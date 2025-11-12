@@ -22,6 +22,7 @@ from .interfaces_base import VllmModelForPooling, is_pooling_model
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
+    from vllm.inputs import TokensPrompt
 
 _T = TypeVar("_T", bound=type[nn.Module])
 
@@ -288,12 +289,15 @@ def as_seq_cls_model(cls: _T) -> _T:
         DispatchPooler,
         Pooler,
     )
-    from vllm.model_executor.models.interfaces import SupportsCrossEncoding
+    from vllm.model_executor.models.interfaces import (
+        SupportsCrossEncoding,
+        SupportsScoreTemplate,
+    )
 
     from .utils import maybe_prefix
 
     class ModelForSequenceClassification(
-        _create_pooling_model_cls(cls), SupportsCrossEncoding
+        _create_pooling_model_cls(cls), SupportsCrossEncoding, SupportsScoreTemplate
     ):
         def _init_pooler(self, vllm_config: "VllmConfig", prefix: str = ""):
             text_config = vllm_config.model_config.hf_config.get_text_config()
@@ -338,6 +342,48 @@ def as_seq_cls_model(cls: _T) -> _T:
                 # Online convert ForCausalLM into
                 # ForSequenceClassification model.
                 return seq_cls_model_loader(self, weights)
+
+        @classmethod
+        def get_score_template(
+            cls, query: str, document: str, model_config: "ModelConfig"
+        ) -> str | None:
+            """
+            Generate a full prompt by populating the score template with query
+            and document content.
+            The template is read from the model's config.json file.
+
+            Supported template placeholders:
+            - {query} or {0}: replaced with query text
+            - {document} or {1}: replaced with document text
+
+            If no template is found in config, uses a simple concatenation:
+            document + query
+            """
+            # Read score template from the model config
+            text_config = model_config.hf_config.get_text_config()
+            template = getattr(text_config, "score_template", None)
+            if template is None:
+                template = getattr(text_config, "prompt_template", None)
+
+            if template is None:
+                return None
+
+            # Replace placeholders with query and document
+            # Support both {query}/{document} and {0}/{1} style placeholders
+            result = template.replace("{query}", query).replace("{document}", document)
+            result = result.replace("{0}", query).replace("{1}", document)
+            return result
+
+        @classmethod
+        def post_process_tokens(
+            cls, prompt: "TokensPrompt", model_config: "ModelConfig"
+        ) -> None:
+            """
+            Perform architecture-specific manipulations on the input tokens.
+            By default, no post-processing is needed.
+            """
+            # No-op by default; subclasses can override if needed
+            pass
 
     ModelForSequenceClassification.__name__ = _get_pooling_model_name(
         cls.__name__, "ForSequenceClassification"

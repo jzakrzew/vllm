@@ -288,16 +288,29 @@ class SupportsScoreTemplate(Protocol):
     """
 
     @classmethod
-    def get_score_template(cls, query: str, document: str) -> str | None:
+    def get_score_template(
+        cls, query: str, document: str, model_config: ModelConfig
+    ) -> str | None:
         """
         Generate a full prompt by populating the score template with query and document content.
+
+        Args:
+            query: The query text
+            document: The document text
+            model_config: The model configuration containing hf_config with potential score_template field
         """  # noqa: E501
         ...
 
     @classmethod
-    def post_process_tokens(cls, prompt: TokensPrompt) -> None:
+    def post_process_tokens(
+        cls, prompt: TokensPrompt, model_config: ModelConfig
+    ) -> None:
         """
         Perform architecture-specific manipulations on the input tokens.
+
+        Args:
+            prompt: The tokens prompt to modify (in-place)
+            model_config: The model configuration
         """
         ...
 

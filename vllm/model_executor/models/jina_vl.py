@@ -117,11 +117,15 @@ class JinaVLForSequenceClassification(
         raise ValueError("Only image modality is supported")
 
     @classmethod
-    def get_score_template(cls, query: str, document: str) -> str | None:
+    def get_score_template(
+        cls, query: str, document: str, model_config: "ModelConfig"
+    ) -> str | None:
         return f"**Document**:\n{document}\n**Query**:\n{query}"
 
     @classmethod
-    def post_process_tokens(cls, prompt: TokensPrompt) -> None:
+    def post_process_tokens(
+        cls, prompt: TokensPrompt, model_config: "ModelConfig"
+    ) -> None:
         # add score target token at the end of prompt tokens
         prompt["prompt_token_ids"].append(100)
 
