@@ -644,20 +644,15 @@ Code example: [examples/pooling/score/openai_cross_encoder_score.py](../../examp
 
 #### Score Template
 
-Some scoring models may require a specific prompt format to work correctly. You can specify a custom score template
-using the `--score-template` parameter. This template is a Jinja2 template that specifies how query and document
-pairs are formatted before being sent to the model.
+Some scoring models require a specific prompt format to work correctly. You can specify a custom score template using the `--chat-template` parameter (see [Chat Template](#chat-template)).
 
-```bash
-vllm serve <model> --score-template ./path-to-score-template.jinja
-```
+The template should use `{{ messages[0]["content"] }}` and `{{ messages[1]["content"] }}` to represent the query and document text, respectively.
 
-The template should use `{{ query }}` and `{{ document }}` variables to represent the query and document text respectively.
-An example template file (`examples/template_score_basic.jinja`):
+Here is an example template file (`examples/template_score_basic.jinja`):
 
 ```jinja2
-Query: {{ query }}
-Document: {{ document }}
+Query: {{ messages[0]["content"] }}
+Document: {{ messages[1]["content"] }}
 ```
 
 #### Single inference

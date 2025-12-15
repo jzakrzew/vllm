@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any, TypeAlias, cast
 
-import jinja2
 from torch.nn import CosineSimilarity
 from typing_extensions import Required, TypedDict
 
@@ -12,9 +11,11 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionContentPartImageEmbedsParam,
     ChatCompletionContentPartImageParam,
     ChatCompletionContentPartTextParam,
+    ChatTemplateResolutionError,
     MultiModalItemTracker,
     _ContentPart,
     _parse_chat_message_content_part,
+    apply_hf_chat_template,
 )
 from vllm.inputs import TokensPrompt
 from vllm.model_executor.models.interfaces import supports_score_template
@@ -140,18 +141,6 @@ def _parse_score_content(
     return next(iter(mm_placeholder_storage.values()))[0]
 
 
-def _apply_custom_score_template(
-    score_template: str,
-    prompt_1: str,
-    prompt_2: str,
-) -> str:
-    try:
-        jinja_template = jinja2.Template(score_template)
-        return jinja_template.render(query=prompt_1, document=prompt_2)
-    except jinja2.TemplateError as e:
-        raise ValueError(f"Error rendering Jinja2 score template: {e}") from e
-
-
 def _apply_model_score_template(
     model_config: ModelConfig, prompt_1: str, prompt_2: str
 ) -> str:
@@ -202,23 +191,42 @@ def get_score_prompt(
     from vllm.model_executor.model_loader import get_model_cls
 
     model = get_model_cls(model_config)
-    if score_template is not None:
-        # explicitly provided score template takes precedence
-        full_prompt = _apply_custom_score_template(score_template, prompt_1, prompt_2)
-        prompt_inputs = tokenizer(full_prompt, **tokenization_kwargs)
-    elif supports_score_template(model):
+
+    # Models implementing SupportsScoreTemplate must use their custom
+    # template implementation by default to preserve existing functionality.
+    # Attempting to use tokenizer_config.json templates would most likely break
+    # these models, as often they just inherit the template from the original LLM.
+    # CLI --chat-template overrides are still supported.
+    if supports_score_template(model) and score_template is None:
         full_prompt = _apply_model_score_template(model_config, prompt_1, prompt_2)
         prompt_inputs = tokenizer(full_prompt, **tokenization_kwargs)
-    elif model_config.use_pad_token:
-        # cross_encoder models defaults to using pad_token.
-        prompt_inputs = tokenizer(
-            text=prompt_1, text_pair=prompt_2, **tokenization_kwargs
-        )
-        full_prompt = tokenizer.decode(prompt_inputs["input_ids"])
     else:
-        # `llm as reranker` models defaults to not using pad_token.
-        full_prompt = prompt_1 + prompt_2
-        prompt_inputs = tokenizer(text=full_prompt, **tokenization_kwargs)
+        # Try applying a score template from the CLI arg or tokenizer_config.json
+        # If that fails because there is no such template,
+        # fall back to the default implementation.
+        try:
+            full_prompt = apply_hf_chat_template(
+                tokenizer,
+                [
+                    {"role": "query", "content": prompt_1},
+                    {"role": "document", "content": prompt_2},
+                ],
+                score_template,
+                tools=None,
+                model_config=model_config,
+            )
+            prompt_inputs = tokenizer(full_prompt, **tokenization_kwargs)
+        except ChatTemplateResolutionError:
+            if model_config.use_pad_token:
+                # cross_encoder models defaults to using pad_token.
+                prompt_inputs = tokenizer(
+                    text=prompt_1, text_pair=prompt_2, **tokenization_kwargs
+                )
+                full_prompt = tokenizer.decode(prompt_inputs["input_ids"])
+            else:
+                # `llm as reranker` models defaults to not using pad_token.
+                full_prompt = prompt_1 + prompt_2
+                prompt_inputs = tokenizer(text=full_prompt, **tokenization_kwargs)
 
     engine_prompt = TokensPrompt(prompt_token_ids=prompt_inputs["input_ids"])
 
