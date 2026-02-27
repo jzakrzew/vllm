@@ -11,6 +11,10 @@ from vllm._custom_ops import (
     scaled_fp4_quant,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.batch_invariant import (
+    linear_batch_invariant_nvfp4,
+    vllm_is_batch_invariant,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     is_fp4_marlin_supported,
@@ -140,6 +144,21 @@ def convert_to_nvfp4_linear_kernel_format(
     # Default to no padding
     layer.weights_padding_cols = 0
 
+    # Batch-invariant path is explicitly Blackwell + tl.dot_scaled only.
+    # We use the CUTLASS-compatible packed weight/scale layout for this path.
+    if vllm_is_batch_invariant():
+        if not current_platform.has_device_capability(100):
+            raise RuntimeError(
+                "Batch-invariant NVFP4 path requires Blackwell (sm100+) GPUs."
+            )
+        weight, weight_scale, weights_padding_cols = prepare_weights_for_nvfp4_cutlass(
+            layer.weight.data, layer.weight_scale.data
+        )
+        layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+        layer.weights_padding_cols = weights_padding_cols
+        return
+
     if backend == NvFp4LinearBackend.MARLIN:
         prepare_fp4_layer_for_marlin(layer)
     elif backend == NvFp4LinearBackend.FLASHINFER_TRTLLM:
@@ -183,6 +202,19 @@ def apply_nvfp4_linear(
     alpha = layer.alpha
     output_size = layer.output_size_per_partition
     input_size = layer.input_size_per_partition
+
+    if vllm_is_batch_invariant():
+        return linear_batch_invariant_nvfp4(
+            input=x,
+            weight=weight,
+            weight_scale=weight_scale,
+            input_global_scale_inv=input_global_scale_inv,
+            alpha=alpha,
+            output_size=output_size,
+            bias=bias,
+            weights_padding_cols=getattr(layer, "weights_padding_cols", 0),
+            quant_backend=NvFp4LinearBackend.VLLM_CUTLASS.value,
+        )
 
     if backend == NvFp4LinearBackend.MARLIN:
         return apply_fp4_marlin_linear(

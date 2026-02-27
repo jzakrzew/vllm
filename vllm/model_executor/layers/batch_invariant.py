@@ -216,6 +216,210 @@ def matmul_persistent(
     return c
 
 
+@triton.jit(launch_metadata=_matmul_launch_metadata)
+def matmul_nvfp4_kernel_persistent(
+    a_ptr,  # (M, K // 2), packed fp4
+    a_scale_ptr,  # (M, K // 16), fp8 block scales
+    b_ptr,  # (N, K // 2), packed fp4
+    b_scale_ptr,  # (N, K // 16), fp8 block scales
+    c_ptr,  # (M, N), output
+    alpha_ptr,  # scalar fp32 global alpha
+    M,
+    N,
+    K,  # K in fp4 elements
+    stride_am,
+    stride_ak,
+    stride_asm,
+    stride_ask,
+    stride_bm,
+    stride_bk,
+    stride_bsm,
+    stride_bsk,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    A_LARGE: tl.constexpr,
+    B_LARGE: tl.constexpr,
+    C_LARGE: tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    tile_id_c = start_pid - NUM_SMS
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    k_byte_offsets_for_mask = tl.arange(0, BLOCK_SIZE_K // 2)
+    k_scale_offsets_for_mask = tl.arange(0, BLOCK_SIZE_K // 16)
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m, pid_n = _compute_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
+        start_m = pid_m * BLOCK_SIZE_M
+        start_n = pid_n * BLOCK_SIZE_N
+
+        offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
+        offs_bn = start_n + tl.arange(0, BLOCK_SIZE_N)
+        if A_LARGE:
+            offs_am = offs_am.to(tl.int64)
+        if B_LARGE:
+            offs_bn = offs_bn.to(tl.int64)
+        offs_am = tl.where(offs_am < M, offs_am, 0)
+        offs_bn = tl.where(offs_bn < N, offs_bn, 0)
+        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+        mask_m = offs_am < M
+        mask_n = offs_bn < N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            if A_LARGE or B_LARGE:
+                offs_k_bytes = (
+                    ki * (BLOCK_SIZE_K // 2) + tl.arange(0, BLOCK_SIZE_K // 2).to(tl.int64)
+                )
+                offs_k_scales = (
+                    ki * (BLOCK_SIZE_K // 16)
+                    + tl.arange(0, BLOCK_SIZE_K // 16).to(tl.int64)
+                )
+            else:
+                offs_k_bytes = ki * (BLOCK_SIZE_K // 2) + tl.arange(0, BLOCK_SIZE_K // 2)
+                offs_k_scales = ki * (BLOCK_SIZE_K // 16) + tl.arange(0, BLOCK_SIZE_K // 16)
+
+            a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k_bytes[None, :] * stride_ak
+            b_ptrs = b_ptr + offs_bn[:, None] * stride_bm + offs_k_bytes[None, :] * stride_bk
+
+            a_scale_ptrs = (
+                a_scale_ptr
+                + offs_am[:, None] * stride_asm
+                + offs_k_scales[None, :] * stride_ask
+            )
+            b_scale_ptrs = (
+                b_scale_ptr
+                + offs_bn[:, None] * stride_bsm
+                + offs_k_scales[None, :] * stride_bsk
+            )
+
+            remaining_k = K - ki * BLOCK_SIZE_K
+            remaining_k_bytes = tl.cdiv(remaining_k, 2)
+            remaining_k_scales = tl.cdiv(remaining_k, 16)
+
+            k_mask_bytes = k_byte_offsets_for_mask < remaining_k_bytes
+            k_mask_scales = k_scale_offsets_for_mask < remaining_k_scales
+
+            a_mask = mask_m[:, None] & k_mask_bytes[None, :]
+            b_mask = mask_n[:, None] & k_mask_bytes[None, :]
+            a_scale_mask = mask_m[:, None] & k_mask_scales[None, :]
+            b_scale_mask = mask_n[:, None] & k_mask_scales[None, :]
+
+            # LHS fp4 is packed along K, RHS is loaded as (N, K//2) and transposed.
+            a = tl.load(a_ptrs, mask=a_mask, other=0)
+            b = tl.load(b_ptrs, mask=b_mask, other=0).T
+            a_scale = tl.load(a_scale_ptrs, mask=a_scale_mask, other=0.0)
+            b_scale = tl.load(b_scale_ptrs, mask=b_scale_mask, other=0.0)
+
+            accumulator = tl.dot_scaled(
+                a,
+                a_scale,
+                "e2m1",
+                b,
+                b_scale,
+                "e2m1",
+                accumulator,
+            )
+
+        alpha = tl.load(alpha_ptr).to(tl.float32)
+        accumulator *= alpha
+
+        tile_id_c += NUM_SMS
+        pid_m, pid_n = _compute_pid(
+            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
+        )
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        if C_LARGE:
+            offs_cm = offs_cm.to(tl.int64)
+            offs_cn = offs_cn.to(tl.int64)
+        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        c = accumulator.to(c_ptr.dtype.element_ty)
+        tl.store(c_ptrs, c, mask=c_mask)
+
+
+def matmul_nvfp4_persistent(
+    a_fp4: torch.Tensor,
+    b_fp4: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    assert a_fp4.dtype == torch.uint8 and b_fp4.dtype == torch.uint8, (
+        "Expected packed FP4 tensors in uint8 format."
+    )
+    assert a_scale.dtype == torch.float8_e4m3fn and b_scale.dtype == torch.float8_e4m3fn, (
+        "Expected FP8 E4M3 block scales for NVFP4."
+    )
+    assert alpha.dtype == torch.float32, "Expected alpha to be float32."
+    assert a_fp4.shape[1] == b_fp4.shape[1], "Incompatible packed K dimensions."
+
+    M = a_fp4.shape[0]
+    N = b_fp4.shape[0]
+    K = a_fp4.shape[1] * 2
+    NUM_SMS = num_compute_units(a_fp4.device.index)
+
+    c = torch.empty((M, N), device=a_fp4.device, dtype=output_dtype)
+
+    def grid(meta):
+        return (
+            min(
+                NUM_SMS,
+                triton.cdiv(M, meta["BLOCK_SIZE_M"])
+                * triton.cdiv(N, meta["BLOCK_SIZE_N"]),
+            ),
+        )
+
+    matmul_nvfp4_kernel_persistent[grid](
+        a_fp4,
+        a_scale,
+        b_fp4,
+        b_scale,
+        c,
+        alpha,
+        M,
+        N,
+        K,
+        a_fp4.stride(0),
+        a_fp4.stride(1),
+        a_scale.stride(0),
+        a_scale.stride(1),
+        b_fp4.stride(0),
+        b_fp4.stride(1),
+        b_scale.stride(0),
+        b_scale.stride(1),
+        c.stride(0),
+        c.stride(1),
+        NUM_SMS=NUM_SMS,
+        A_LARGE=a_fp4.numel() > 2**31,
+        B_LARGE=b_fp4.numel() > 2**31,
+        C_LARGE=c.numel() > 2**31,
+        BLOCK_SIZE_M=128,
+        BLOCK_SIZE_N=128,
+        BLOCK_SIZE_K=256,
+        GROUP_SIZE_M=8,
+        num_stages=4,
+        num_warps=8,
+    )
+    return c
+
+
 @triton.jit
 def bmm_kernel(
     a_ptr,  # (*, ) pointer to A, (B, M, K)
@@ -910,6 +1114,72 @@ def rms_norm_batch_invariant(
 def linear_batch_invariant(input, weight, bias=None):
     output = matmul_batch_invariant(input, weight.t())
 
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+def linear_batch_invariant_nvfp4(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_global_scale_inv: torch.Tensor,
+    alpha: torch.Tensor,
+    output_size: int,
+    bias: torch.Tensor | None = None,
+    *,
+    weights_padding_cols: int = 0,
+    quant_backend: str = "cutlass",
+) -> torch.Tensor:
+    """
+    Deterministic Blackwell NVFP4 linear path using Triton tl.dot_scaled.
+    """
+    if not current_platform.has_device_capability(100):
+        raise RuntimeError(
+            "Batch-invariant NVFP4 path requires Blackwell (sm100+) GPUs."
+        )
+    if not hasattr(tl, "dot_scaled"):
+        raise RuntimeError(
+            "This Triton build does not expose tl.dot_scaled required for "
+            "batch-invariant NVFP4."
+        )
+    if weight.dtype != torch.uint8 or weight_scale.dtype != torch.float8_e4m3fn:
+        raise RuntimeError(
+            "Batch-invariant NVFP4 path expects packed FP4 weights and FP8 "
+            "E4M3 block scales."
+        )
+    if input.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            f"Batch-invariant NVFP4 path only supports fp16/bf16 inputs, got {input.dtype}."
+        )
+
+    original_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+
+    # Lazily import to avoid circular import with vllm._custom_ops.
+    from vllm._custom_ops import scaled_fp4_quant
+
+    x_fp4, x_blockscale = scaled_fp4_quant(
+        input_2d,
+        input_global_scale_inv,
+        is_sf_swizzled_layout=True,
+        backend=quant_backend,
+    )
+    if weights_padding_cols > 0:
+        x_fp4 = torch.nn.functional.pad(x_fp4, (0, weights_padding_cols)).contiguous()
+
+    out_2d = matmul_nvfp4_persistent(
+        a_fp4=x_fp4,
+        b_fp4=weight,
+        a_scale=x_blockscale,
+        b_scale=weight_scale,
+        alpha=alpha,
+        output_dtype=input.dtype,
+    )
+    if out_2d.shape[-1] != output_size:
+        out_2d = out_2d[:, :output_size].contiguous()
+
+    output = out_2d.reshape(*original_shape[:-1], output_size)
     if bias is not None:
         output = output + bias
     return output
