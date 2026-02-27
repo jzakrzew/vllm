@@ -1185,6 +1185,201 @@ def linear_batch_invariant_nvfp4(
     return output
 
 
+def _nvfp4_get_expert_scalar(
+    tensor: torch.Tensor | None,
+    expert_id: int,
+    *,
+    field_name: str,
+) -> torch.Tensor:
+    if tensor is None:
+        raise RuntimeError(f"Missing required NVFP4 MoE tensor: {field_name}")
+
+    if tensor.ndim == 0 or tensor.numel() == 1:
+        value = tensor.reshape(())
+    else:
+        if expert_id >= tensor.shape[0]:
+            raise RuntimeError(
+                f"NVFP4 MoE tensor '{field_name}' is missing expert {expert_id}."
+            )
+        value = tensor[expert_id]
+        if value.ndim != 0:
+            value = value.reshape(())
+    return value.to(dtype=torch.float32)
+
+
+def _nvfp4_moe_map_experts(
+    topk_ids: torch.Tensor, expert_map: torch.Tensor
+) -> torch.Tensor:
+    flat_ids = topk_ids.reshape(-1).to(torch.long)
+    if expert_map.numel() == 0:
+        return torch.full_like(topk_ids, -1, dtype=torch.long)
+    valid = (flat_ids >= 0) & (flat_ids < expert_map.numel())
+    clamped = flat_ids.clamp(min=0, max=max(0, expert_map.numel() - 1))
+    remapped = expert_map.to(torch.long).index_select(0, clamped)
+    mapped = torch.where(valid, remapped, torch.full_like(remapped, -1))
+    return mapped.view_as(topk_ids)
+
+
+def fused_moe_batch_invariant_nvfp4(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    a1_gscale: torch.Tensor | None,
+    g1_alphas: torch.Tensor | None,
+    a2_gscale: torch.Tensor | None,
+    g2_alphas: torch.Tensor | None,
+    activation: Any,
+    *,
+    apply_router_weight_on_input: bool = False,
+    expert_map: torch.Tensor | None = None,
+    quant_backend: str = "cutlass",
+) -> torch.Tensor:
+    """
+    Deterministic NVFP4 MoE fallback built from batch-invariant NVFP4 GEMMs.
+    """
+    if hidden_states.ndim != 2:
+        raise RuntimeError(
+            f"Expected 2D hidden_states for NVFP4 MoE fallback, got {hidden_states.shape}."
+        )
+    if topk_ids.shape != topk_weights.shape:
+        raise RuntimeError(
+            "NVFP4 MoE fallback expects topk_ids and topk_weights to have identical shapes."
+        )
+    if topk_ids.ndim != 2:
+        raise RuntimeError(
+            f"Expected 2D top-k routing tensors, got shape {topk_ids.shape}."
+        )
+    if apply_router_weight_on_input and topk_ids.shape[1] != 1:
+        raise RuntimeError(
+            "apply_router_weight_on_input=True is only supported for top_k == 1."
+        )
+
+    # Lazily import to avoid pulling MoE deps when the fallback is unused.
+    from vllm.model_executor.layers.fused_moe.activation import (
+        MoEActivation,
+        apply_moe_activation,
+    )
+
+    activation_kind = (
+        activation
+        if isinstance(activation, MoEActivation)
+        else MoEActivation.from_str(str(activation))
+    )
+
+    num_tokens, hidden_dim = hidden_states.shape
+    num_experts = w13_weight.shape[0]
+    top_k = topk_ids.shape[1]
+
+    routed_topk_ids = topk_ids
+    if expert_map is not None:
+        routed_topk_ids = _nvfp4_moe_map_experts(topk_ids, expert_map)
+    routed_topk_ids = routed_topk_ids.to(torch.long)
+    routed_topk_weights = topk_weights.to(torch.float32)
+
+    expert_ids = routed_topk_ids.reshape(-1)
+    assignment_weights = routed_topk_weights.reshape(-1)
+    repeated_hidden_states = (
+        hidden_states.unsqueeze(1)
+        .expand(num_tokens, top_k, hidden_dim)
+        .reshape(-1, hidden_dim)
+        .contiguous()
+    )
+    if apply_router_weight_on_input:
+        repeated_hidden_states = repeated_hidden_states * assignment_weights.unsqueeze(
+            -1
+        ).to(repeated_hidden_states.dtype)
+    output_scale = (
+        torch.ones_like(assignment_weights)
+        if apply_router_weight_on_input
+        else assignment_weights
+    )
+    contribution = torch.zeros(
+        (repeated_hidden_states.shape[0], hidden_dim),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+
+    w1_padding_cols = max(0, w13_weight.shape[-1] - hidden_dim // 2)
+    w2_output_size = hidden_dim
+    w1_output_size = w13_weight.shape[1]
+
+    for expert_id in range(num_experts):
+        # CUDA graph capture-safe expert routing mask. This avoids dynamic
+        # indexing ops such as nonzero/index_select that are capture-unsafe.
+        expert_mask = (expert_ids == expert_id).unsqueeze(-1)
+        expert_inputs = repeated_hidden_states * expert_mask.to(
+            repeated_hidden_states.dtype
+        )
+
+        gemm1_out = linear_batch_invariant_nvfp4(
+            input=expert_inputs,
+            weight=w13_weight[expert_id].contiguous(),
+            weight_scale=w13_weight_scale[expert_id].contiguous(),
+            input_global_scale_inv=_nvfp4_get_expert_scalar(
+                a1_gscale, expert_id, field_name="a1_gscale"
+            ),
+            alpha=_nvfp4_get_expert_scalar(
+                g1_alphas, expert_id, field_name="g1_alphas"
+            ),
+            output_size=w1_output_size,
+            weights_padding_cols=w1_padding_cols,
+            quant_backend=quant_backend,
+        )
+
+        activation_out_dim = (
+            gemm1_out.shape[-1] // 2
+            if activation_kind.is_gated
+            else gemm1_out.shape[-1]
+        )
+        activation_out = torch.empty(
+            (gemm1_out.shape[0], activation_out_dim),
+            device=gemm1_out.device,
+            dtype=gemm1_out.dtype,
+        )
+        apply_moe_activation(
+            activation=activation_kind,
+            output=activation_out,
+            input=gemm1_out,
+        )
+
+        w2_padding_cols = max(0, w2_weight.shape[-1] - activation_out_dim // 2)
+        gemm2_out = linear_batch_invariant_nvfp4(
+            input=activation_out,
+            weight=w2_weight[expert_id].contiguous(),
+            weight_scale=w2_weight_scale[expert_id].contiguous(),
+            input_global_scale_inv=_nvfp4_get_expert_scalar(
+                a2_gscale, expert_id, field_name="a2_gscale"
+            ),
+            alpha=_nvfp4_get_expert_scalar(
+                g2_alphas, expert_id, field_name="g2_alphas"
+            ),
+            output_size=w2_output_size,
+            weights_padding_cols=w2_padding_cols,
+            quant_backend=quant_backend,
+        )
+
+        weighted_output = (
+            gemm2_out.to(torch.float32)
+            * output_scale.unsqueeze(-1)
+            * expert_mask.to(torch.float32)
+        )
+        contribution += weighted_output
+
+    reduced = torch.zeros(
+        (num_tokens, hidden_dim),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    contribution = contribution.view(num_tokens, top_k, hidden_dim)
+    for slot in range(top_k):
+        reduced += contribution[:, slot, :]
+    return reduced.to(hidden_states.dtype)
+
+
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _original_torch_bmm = None
