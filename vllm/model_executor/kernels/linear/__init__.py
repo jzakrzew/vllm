@@ -78,6 +78,9 @@ from vllm.model_executor.kernels.linear.nvfp4 import (
     NvFp4LinearKernel,
     NvFp4LinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.nvfp4.batch_invariant import (
+    BatchInvariantNvFp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
     CutlassNvFp4LinearKernel,
 )
@@ -602,9 +605,10 @@ def init_nvfp4_linear_kernel() -> NvFp4LinearKernel:
     # Env-var overrides.
     force_kernel: type[NvFp4LinearKernel] | None = None
     if envs.VLLM_BATCH_INVARIANT:
-        bi_supported, _ = CutlassNvFp4LinearKernel.is_supported()
-        if bi_supported:
+        if CutlassNvFp4LinearKernel.is_supported():
             force_kernel = CutlassNvFp4LinearKernel
+        elif BatchInvariantNvFp4LinearKernel.is_supported():
+            force_kernel = BatchInvariantNvFp4LinearKernel
         else:
             logger.info_once(
                 "VLLM_BATCH_INVARIANT is set but the batch-invariant NVFP4 "
@@ -772,4 +776,5 @@ __all__ = [
     "_KernelT",
     "DeepGemmFp8BlockScaledMMKernel",
     "FlashInferFp8DeepGEMMDynamicBlockScaledKernel",
+    "BatchInvariantNvFp4LinearKernel",
 ]
