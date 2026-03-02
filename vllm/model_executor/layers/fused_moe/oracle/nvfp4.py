@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     prepare_nvfp4_moe_layer_for_marlin,
 )
+from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
@@ -42,6 +43,7 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
+    BATCH_INVARIANT = "BATCH_INVARIANT"
 
 
 FLASHINFER_NVFP4_MOE_BACKENDS = [
@@ -100,6 +102,13 @@ def backend_to_kernel_cls(
         )
 
         return MarlinExperts
+
+    elif backend == NvFp4MoeBackend.BATCH_INVARIANT:
+        from vllm.model_executor.layers.fused_moe.batch_invariant_moe import (
+            BatchInvariantNvfp4Experts,
+        )
+
+        return BatchInvariantNvfp4Experts
     else:
         raise ValueError(f"Unknown NvFP4 MoE backend: {backend.value}")
 
@@ -112,6 +121,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         "marlin": NvFp4MoeBackend.MARLIN,
+        "batch_invariant": NvFp4MoeBackend.BATCH_INVARIANT,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -130,6 +140,15 @@ def select_nvfp4_moe_backend(
     Select the primary NvFP4 MoE backend
     Note: Shape-specific fallbacks may still occur at runtime.
     """
+
+    if vllm_is_batch_invariant():
+        backend = NvFp4MoeBackend.BATCH_INVARIANT
+        k_cls = backend_to_kernel_cls(backend)
+        logger.info_once(
+            "Batch-invariant mode enabled: using '%s' NvFp4 MoE backend.",
+            backend.value,
+        )
+        return backend, k_cls
 
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = [
@@ -322,6 +341,7 @@ def convert_to_nvfp4_moe_kernel_format(
     if (
         nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS
         or nvfp4_backend == NvFp4MoeBackend.VLLM_CUTLASS
+        or nvfp4_backend == NvFp4MoeBackend.BATCH_INVARIANT
     ):
         (
             w13,

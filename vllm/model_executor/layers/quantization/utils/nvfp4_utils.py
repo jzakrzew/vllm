@@ -38,6 +38,7 @@ class NvFp4LinearBackend(Enum):
     FBGEMM = "fbgemm"
     MARLIN = "marlin"
     EMULATION = "emulation"
+    BATCH_INVARIANT = "batch-invariant"
 
 
 def select_nvfp4_linear_backend() -> NvFp4LinearBackend:
@@ -46,8 +47,9 @@ def select_nvfp4_linear_backend() -> NvFp4LinearBackend:
     configuration and platform capabilities.
     """
     backend: NvFp4LinearBackend | None = None
-
-    if envs.VLLM_USE_FBGEMM:
+    if vllm_is_batch_invariant():
+        backend = NvFp4LinearBackend.BATCH_INVARIANT
+    elif envs.VLLM_USE_FBGEMM:
         try:
             import fbgemm_gpu  # noqa: F401
         except ImportError as exc:
@@ -146,7 +148,7 @@ def convert_to_nvfp4_linear_kernel_format(
 
     # Batch-invariant path is explicitly Blackwell + tl.dot_scaled only.
     # We use the CUTLASS-compatible packed weight/scale layout for this path.
-    if vllm_is_batch_invariant():
+    if backend == NvFp4LinearBackend.BATCH_INVARIANT:
         if not current_platform.has_device_capability(100):
             raise RuntimeError(
                 "Batch-invariant NVFP4 path requires Blackwell (sm100+) GPUs."
@@ -157,9 +159,7 @@ def convert_to_nvfp4_linear_kernel_format(
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
         layer.weights_padding_cols = weights_padding_cols
-        return
-
-    if backend == NvFp4LinearBackend.MARLIN:
+    elif backend == NvFp4LinearBackend.MARLIN:
         prepare_fp4_layer_for_marlin(layer)
     elif backend == NvFp4LinearBackend.FLASHINFER_TRTLLM:
         weight, weight_scale = prepare_weights_for_nvfp4_flashinfer_trtllm(
@@ -203,7 +203,7 @@ def apply_nvfp4_linear(
     output_size = layer.output_size_per_partition
     input_size = layer.input_size_per_partition
 
-    if vllm_is_batch_invariant():
+    if backend == NvFp4LinearBackend.BATCH_INVARIANT:
         return linear_batch_invariant_nvfp4(
             input=x,
             weight=weight,
@@ -215,8 +215,7 @@ def apply_nvfp4_linear(
             weights_padding_cols=getattr(layer, "weights_padding_cols", 0),
             quant_backend=NvFp4LinearBackend.VLLM_CUTLASS.value,
         )
-
-    if backend == NvFp4LinearBackend.MARLIN:
+    elif backend == NvFp4LinearBackend.MARLIN:
         return apply_fp4_marlin_linear(
             input=x,
             weight=weight,

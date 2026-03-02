@@ -9,10 +9,6 @@ from torch.nn.parameter import Parameter
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import (
-    fused_moe_batch_invariant_nvfp4,
-    vllm_is_batch_invariant,
-)
 from vllm.model_executor.kernels.linear import (
     init_fp8_linear_kernel,
 )
@@ -1381,11 +1377,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
-        kernel_format_backend = (
-            NvFp4MoeBackend.VLLM_CUTLASS
-            if vllm_is_batch_invariant()
-            else self.nvfp4_backend
-        )
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(
@@ -1407,7 +1398,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w2_scale_2,
             a2_scale,
         ) = convert_to_nvfp4_moe_kernel_format(
-            nvfp4_backend=kernel_format_backend,
+            nvfp4_backend=self.nvfp4_backend,
             layer=layer,
             w13=layer.w13_weight,
             w13_scale=layer.w13_weight_scale,
@@ -1446,10 +1437,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
     @property
     def do_post_quant_allgather(self):
-        return (
-            self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
-            and not vllm_is_batch_invariant()
-        )
+        return self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
 
     def prepare_dp_allgather_tensor(
         self,
@@ -1498,49 +1486,10 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             and not self.moe.moe_parallel_config.enable_eplb
         )
 
-    def _extract_hidden_states_tensor(
-        self,
-        x: torch.Tensor | tuple[torch.Tensor, ...],
-    ) -> torch.Tensor:
-        if isinstance(x, tuple):
-            if len(x) == 0:
-                raise RuntimeError("NVFP4 MoE fallback received an empty tuple input.")
-            x = x[0]
-        if x.dtype not in (torch.float16, torch.bfloat16):
-            raise RuntimeError(
-                "Batch-invariant NVFP4 MoE fallback expects fp16/bf16 hidden states."
-            )
-        return x
-
-    def _apply_batch_invariant_fallback(
-        self,
-        layer: FusedMoE,
-        x: torch.Tensor | tuple[torch.Tensor, ...],
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self._extract_hidden_states_tensor(x)
-        return fused_moe_batch_invariant_nvfp4(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            w13_weight=layer.w13_weight,
-            w13_weight_scale=layer.w13_weight_scale,
-            w2_weight=layer.w2_weight,
-            w2_weight_scale=layer.w2_weight_scale,
-            a1_gscale=layer.w13_input_scale,
-            g1_alphas=layer.w13_weight_scale_2,
-            a2_gscale=layer.w2_input_scale,
-            g2_alphas=layer.w2_weight_scale_2,
-            activation=layer.activation,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            expert_map=layer.expert_map,
-        )
-
     def apply_monolithic(
         self,
         layer: FusedMoE,
-        x: torch.Tensor | tuple[torch.Tensor, ...],
+        x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.is_monolithic
@@ -1548,17 +1497,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
             and not layer.enable_eplb
         )
-        if vllm_is_batch_invariant():
-            topk_weights, topk_ids = layer.router.select_experts(
-                hidden_states=self._extract_hidden_states_tensor(x),
-                router_logits=router_logits,
-            )
-            return self._apply_batch_invariant_fallback(
-                layer=layer,
-                x=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
 
         return flashinfer_trtllm_fp4_moe(
             layer=layer,
@@ -1582,14 +1520,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert not self.is_monolithic
-
-        if vllm_is_batch_invariant():
-            return self._apply_batch_invariant_fallback(
-                layer=layer,
-                x=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
 
         # EPLB path
         if self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
