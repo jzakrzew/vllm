@@ -232,9 +232,7 @@ def _unswizzle_scale(
     The inverse permutation (0, 3, 2, 1, 4) recovers the standard layout.
     """
     return (
-        scale_raw.reshape(
-            TILE_ROWS // 128, TILE_SCALE_COLS // 4, 32, 4, 4
-        )
+        scale_raw.reshape(TILE_ROWS // 128, TILE_SCALE_COLS // 4, 32, 4, 4)
         .trans(0, 3, 2, 1, 4)
         .reshape(TILE_ROWS, TILE_SCALE_COLS)
     )
@@ -266,14 +264,8 @@ def _swizzled_scale_ptrs(
     # Swizzled storage layout:
     # [m_tiles, k_tiles, 32, 4, 4] reshaped to 2D row-major.
     linear_off = (
-        (
-            (
-                ((row_tile * num_k_tiles + k_tile) * 32 + outer_m) * 4 + inner_m
-            )
-            * 4
-            + inner_k
-        )
-    )
+        ((row_tile * num_k_tiles + k_tile) * 32 + outer_m) * 4 + inner_m
+    ) * 4 + inner_k
     swizzled_rows = linear_off // scale_cols_total
     swizzled_cols = linear_off % scale_cols_total
     return scale_ptr + swizzled_rows * stride_sm + swizzled_cols * stride_sk
@@ -352,14 +344,20 @@ def matmul_nvfp4_kernel_persistent(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             if A_LARGE or B_LARGE:
-                offs_k_bytes = (
-                    ki * (BLOCK_SIZE_K // 2) + tl.arange(0, BLOCK_SIZE_K // 2).to(tl.int64)
-                )
+                offs_k_bytes = ki * (BLOCK_SIZE_K // 2) + tl.arange(
+                    0, BLOCK_SIZE_K // 2
+                ).to(tl.int64)
             else:
-                offs_k_bytes = ki * (BLOCK_SIZE_K // 2) + tl.arange(0, BLOCK_SIZE_K // 2)
+                offs_k_bytes = ki * (BLOCK_SIZE_K // 2) + tl.arange(
+                    0, BLOCK_SIZE_K // 2
+                )
 
-            a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k_bytes[None, :] * stride_ak
-            b_ptrs = b_ptr + offs_bn[:, None] * stride_bm + offs_k_bytes[None, :] * stride_bk
+            a_ptrs = (
+                a_ptr + offs_am[:, None] * stride_am + offs_k_bytes[None, :] * stride_ak
+            )
+            b_ptrs = (
+                b_ptr + offs_bn[:, None] * stride_bm + offs_k_bytes[None, :] * stride_bk
+            )
 
             scale_offs_k = ki * SCALE_K_TILE + tl.arange(0, SCALE_K_TILE)
             a_scale_ptrs = _swizzled_scale_ptrs(
@@ -445,9 +443,9 @@ def matmul_nvfp4_persistent(
     assert a_fp4.dtype == torch.uint8 and b_fp4.dtype == torch.uint8, (
         "Expected packed FP4 tensors in uint8 format."
     )
-    assert a_scale.dtype == torch.float8_e4m3fn and b_scale.dtype == torch.float8_e4m3fn, (
-        "Expected FP8 E4M3 block scales for NVFP4."
-    )
+    assert (
+        a_scale.dtype == torch.float8_e4m3fn and b_scale.dtype == torch.float8_e4m3fn
+    ), "Expected FP8 E4M3 block scales for NVFP4."
     assert alpha.dtype == torch.float32, "Expected alpha to be float32."
     assert a_fp4.shape[1] == b_fp4.shape[1], "Incompatible packed K dimensions."
 

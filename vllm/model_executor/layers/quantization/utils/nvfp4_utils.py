@@ -12,7 +12,7 @@ from vllm._custom_ops import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
-    linear_batch_invariant_nvfp4,
+    matmul_nvfp4_persistent,
     vllm_is_batch_invariant,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
@@ -149,10 +149,6 @@ def convert_to_nvfp4_linear_kernel_format(
     # Batch-invariant path is explicitly Blackwell + tl.dot_scaled only.
     # We use the CUTLASS-compatible packed weight/scale layout for this path.
     if backend == NvFp4LinearBackend.BATCH_INVARIANT:
-        if not current_platform.has_device_capability(100):
-            raise RuntimeError(
-                "Batch-invariant NVFP4 path requires Blackwell (sm100+) GPUs."
-            )
         weight, weight_scale, weights_padding_cols = prepare_weights_for_nvfp4_cutlass(
             layer.weight.data, layer.weight_scale.data
         )
@@ -203,19 +199,7 @@ def apply_nvfp4_linear(
     output_size = layer.output_size_per_partition
     input_size = layer.input_size_per_partition
 
-    if backend == NvFp4LinearBackend.BATCH_INVARIANT:
-        return linear_batch_invariant_nvfp4(
-            input=x,
-            weight=weight,
-            weight_scale=weight_scale,
-            input_global_scale_inv=input_global_scale_inv,
-            alpha=alpha,
-            output_size=output_size,
-            bias=bias,
-            weights_padding_cols=getattr(layer, "weights_padding_cols", 0),
-            quant_backend=NvFp4LinearBackend.VLLM_CUTLASS.value,
-        )
-    elif backend == NvFp4LinearBackend.MARLIN:
+    if backend == NvFp4LinearBackend.MARLIN:
         return apply_fp4_marlin_linear(
             input=x,
             weight=weight,
@@ -281,6 +265,8 @@ def apply_nvfp4_linear(
             alpha,
             use_mx=False,
         ).to(output_dtype)
+    elif backend == NvFp4LinearBackend.BATCH_INVARIANT:
+        out = matmul_nvfp4_persistent(*mm_args)
     else:
         assert backend == NvFp4LinearBackend.VLLM_CUTLASS
         out = cutlass_scaled_fp4_mm(*mm_args)

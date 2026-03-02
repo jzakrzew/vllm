@@ -352,6 +352,4 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
         output.copy_(result)
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        raise NotImplementedError(
-            "LoRA is not supported for batch-invariant NVFP4 MoE"
-        )
+        raise NotImplementedError("LoRA is not supported for batch-invariant NVFP4 MoE")
