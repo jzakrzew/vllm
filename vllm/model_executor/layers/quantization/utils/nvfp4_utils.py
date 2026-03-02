@@ -42,6 +42,7 @@ class NvFp4LinearBackend(Enum):
     FLASHINFER_CUDNN = "flashinfer-cudnn"
     FBGEMM = "fbgemm"
     EMULATION = "emulation"
+    BATCH_INVARIANT = "batch-invariant"
 
 
 NVFP4_LINEAR_BACKENDS = list(NvFp4LinearBackend)
@@ -115,7 +116,9 @@ def select_nvfp4_linear_backend() -> NvFp4LinearBackend:
     """
     selected_backend: NvFp4LinearBackend | None = None
 
-    if envs.VLLM_USE_FBGEMM:
+    if vllm_is_batch_invariant():
+        selected_backend = NvFp4LinearBackend.BATCH_INVARIANT
+    elif envs.VLLM_USE_FBGEMM:
         try:
             import fbgemm_gpu  # noqa: F401
         except ImportError as exc:
@@ -211,7 +214,7 @@ def convert_to_nvfp4_linear_kernel_format(
 
     # Batch-invariant path is explicitly Blackwell + tl.dot_scaled only.
     # We use the CUTLASS-compatible packed weight/scale layout for this path.
-    if vllm_is_batch_invariant():
+    if backend == NvFp4LinearBackend.BATCH_INVARIANT:
         if not current_platform.has_device_capability(100):
             raise RuntimeError(
                 "Batch-invariant NVFP4 path requires Blackwell (sm100+) GPUs."
@@ -279,7 +282,7 @@ def apply_nvfp4_linear(
     output_size = layer.output_size_per_partition
     input_size = layer.input_size_per_partition
 
-    if vllm_is_batch_invariant():
+    if backend == NvFp4LinearBackend.BATCH_INVARIANT:
         return linear_batch_invariant_nvfp4(
             input=x,
             weight=weight,
@@ -291,8 +294,7 @@ def apply_nvfp4_linear(
             weights_padding_cols=getattr(layer, "weights_padding_cols", 0),
             quant_backend=NvFp4LinearBackend.VLLM_CUTLASS.value,
         )
-
-    if backend == NvFp4LinearBackend.MARLIN:
+    elif backend == NvFp4LinearBackend.MARLIN:
         return apply_fp4_marlin_linear(
             input=x,
             weight=weight,
