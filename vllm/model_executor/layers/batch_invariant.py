@@ -216,12 +216,75 @@ def matmul_persistent(
     return c
 
 
+@triton.jit
+def _unswizzle_scale(
+    scale_raw,
+    TILE_ROWS: tl.constexpr,
+    TILE_SCALE_COLS: tl.constexpr,
+):
+    """Un-swizzle NVFP4 block scales from hardware-interleaved 128x4 layout
+    to standard 2D row-major layout expected by tl.dot_scaled.
+
+    The swizzled layout stores a (M, K_s) scale tensor as:
+        (M//128, K_s//4, 32, 4, 4)
+    The standard layout is:
+        (M//128, 4, 32, K_s//4, 4)
+    The inverse permutation (0, 3, 2, 1, 4) recovers the standard layout.
+    """
+    return (
+        scale_raw.reshape(
+            TILE_ROWS // 128, TILE_SCALE_COLS // 4, 32, 4, 4
+        )
+        .trans(0, 3, 2, 1, 4)
+        .reshape(TILE_ROWS, TILE_SCALE_COLS)
+    )
+
+
+@triton.jit
+def _swizzled_scale_ptrs(
+    scale_ptr,
+    stride_sm,
+    stride_sk,
+    logical_rows,
+    logical_scale_cols,
+    scale_cols_total,
+):
+    """Map logical scale (row, col) indices to swizzled scale storage."""
+    num_k_tiles = scale_cols_total // 4
+
+    rows = logical_rows[:, None]
+    cols = logical_scale_cols[None, :]
+
+    row_tile = rows // 128
+    row_rem = rows % 128
+    inner_m = row_rem // 32
+    outer_m = row_rem % 32
+
+    k_tile = cols // 4
+    inner_k = cols % 4
+
+    # Swizzled storage layout:
+    # [m_tiles, k_tiles, 32, 4, 4] reshaped to 2D row-major.
+    linear_off = (
+        (
+            (
+                ((row_tile * num_k_tiles + k_tile) * 32 + outer_m) * 4 + inner_m
+            )
+            * 4
+            + inner_k
+        )
+    )
+    swizzled_rows = linear_off // scale_cols_total
+    swizzled_cols = linear_off % scale_cols_total
+    return scale_ptr + swizzled_rows * stride_sm + swizzled_cols * stride_sk
+
+
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def matmul_nvfp4_kernel_persistent(
     a_ptr,  # (M, K // 2), packed fp4
-    a_scale_ptr,  # (M, K // 16), fp8 block scales
+    a_scale_ptr,  # (M_padded, K_s_padded), fp8 block scales (swizzled)
     b_ptr,  # (N, K // 2), packed fp4
-    b_scale_ptr,  # (N, K // 16), fp8 block scales
+    b_scale_ptr,  # (N_padded, K_s_padded), fp8 block scales (swizzled)
     c_ptr,  # (M, N), output
     alpha_ptr,  # scalar fp32 global alpha
     M,
@@ -237,6 +300,8 @@ def matmul_nvfp4_kernel_persistent(
     stride_bsk,
     stride_cm,
     stride_cn,
+    a_scale_cols_total,
+    b_scale_cols_total,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -252,11 +317,11 @@ def matmul_nvfp4_kernel_persistent(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_tiles = num_pid_m * num_pid_n
 
-    tile_id_c = start_pid - NUM_SMS
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
     k_byte_offsets_for_mask = tl.arange(0, BLOCK_SIZE_K // 2)
-    k_scale_offsets_for_mask = tl.arange(0, BLOCK_SIZE_K // 16)
+
+    SCALE_K_TILE: tl.constexpr = BLOCK_SIZE_K // 16
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m, pid_n = _compute_pid(
@@ -279,49 +344,54 @@ def matmul_nvfp4_kernel_persistent(
         mask_m = offs_am < M
         mask_n = offs_bn < N
 
+        # Scale offsets use block-aligned indices (scale tensors are pre-padded
+        # to multiples of 128 rows and SCALE_K_TILE columns, so no masking).
+        scale_offs_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+        scale_offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)
+
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             if A_LARGE or B_LARGE:
                 offs_k_bytes = (
                     ki * (BLOCK_SIZE_K // 2) + tl.arange(0, BLOCK_SIZE_K // 2).to(tl.int64)
                 )
-                offs_k_scales = (
-                    ki * (BLOCK_SIZE_K // 16)
-                    + tl.arange(0, BLOCK_SIZE_K // 16).to(tl.int64)
-                )
             else:
                 offs_k_bytes = ki * (BLOCK_SIZE_K // 2) + tl.arange(0, BLOCK_SIZE_K // 2)
-                offs_k_scales = ki * (BLOCK_SIZE_K // 16) + tl.arange(0, BLOCK_SIZE_K // 16)
 
             a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k_bytes[None, :] * stride_ak
             b_ptrs = b_ptr + offs_bn[:, None] * stride_bm + offs_k_bytes[None, :] * stride_bk
 
-            a_scale_ptrs = (
-                a_scale_ptr
-                + offs_am[:, None] * stride_asm
-                + offs_k_scales[None, :] * stride_ask
+            scale_offs_k = ki * SCALE_K_TILE + tl.arange(0, SCALE_K_TILE)
+            a_scale_ptrs = _swizzled_scale_ptrs(
+                a_scale_ptr,
+                stride_asm,
+                stride_ask,
+                scale_offs_m,
+                scale_offs_k,
+                a_scale_cols_total,
             )
-            b_scale_ptrs = (
-                b_scale_ptr
-                + offs_bn[:, None] * stride_bsm
-                + offs_k_scales[None, :] * stride_bsk
+            b_scale_ptrs = _swizzled_scale_ptrs(
+                b_scale_ptr,
+                stride_bsm,
+                stride_bsk,
+                scale_offs_n,
+                scale_offs_k,
+                b_scale_cols_total,
             )
 
             remaining_k = K - ki * BLOCK_SIZE_K
-            remaining_k_bytes = tl.cdiv(remaining_k, 2)
-            remaining_k_scales = tl.cdiv(remaining_k, 16)
+            remaining_k_bytes = remaining_k // 2
 
             k_mask_bytes = k_byte_offsets_for_mask < remaining_k_bytes
-            k_mask_scales = k_scale_offsets_for_mask < remaining_k_scales
 
             a_mask = mask_m[:, None] & k_mask_bytes[None, :]
             b_mask = mask_n[:, None] & k_mask_bytes[None, :]
-            a_scale_mask = mask_m[:, None] & k_mask_scales[None, :]
-            b_scale_mask = mask_n[:, None] & k_mask_scales[None, :]
+            a_scale_mask = scale_offs_k[None, :] < a_scale_cols_total
+            b_scale_mask = scale_offs_k[None, :] < b_scale_cols_total
 
-            # LHS fp4 is packed along K, RHS is loaded as (N, K//2) and transposed.
             a = tl.load(a_ptrs, mask=a_mask, other=0)
             b = tl.load(b_ptrs, mask=b_mask, other=0).T
+
             a_scale = tl.load(a_scale_ptrs, mask=a_scale_mask, other=0.0)
             b_scale = tl.load(b_scale_ptrs, mask=b_scale_mask, other=0.0)
 
@@ -338,12 +408,8 @@ def matmul_nvfp4_kernel_persistent(
         alpha = tl.load(alpha_ptr).to(tl.float32)
         accumulator *= alpha
 
-        tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS
-        )
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        offs_cm = start_m + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = start_n + tl.arange(0, BLOCK_SIZE_N)
         if C_LARGE:
             offs_cm = offs_cm.to(tl.int64)
             offs_cn = offs_cn.to(tl.int64)
@@ -351,6 +417,21 @@ def matmul_nvfp4_kernel_persistent(
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         c = accumulator.to(c_ptr.dtype.element_ty)
         tl.store(c_ptrs, c, mask=c_mask)
+
+
+def _pad_scale_for_kernel(
+    scale: torch.Tensor,
+    needed_cols: int,
+) -> torch.Tensor:
+    """Zero-pad the K-scale dimension so the kernel can load full tiles
+    without out-of-bounds access.  Padding with zeros in the swizzled domain
+    is safe because all-zero swizzle blocks un-swizzle to all-zero standard
+    blocks."""
+    if scale.shape[1] < needed_cols:
+        scale = torch.nn.functional.pad(
+            scale, (0, needed_cols - scale.shape[1])
+        ).contiguous()
+    return scale
 
 
 def matmul_nvfp4_persistent(
@@ -369,6 +450,20 @@ def matmul_nvfp4_persistent(
     )
     assert alpha.dtype == torch.float32, "Expected alpha to be float32."
     assert a_fp4.shape[1] == b_fp4.shape[1], "Incompatible packed K dimensions."
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 256
+
+    assert BLOCK_SIZE_M % 128 == 0, (
+        "BLOCK_SIZE_M must be a multiple of 128 for NVFP4 scale un-swizzle."
+    )
+    assert BLOCK_SIZE_N % 128 == 0, (
+        "BLOCK_SIZE_N must be a multiple of 128 for NVFP4 scale un-swizzle."
+    )
+    assert (BLOCK_SIZE_K // 16) % 4 == 0, (
+        "BLOCK_SIZE_K // 16 must be a multiple of 4 for NVFP4 scale un-swizzle."
+    )
 
     M = a_fp4.shape[0]
     N = b_fp4.shape[0]
@@ -406,15 +501,17 @@ def matmul_nvfp4_persistent(
         b_scale.stride(1),
         c.stride(0),
         c.stride(1),
+        a_scale.shape[1],
+        b_scale.shape[1],
         NUM_SMS=NUM_SMS,
         A_LARGE=a_fp4.numel() > 2**31,
         B_LARGE=b_fp4.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
-        BLOCK_SIZE_M=128,
-        BLOCK_SIZE_N=128,
-        BLOCK_SIZE_K=256,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=8,
-        num_stages=4,
+        num_stages=2,
         num_warps=8,
     )
     return c
@@ -1134,10 +1231,6 @@ def linear_batch_invariant_nvfp4(
     """
     Deterministic Blackwell NVFP4 linear path using Triton tl.dot_scaled.
     """
-    if not current_platform.has_device_capability(100):
-        raise RuntimeError(
-            "Batch-invariant NVFP4 path requires Blackwell (sm100+) GPUs."
-        )
     if not hasattr(tl, "dot_scaled"):
         raise RuntimeError(
             "This Triton build does not expose tl.dot_scaled required for "
