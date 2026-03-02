@@ -265,6 +265,10 @@ _EMBEDDING_MODELS = {
         "nemotron_vl",
         "LlamaNemotronVLForEmbedding",
     ),
+    "LlamaNemotronColEmbedVLModel": (
+        "nemotron_vl",
+        "LlamaNemotronColEmbedVLModel",
+    ),
     # Technically Terratorch models work on images, both in
     # input and output. I am adding it here because it piggy-backs on embedding
     # models for the time being.

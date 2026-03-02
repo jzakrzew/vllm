@@ -599,6 +599,9 @@ _EMBEDDING_EXAMPLE_MODELS = {
     "ColModernVBertForRetrieval": _HfExamplesInfo(
         "ModernVBERT/colmodernvbert-merged",
     ),
+    "LlamaNemotronColEmbedVLModel": _HfExamplesInfo(
+        "nvidia/llama-nemotron-colembed-vl-3b-v2", trust_remote_code=True
+    ),
     "LlamaNemotronVLModel": _HfExamplesInfo(
         "nvidia/llama-nemotron-embed-vl-1b-v2", trust_remote_code=True
     ),

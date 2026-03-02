@@ -10,6 +10,7 @@
 import math
 from abc import ABC
 from collections.abc import Iterable
+from typing import ClassVar, Literal
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,7 @@ from transformers.image_processing_utils_fast import BaseImageProcessorFast
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.pooler import DispatchPooler
+from vllm.model_executor.layers.pooler.tokwise import pooler_for_token_embed
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.models.internvl import (
@@ -49,7 +51,7 @@ from .interfaces import (
     SupportsMultiModal,
     SupportsPP,
 )
-from .interfaces_base import VllmModelForPooling
+from .interfaces_base import VllmModelForPooling, default_pooling_type
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -940,3 +942,37 @@ class LlamaNemotronVLForSequenceClassification(
             loaded_weights.add(name)
 
         return loaded_weights
+
+
+# --------------------------------------------------------
+# LlamaNemotronColEmbedVL (nvidia/llama-nemotron-colembed-vl-3b-v2)
+# ColBERT-style late-interaction variant of LlamaNemotronVLForEmbedding:
+#   - Same SigLIP vision encoder and bidirectional LLaMA backbone
+#   - Per-token L2-normalized embeddings (no sequence-level pooling)
+#   - config.json `pooling: "colbert"` maps to vLLM token_embed task
+# --------------------------------------------------------
+
+
+@default_pooling_type(tok_pooling_type="ALL")
+class LlamaNemotronColEmbedVLModel(LlamaNemotronVLForEmbedding):
+    """LlamaNemotronVL late-interaction model for ColBERT-style retrieval.
+
+    Extends LlamaNemotronVLForEmbedding to produce per-token embeddings
+    instead of a single sequence-level embedding. This model supports the
+    "token_embed" pooling task and is designed for multi-vector retrieval
+    of documents containing both text and images.
+
+    The config field `pooling: "colbert"` indicates that MaxSim scoring
+    over per-token embeddings should be used at retrieval time.
+    """
+
+    supports_late_interaction: ClassVar[Literal[True]] = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        # Override the sequence-level pooler with a token-level pooler.
+        # config.json `pooling: "colbert"` → per-token (AllPool + L2 normalize).
+        pooler_config = vllm_config.model_config.pooler_config
+        assert pooler_config is not None
+        self.pooler = pooler_for_token_embed(pooler_config)

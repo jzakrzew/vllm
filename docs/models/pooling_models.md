@@ -559,6 +559,65 @@ curl -s http://localhost:8000/v1/embeddings -H "Content-Type: application/json" 
 }'
 ```
 
+### Llama Nemotron Multimodal Late Interaction Models
+
+Llama Nemotron ColEmbed VL models combine the bidirectional Llama backbone with SigLIP
+as the vision encoder to produce per-token L2-normalized embeddings for ColBERT-style
+late interaction retrieval over text and/or images.
+
+| Architecture | Backbone | Example HF Models |
+|---|---|---|
+| `LlamaNemotronColEmbedVLModel` | Bidirectional Llama + SigLIP | `nvidia/llama-nemotron-colembed-vl-3b-v2` |
+
+Start the server:
+
+```shell
+vllm serve nvidia/llama-nemotron-colembed-vl-3b-v2 \
+    --trust-remote-code \
+    --chat-template examples/pooling/embed/template/nemotron_embed_vl.jinja
+```
+
+!!! note
+    The chat template bundled with this model's tokenizer is not suitable for
+    the embeddings API. Use the provided override template above when serving
+    with the `messages`-based (chat-style) embeddings endpoint.
+
+    The override template uses the message `role` to automatically prepend the
+    appropriate prefix: set `role` to `"query"` for queries (prepends `query: `)
+    or `"document"` for passages (prepends `passage: `). Any other role omits
+    the prefix.
+
+Get per-token embeddings for a text query:
+
+```shell
+curl -s http://localhost:8000/pooling -H "Content-Type: application/json" -d '{
+    "model": "nvidia/llama-nemotron-colembed-vl-3b-v2",
+    "input": "What is machine learning?",
+    "task": "token_embed"
+}'
+```
+
+Get per-token embeddings for an image document:
+
+```shell
+curl -s http://localhost:8000/pooling -H "Content-Type: application/json" -d '{
+    "model": "nvidia/llama-nemotron-colembed-vl-3b-v2",
+    "messages": [
+        {
+            "role": "document",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,<BASE64>"}},
+                {"type": "text", "text": "Describe the image."}
+            ]
+        }
+    ],
+    "task": "token_embed"
+}'
+```
+
+For text-only and multi-modal scoring and reranking via `/score` and `/rerank`,
+the same API applies as for [ColQwen3 models](#colqwen3-multi-modal-late-interaction-models).
+
 ### Llama Nemotron Multimodal Reranker Models
 
 Llama Nemotron VL reranker models combine the same bidirectional Llama + SigLIP

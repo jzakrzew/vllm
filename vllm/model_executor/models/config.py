@@ -138,6 +138,10 @@ class LlamaNemotronVLConfig(VerifyAndUpdateConfig):
 
         # Get pooling type from config (check both top-level and llm_config)
         pooling = getattr(hf_config, "pooling", None)
+        if pooling == "colbert":
+            model_config.pooler_config.tok_pooling_type = "ALL"
+            return
+
         if pooling is None and hasattr(hf_config, "llm_config"):
             pooling = getattr(hf_config.llm_config, "pooling", "avg")
 
@@ -657,6 +661,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "LlamaBidirectionalModel": LlamaBidirectionalConfig,
     "LlamaNemotronVLModel": LlamaNemotronVLConfig,
     "LlamaNemotronVLForSequenceClassification": LlamaNemotronVLConfig,
+    "LlamaNemotronColEmbedVLModel": LlamaNemotronVLConfig,
     "NomicBertModel": NomicBertModelConfig,
     "Qwen2ForProcessRewardModel": Qwen2ForProcessRewardModelConfig,
     "Qwen2ForRewardModel": Qwen2ForRewardModelConfig,
