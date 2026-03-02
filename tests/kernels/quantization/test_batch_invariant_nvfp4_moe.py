@@ -6,12 +6,16 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import make_dummy_moe_config, make_test_weights
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
-from vllm.model_executor.layers.fused_moe.batch_invariant_moe import fused_moe_batch_invariant_nvfp4
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.batch_invariant_moe import (
+    fused_moe_batch_invariant_nvfp4,
+)
 from vllm.model_executor.layers.fused_moe.config import nvfp4_moe_quant_config
 from vllm.model_executor.layers.fused_moe.cutlass_moe import CutlassExpertsFp4
-from vllm.model_executor.layers.fused_moe.prepare_finalize import MoEPrepareAndFinalizeNoEP
+from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+    MoEPrepareAndFinalizeNoEP,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.torch_utils import set_random_seed
