@@ -301,7 +301,6 @@ def matmul_nvfp4_kernel_persistent(
     NUM_SMS: tl.constexpr,
     A_LARGE: tl.constexpr,
     B_LARGE: tl.constexpr,
-    C_LARGE: tl.constexpr,
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -311,9 +310,67 @@ def matmul_nvfp4_kernel_persistent(
 
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    k_byte_offsets_for_mask = tl.arange(0, BLOCK_SIZE_K // 2)
-
+    K_BYTES: tl.constexpr = BLOCK_SIZE_K // 2
     SCALE_K_TILE: tl.constexpr = BLOCK_SIZE_K // 16
+    SCALE_K_TILES: tl.constexpr = SCALE_K_TILE // 4
+    SCALE_M_TILES: tl.constexpr = BLOCK_SIZE_M // 128
+    SCALE_N_TILES: tl.constexpr = BLOCK_SIZE_N // 128
+
+    k_bytes = K // 2
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, k_bytes],
+        strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_SIZE_M, K_BYTES],
+        padding_option="zero",
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[N, k_bytes],
+        strides=[stride_bm, stride_bk],
+        block_shape=[BLOCK_SIZE_N, K_BYTES],
+        padding_option="zero",
+    )
+
+    # Swizzled scale storage is logically 5D:
+    # [m_tiles, k_tiles, 32, 4, 4] in row-major.
+    # Reshape the trailing 32*16 = 512 elements into (2, 256) so the
+    # innermost TMA dimension is 256 bytes, avoiding many small messages.
+    a_scale_desc = tl.make_tensor_descriptor(
+        a_scale_ptr,
+        shape=[1, tl.cdiv(M, 128), a_scale_cols_total // 4, 2, 256],
+        strides=[
+            tl.cdiv(M, 128) * (a_scale_cols_total // 4) * 512 * stride_ask,
+            (a_scale_cols_total // 4) * 512 * stride_ask,
+            512 * stride_ask,
+            256 * stride_ask,
+            stride_ask,
+        ],
+        block_shape=[1, SCALE_M_TILES, SCALE_K_TILES, 2, 256],
+        padding_option="zero",
+    )
+    b_scale_desc = tl.make_tensor_descriptor(
+        b_scale_ptr,
+        shape=[1, tl.cdiv(N, 128), b_scale_cols_total // 4, 2, 256],
+        strides=[
+            tl.cdiv(N, 128) * (b_scale_cols_total // 4) * 512 * stride_bsk,
+            (b_scale_cols_total // 4) * 512 * stride_bsk,
+            512 * stride_bsk,
+            256 * stride_bsk,
+            stride_bsk,
+        ],
+        block_shape=[1, SCALE_N_TILES, SCALE_K_TILES, 2, 256],
+        padding_option="zero",
+    )
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        shape=[M, N],
+        strides=[stride_cm, stride_cn],
+        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        padding_option="zero",
+    )
+
+    alpha = tl.load(alpha_ptr).to(tl.float32)
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m, pid_n = _compute_pid(
@@ -322,76 +379,47 @@ def matmul_nvfp4_kernel_persistent(
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
 
-        offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
-        offs_bn = start_n + tl.arange(0, BLOCK_SIZE_N)
-        if A_LARGE:
-            offs_am = offs_am.to(tl.int64)
-        if B_LARGE:
-            offs_bn = offs_bn.to(tl.int64)
-        offs_am = tl.where(offs_am < M, offs_am, 0)
-        offs_bn = tl.where(offs_bn < N, offs_bn, 0)
-        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
-        offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-
-        mask_m = offs_am < M
-        mask_n = offs_bn < N
-
         # Scale offsets use block-aligned indices (scale tensors are pre-padded
         # to multiples of 128 rows and SCALE_K_TILE columns, so no masking).
-        scale_offs_m = start_m + tl.arange(0, BLOCK_SIZE_M)
-        scale_offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)
-
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
+            k_start_bytes = ki * K_BYTES
             if A_LARGE or B_LARGE:
-                offs_k_bytes = ki * (BLOCK_SIZE_K // 2) + tl.arange(
-                    0, BLOCK_SIZE_K // 2
-                ).to(tl.int64)
-            else:
-                offs_k_bytes = ki * (BLOCK_SIZE_K // 2) + tl.arange(
-                    0, BLOCK_SIZE_K // 2
-                )
+                k_start_bytes = k_start_bytes.to(tl.int64)
 
-            a_ptrs = (
-                a_ptr + offs_am[:, None] * stride_am + offs_k_bytes[None, :] * stride_ak
+            a_m_start = start_m
+            b_n_start = start_n
+            if A_LARGE:
+                a_m_start = a_m_start.to(tl.int64)
+            if B_LARGE:
+                b_n_start = b_n_start.to(tl.int64)
+
+            a = a_desc.load([a_m_start, k_start_bytes])
+            b = b_desc.load([b_n_start, k_start_bytes]).T
+
+            scale_tile_k = ki * SCALE_K_TILES
+            if A_LARGE or B_LARGE:
+                scale_tile_k = scale_tile_k.to(tl.int64)
+            scale_tile_m = start_m // 128
+            scale_tile_n = start_n // 128
+            if A_LARGE:
+                scale_tile_m = scale_tile_m.to(tl.int64)
+            if B_LARGE:
+                scale_tile_n = scale_tile_n.to(tl.int64)
+
+            a_scale_raw = a_scale_desc.load([0, scale_tile_m, scale_tile_k, 0, 0])
+            b_scale_raw = b_scale_desc.load([0, scale_tile_n, scale_tile_k, 0, 0])
+
+            a_scale = _unswizzle_scale(
+                a_scale_raw.reshape(BLOCK_SIZE_M, SCALE_K_TILE),
+                TILE_ROWS=BLOCK_SIZE_M,
+                TILE_SCALE_COLS=SCALE_K_TILE,
             )
-            b_ptrs = (
-                b_ptr + offs_bn[:, None] * stride_bm + offs_k_bytes[None, :] * stride_bk
+            b_scale = _unswizzle_scale(
+                b_scale_raw.reshape(BLOCK_SIZE_N, SCALE_K_TILE),
+                TILE_ROWS=BLOCK_SIZE_N,
+                TILE_SCALE_COLS=SCALE_K_TILE,
             )
-
-            scale_offs_k = ki * SCALE_K_TILE + tl.arange(0, SCALE_K_TILE)
-            a_scale_ptrs = _swizzled_scale_ptrs(
-                a_scale_ptr,
-                stride_asm,
-                stride_ask,
-                scale_offs_m,
-                scale_offs_k,
-                a_scale_cols_total,
-            )
-            b_scale_ptrs = _swizzled_scale_ptrs(
-                b_scale_ptr,
-                stride_bsm,
-                stride_bsk,
-                scale_offs_n,
-                scale_offs_k,
-                b_scale_cols_total,
-            )
-
-            remaining_k = K - ki * BLOCK_SIZE_K
-            remaining_k_bytes = remaining_k // 2
-
-            k_mask_bytes = k_byte_offsets_for_mask < remaining_k_bytes
-
-            a_mask = mask_m[:, None] & k_mask_bytes[None, :]
-            b_mask = mask_n[:, None] & k_mask_bytes[None, :]
-            a_scale_mask = scale_offs_k[None, :] < a_scale_cols_total
-            b_scale_mask = scale_offs_k[None, :] < b_scale_cols_total
-
-            a = tl.load(a_ptrs, mask=a_mask, other=0)
-            b = tl.load(b_ptrs, mask=b_mask, other=0).T
-
-            a_scale = tl.load(a_scale_ptrs, mask=a_scale_mask, other=0.0)
-            b_scale = tl.load(b_scale_ptrs, mask=b_scale_mask, other=0.0)
 
             accumulator = tl.dot_scaled(
                 a,
@@ -403,18 +431,9 @@ def matmul_nvfp4_kernel_persistent(
                 accumulator,
             )
 
-        alpha = tl.load(alpha_ptr).to(tl.float32)
         accumulator *= alpha
-
-        offs_cm = start_m + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = start_n + tl.arange(0, BLOCK_SIZE_N)
-        if C_LARGE:
-            offs_cm = offs_cm.to(tl.int64)
-            offs_cn = offs_cn.to(tl.int64)
-        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         c = accumulator.to(c_ptr.dtype.element_ty)
-        tl.store(c_ptrs, c, mask=c_mask)
+        c_desc.store([start_m, start_n], c)
 
 
 def _pad_scale_for_kernel(
@@ -504,7 +523,6 @@ def matmul_nvfp4_persistent(
         NUM_SMS=NUM_SMS,
         A_LARGE=a_fp4.numel() > 2**31,
         B_LARGE=b_fp4.numel() > 2**31,
-        C_LARGE=c.numel() > 2**31,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
