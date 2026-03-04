@@ -271,6 +271,182 @@ def test_batch_invariant_nvfp4_moe_batch_size_invariance(
 
 
 @torch.inference_mode()
+def test_batch_invariant_nvfp4_moe_ignores_invalid_sentinel_routes() -> None:
+    set_random_seed(23)
+    m, e, n, k = 32, 8, 128, 128
+    (
+        hidden_states,
+        _,
+        _,
+        w1_q,
+        w1_blockscale,
+        w2_q,
+        w2_blockscale,
+        a1_gscale,
+        a2_gscale,
+        g1_alphas,
+        g2_alphas,
+    ) = _make_nvfp4_moe_tensors(m=m, n=n, k=k, e=e, topk=1)
+
+    valid_topk_ids = torch.randint(0, e, (m, 1), device=DEVICE, dtype=torch.int64)
+    valid_topk_weights = torch.rand((m, 1), device=DEVICE, dtype=torch.float32)
+    invalid_topk_ids = torch.full((m, 1), -1, device=DEVICE, dtype=torch.int64)
+    invalid_topk_weights = torch.rand((m, 1), device=DEVICE, dtype=torch.float32)
+
+    topk_ids_with_invalid = torch.cat([valid_topk_ids, invalid_topk_ids], dim=1)
+    topk_weights_with_invalid = torch.cat(
+        [valid_topk_weights, invalid_topk_weights], dim=1
+    )
+
+    out_with_invalid = fused_moe_batch_invariant_nvfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids_with_invalid,
+        topk_weights=topk_weights_with_invalid,
+        w13_weight=w1_q,
+        w13_weight_scale=w1_blockscale,
+        w2_weight=w2_q,
+        w2_weight_scale=w2_blockscale,
+        a1_gscale=a1_gscale,
+        g1_alphas=g1_alphas,
+        a2_gscale=a2_gscale,
+        g2_alphas=g2_alphas,
+        activation=MoEActivation.SILU,
+    )
+    out_valid_only = fused_moe_batch_invariant_nvfp4(
+        hidden_states=hidden_states,
+        topk_ids=valid_topk_ids,
+        topk_weights=valid_topk_weights,
+        w13_weight=w1_q,
+        w13_weight_scale=w1_blockscale,
+        w2_weight=w2_q,
+        w2_weight_scale=w2_blockscale,
+        a1_gscale=a1_gscale,
+        g1_alphas=g1_alphas,
+        a2_gscale=a2_gscale,
+        g2_alphas=g2_alphas,
+        activation=MoEActivation.SILU,
+    )
+
+    torch.testing.assert_close(out_with_invalid, out_valid_only, atol=1e-1, rtol=1e-1)
+
+
+@torch.inference_mode()
+def test_batch_invariant_nvfp4_moe_expert_map_invalidation_matches_local_routes() -> (
+    None
+):
+    set_random_seed(29)
+    m, e_local, n, k = 32, 4, 128, 128
+    (
+        hidden_states,
+        _,
+        _,
+        w1_q,
+        w1_blockscale,
+        w2_q,
+        w2_blockscale,
+        a1_gscale,
+        a2_gscale,
+        g1_alphas,
+        g2_alphas,
+    ) = _make_nvfp4_moe_tensors(m=m, n=n, k=k, e=e_local, topk=1)
+
+    global_num_experts = 8
+    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32, device=DEVICE)
+    mapped_global_ids = torch.tensor([1, 3, 5, 7], dtype=torch.int64, device=DEVICE)
+    expert_map[mapped_global_ids] = torch.arange(
+        e_local, dtype=torch.int32, device=DEVICE
+    )
+
+    valid_global_ids = mapped_global_ids[
+        torch.randint(0, mapped_global_ids.numel(), (m, 1), device=DEVICE)
+    ]
+    invalid_global_candidates = torch.tensor(
+        [0, 2, 4, 6], dtype=torch.int64, device=DEVICE
+    )
+    invalid_global_ids = invalid_global_candidates[
+        torch.randint(0, invalid_global_candidates.numel(), (m, 1), device=DEVICE)
+    ]
+    topk_ids_global = torch.cat([valid_global_ids, invalid_global_ids], dim=1)
+    topk_weights_global = torch.rand((m, 2), device=DEVICE, dtype=torch.float32)
+
+    out_with_expert_map = fused_moe_batch_invariant_nvfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids_global,
+        topk_weights=topk_weights_global,
+        w13_weight=w1_q,
+        w13_weight_scale=w1_blockscale,
+        w2_weight=w2_q,
+        w2_weight_scale=w2_blockscale,
+        a1_gscale=a1_gscale,
+        g1_alphas=g1_alphas,
+        a2_gscale=a2_gscale,
+        g2_alphas=g2_alphas,
+        activation=MoEActivation.SILU,
+        expert_map=expert_map,
+    )
+
+    topk_ids_local = expert_map[topk_ids_global[:, :1]].to(torch.int64)
+    assert torch.all(topk_ids_local >= 0)
+    out_local_only = fused_moe_batch_invariant_nvfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids_local,
+        topk_weights=topk_weights_global[:, :1].contiguous(),
+        w13_weight=w1_q,
+        w13_weight_scale=w1_blockscale,
+        w2_weight=w2_q,
+        w2_weight_scale=w2_blockscale,
+        a1_gscale=a1_gscale,
+        g1_alphas=g1_alphas,
+        a2_gscale=a2_gscale,
+        g2_alphas=g2_alphas,
+        activation=MoEActivation.SILU,
+        expert_map=None,
+    )
+
+    torch.testing.assert_close(
+        out_with_expert_map, out_local_only, atol=1e-1, rtol=1e-1
+    )
+
+
+@torch.inference_mode()
+def test_batch_invariant_nvfp4_moe_all_invalid_routes_return_zero() -> None:
+    set_random_seed(31)
+    m, e, n, k = 16, 8, 128, 128
+    (
+        hidden_states,
+        _,
+        _,
+        w1_q,
+        w1_blockscale,
+        w2_q,
+        w2_blockscale,
+        a1_gscale,
+        a2_gscale,
+        g1_alphas,
+        g2_alphas,
+    ) = _make_nvfp4_moe_tensors(m=m, n=n, k=k, e=e, topk=1)
+
+    topk_ids = torch.full((m, 2), -1, dtype=torch.int64, device=DEVICE)
+    topk_weights = torch.rand((m, 2), dtype=torch.float32, device=DEVICE)
+    out = fused_moe_batch_invariant_nvfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w1_q,
+        w13_weight_scale=w1_blockscale,
+        w2_weight=w2_q,
+        w2_weight_scale=w2_blockscale,
+        a1_gscale=a1_gscale,
+        g1_alphas=g1_alphas,
+        a2_gscale=a2_gscale,
+        g2_alphas=g2_alphas,
+        activation=MoEActivation.SILU,
+    )
+
+    torch.testing.assert_close(out, torch.zeros_like(out), atol=0.0, rtol=0.0)
+
+
+@torch.inference_mode()
 def test_grouped_matmul_nvfp4_packed_matches_cutlass_reference() -> None:
     set_random_seed(17)
 

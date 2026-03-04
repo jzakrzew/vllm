@@ -484,7 +484,6 @@ def _grouped_matmul_nvfp4_packed_kernel(
     )
 
     k_bytes = K // 2
-    k_scale_cols = tl.cdiv(K, 16)
     alpha = tl.load(alpha_ptr + expert_id).to(tl.float32)
     start_m = pid_m * BLOCK_SIZE_M
     start_n = pid_n * BLOCK_SIZE_N
@@ -527,13 +526,6 @@ def _grouped_matmul_nvfp4_packed_kernel(
         )
         b_scale_raw = b_scale_desc.load([0, scale_tile_n, scale_tile_k, 0, 0]).reshape(
             BLOCK_SIZE_N, SCALE_K_TILE
-        )
-        k_scale_mask = (ki * SCALE_K_TILE + tl.arange(0, SCALE_K_TILE)) < k_scale_cols
-        a_scale_raw = tl.where(
-            m_mask[:, None] & k_scale_mask[None, :], a_scale_raw, 0.0
-        )
-        b_scale_raw = tl.where(
-            n_mask[:, None] & k_scale_mask[None, :], b_scale_raw, 0.0
         )
 
         a_scale = _unswizzle_scale(
@@ -1074,7 +1066,33 @@ def fused_moe_batch_invariant_nvfp4(
         problem_sizes1[:, 1].fill_(w1_output_size)
         problem_sizes2[:, 2].fill_(activation_out_dim)
 
-    packed_hidden_states = ops.shuffle_rows(packed_hidden_states, a_map)
+    _is_capturing = (
+        torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
+    )
+
+    if _is_capturing:
+        # During CUDA graph capture we cannot transfer data to the host.
+        # Use the worst-case row count; the kernels below already rely on
+        # expert_offsets / problem_sizes for actual boundaries.
+        valid_rows = M_total
+    else:
+        valid_rows = int(expert_offsets[-1].item())
+        if valid_rows == 0:
+            if workspace2 is not None:
+                reduced = _resize_cache(workspace2, (num_tokens, hidden_dim))
+                reduced.zero_()
+            else:
+                reduced = torch.zeros(
+                    (num_tokens, hidden_dim), device=device, dtype=dtype
+                )
+            return reduced
+
+    # `get_cutlass_moe_mm_data()` only defines valid source rows in the first
+    # `expert_offsets[-1]` positions of `a_map`. Keep quant/GEMM on this packed
+    # prefix so invalid routes never enter expert quantization.
+    packed_hidden_states = ops.shuffle_rows(
+        packed_hidden_states, a_map[:valid_rows].contiguous()
+    )
 
     a1_gscale_vec = _nvfp4_get_expert_vector(
         a1_gscale, num_experts=num_experts, field_name="a1_gscale"
@@ -1124,10 +1142,10 @@ def fused_moe_batch_invariant_nvfp4(
         )
     else:
         if workspace2 is not None:
-            act_out = _resize_cache(workspace2, (M_total, activation_out_dim))
+            act_out = _resize_cache(workspace2, (valid_rows, activation_out_dim))
         else:
             act_out = torch.empty(
-                (M_total, activation_out_dim), device=device, dtype=dtype
+                (valid_rows, activation_out_dim), device=device, dtype=dtype
             )
         apply_moe_activation(
             activation=activation_kind,
