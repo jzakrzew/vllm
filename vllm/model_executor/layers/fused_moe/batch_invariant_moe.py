@@ -368,6 +368,10 @@ def _grouped_matmul_nvfp4_packed_kernel(
     expert_offsets_ptr,
     a_scale_offsets_ptr,
     problem_sizes_ptr,
+    M_total,
+    N_total,
+    K_total,
+    a_scale_rows_total,
     stride_ps0,
     stride_ps1,
     stride_am,
@@ -433,26 +437,29 @@ def _grouped_matmul_nvfp4_packed_kernel(
     b_scale_expert_ptr = b_scale_ptr + expert_id * stride_ebs
     c_expert_ptr = c_ptr + expert_row_offset * stride_cm
 
-    k_bytes = K // 2
+    k_bytes_total = K_total // 2
     a_desc = tl.make_tensor_descriptor(
         a_expert_ptr,
-        shape=[M, k_bytes],
+        shape=[M_total, k_bytes_total],
         strides=[stride_am, stride_ak],
         block_shape=[BLOCK_SIZE_M, K_BYTES],
         padding_option="zero",
     )
     b_desc = tl.make_tensor_descriptor(
         b_expert_ptr,
-        shape=[N, k_bytes],
+        shape=[N_total, k_bytes_total],
         strides=[stride_bm, stride_bk],
         block_shape=[BLOCK_SIZE_N, K_BYTES],
         padding_option="zero",
     )
     a_scale_desc = tl.make_tensor_descriptor(
         a_scale_expert_ptr,
-        shape=[1, tl.cdiv(M, 128), a_scale_cols_total // 4, 2, 256],
+        shape=[1, tl.cdiv(a_scale_rows_total, 128), a_scale_cols_total // 4, 2, 256],
         strides=[
-            tl.cdiv(M, 128) * (a_scale_cols_total // 4) * 512 * stride_ask,
+            tl.cdiv(a_scale_rows_total, 128)
+            * (a_scale_cols_total // 4)
+            * 512
+            * stride_ask,
             (a_scale_cols_total // 4) * 512 * stride_ask,
             512 * stride_ask,
             256 * stride_ask,
@@ -463,9 +470,9 @@ def _grouped_matmul_nvfp4_packed_kernel(
     )
     b_scale_desc = tl.make_tensor_descriptor(
         b_scale_expert_ptr,
-        shape=[1, tl.cdiv(N, 128), b_scale_cols_total // 4, 2, 256],
+        shape=[1, tl.cdiv(N_total, 128), b_scale_cols_total // 4, 2, 256],
         strides=[
-            tl.cdiv(N, 128) * (b_scale_cols_total // 4) * 512 * stride_bsk,
+            tl.cdiv(N_total, 128) * (b_scale_cols_total // 4) * 512 * stride_bsk,
             (b_scale_cols_total // 4) * 512 * stride_bsk,
             512 * stride_bsk,
             256 * stride_bsk,
@@ -474,23 +481,23 @@ def _grouped_matmul_nvfp4_packed_kernel(
         block_shape=[1, SCALE_N_TILES, SCALE_K_TILES, 2, 256],
         padding_option="zero",
     )
-    c_desc = tl.make_tensor_descriptor(
-        c_expert_ptr,
-        shape=[M, N],
-        strides=[stride_cm, stride_cn],
-        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-        padding_option="zero",
-    )
 
+    k_bytes = K // 2
+    k_scale_cols = tl.cdiv(K, 16)
     alpha = tl.load(alpha_ptr + expert_id).to(tl.float32)
     start_m = pid_m * BLOCK_SIZE_M
     start_n = pid_n * BLOCK_SIZE_N
+    offs_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for ki in range(k_tiles):
         k_start_bytes = ki * K_BYTES
         if A_LARGE or B_LARGE:
             k_start_bytes = k_start_bytes.to(tl.int64)
+        k_byte_mask = (ki * K_BYTES + tl.arange(0, K_BYTES)) < k_bytes
 
         a_m_start = start_m
         b_n_start = start_n
@@ -500,7 +507,9 @@ def _grouped_matmul_nvfp4_packed_kernel(
             b_n_start = b_n_start.to(tl.int64)
 
         a = a_desc.load([a_m_start, k_start_bytes])
-        b = b_desc.load([b_n_start, k_start_bytes]).T
+        b_raw = b_desc.load([b_n_start, k_start_bytes])
+        a = tl.where(m_mask[:, None] & k_byte_mask[None, :], a, 0)
+        b = tl.where(n_mask[:, None] & k_byte_mask[None, :], b_raw, 0).T
 
         scale_tile_k = ki * SCALE_K_TILES
         if A_LARGE or B_LARGE:
@@ -512,16 +521,27 @@ def _grouped_matmul_nvfp4_packed_kernel(
         if B_LARGE:
             scale_tile_n = scale_tile_n.to(tl.int64)
 
-        a_scale_raw = a_scale_desc.load([0, scale_tile_m, scale_tile_k, 0, 0])
-        b_scale_raw = b_scale_desc.load([0, scale_tile_n, scale_tile_k, 0, 0])
+        a_scale_raw = a_scale_desc.load([0, scale_tile_m, scale_tile_k, 0, 0]).reshape(
+            BLOCK_SIZE_M, SCALE_K_TILE
+        )
+        b_scale_raw = b_scale_desc.load([0, scale_tile_n, scale_tile_k, 0, 0]).reshape(
+            BLOCK_SIZE_N, SCALE_K_TILE
+        )
+        k_scale_mask = (ki * SCALE_K_TILE + tl.arange(0, SCALE_K_TILE)) < k_scale_cols
+        a_scale_raw = tl.where(
+            m_mask[:, None] & k_scale_mask[None, :], a_scale_raw, 0.0
+        )
+        b_scale_raw = tl.where(
+            n_mask[:, None] & k_scale_mask[None, :], b_scale_raw, 0.0
+        )
 
         a_scale = _unswizzle_scale(
-            a_scale_raw.reshape(BLOCK_SIZE_M, SCALE_K_TILE),
+            a_scale_raw,
             TILE_ROWS=BLOCK_SIZE_M,
             TILE_SCALE_COLS=SCALE_K_TILE,
         )
         b_scale = _unswizzle_scale(
-            b_scale_raw.reshape(BLOCK_SIZE_N, SCALE_K_TILE),
+            b_scale_raw,
             TILE_ROWS=BLOCK_SIZE_N,
             TILE_SCALE_COLS=SCALE_K_TILE,
         )
@@ -538,7 +558,16 @@ def _grouped_matmul_nvfp4_packed_kernel(
 
     accumulator *= alpha
     c = accumulator.to(c_ptr.dtype.element_ty)
-    c_desc.store([start_m, start_n], c)
+    offs_m_c = offs_m
+    offs_n_c = offs_n
+    if A_LARGE:
+        offs_m_c = offs_m_c.to(tl.int64)
+    if B_LARGE:
+        offs_n_c = offs_n_c.to(tl.int64)
+    c_ptrs = (
+        c_expert_ptr + offs_m_c[:, None] * stride_cm + offs_n_c[None, :] * stride_cn
+    )
+    tl.store(c_ptrs, c, mask=m_mask[:, None] & n_mask[None, :])
 
 
 def _canonicalize_grouped_offsets(
@@ -645,6 +674,8 @@ def _grouped_matmul_nvfp4_packed(
         a_scale_offsets, num_experts=E, name="a_scale_offsets"
     )
     problem_sizes = problem_sizes.to(dtype=torch.int32).contiguous()
+    if not a_fp4.is_contiguous():
+        a_fp4 = a_fp4.contiguous()
     if not a_scale.is_contiguous():
         a_scale = a_scale.contiguous()
     if not b_scale.is_contiguous():
@@ -668,10 +699,17 @@ def _grouped_matmul_nvfp4_packed(
         raise RuntimeError(
             "a_scale_offsets + M from problem_sizes exceed packed scale rows."
         )
+    if int(problem_sizes[:, 1].max().item()) > b_fp4.shape[1]:
+        raise RuntimeError(
+            "problem_sizes N exceeds packed expert-weight row dimension."
+        )
+    if int(problem_sizes[:, 2].max().item()) > a_fp4.shape[1] * 2:
+        raise RuntimeError("problem_sizes K exceeds packed activation K dimension.")
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 256
+    PAD_ROWS = BLOCK_SIZE_M
 
     m_tiles = torch.div(
         problem_sizes[:, 0].clamp_min(0) + BLOCK_SIZE_M - 1,
@@ -685,50 +723,57 @@ def _grouped_matmul_nvfp4_packed(
     )
     max_tiles_per_expert = int((m_tiles * n_tiles).max().item())
 
-    c = torch.zeros(
-        (a_fp4.shape[0], b_fp4.shape[1]),
+    # Guard rows avoid descriptor OOB reads in the last expert tile.
+    a_fp4_work = torch.nn.functional.pad(a_fp4, (0, 0, 0, PAD_ROWS)).contiguous()
+    a_scale_work = torch.nn.functional.pad(a_scale, (0, 0, 0, PAD_ROWS)).contiguous()
+    c_work = torch.zeros(
+        (a_fp4_work.shape[0], b_fp4.shape[1]),
         device=a_fp4.device,
         dtype=output_dtype,
     )
     if max_tiles_per_expert == 0:
-        return c
+        return c_work[: a_fp4.shape[0]]
 
     grid = (E, max_tiles_per_expert)
     _grouped_matmul_nvfp4_packed_kernel[grid](
-        a_fp4,
-        a_scale,
+        a_fp4_work,
+        a_scale_work,
         b_fp4,
         b_scale,
-        c,
+        c_work,
         alpha,
         expert_offsets,
         a_scale_offsets,
         problem_sizes,
+        a_fp4_work.shape[0],
+        b_fp4.shape[1],
+        a_fp4_work.shape[1] * 2,
+        a_scale_work.shape[0],
         problem_sizes.stride(0),
         problem_sizes.stride(1),
-        a_fp4.stride(0),
-        a_fp4.stride(1),
-        a_scale.stride(0),
-        a_scale.stride(1),
+        a_fp4_work.stride(0),
+        a_fp4_work.stride(1),
+        a_scale_work.stride(0),
+        a_scale_work.stride(1),
         b_fp4.stride(0),
         b_scale.stride(0),
         b_fp4.stride(1),
         b_fp4.stride(2),
         b_scale.stride(2),
-        c.stride(0),
-        c.stride(1),
-        a_scale.shape[1],
+        c_work.stride(0),
+        c_work.stride(1),
+        a_scale_work.shape[1],
         b_scale.shape[2],
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=8,
-        A_LARGE=max(a_fp4.numel(), a_scale.numel(), c.numel()) > 2**31,
+        A_LARGE=max(a_fp4_work.numel(), a_scale_work.numel(), c_work.numel()) > 2**31,
         B_LARGE=max(b_fp4.numel(), b_scale.numel()) > 2**31,
         num_stages=2,
         num_warps=8,
     )
-    return c
+    return c_work[: a_fp4.shape[0]]
 
 
 # ---------------------------------------------------------------------------
