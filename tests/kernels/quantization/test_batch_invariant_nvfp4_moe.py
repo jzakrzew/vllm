@@ -113,6 +113,7 @@ def _make_nvfp4_moe_tensors(
     [
         (1, False),
         (2, False),
+        (4, False),
         (1, True),
     ],
 )
@@ -190,6 +191,7 @@ def test_batch_invariant_nvfp4_moe_matches_cutlass(
     [
         (1, False),
         (2, False),
+        (4, False),
         (1, True),
     ],
 )
