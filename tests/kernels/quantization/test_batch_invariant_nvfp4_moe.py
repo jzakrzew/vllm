@@ -5,16 +5,23 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import make_dummy_moe_config, make_test_weights
+from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.batch_invariant_moe import (
+    _grouped_matmul_nvfp4_packed,
     fused_moe_batch_invariant_nvfp4,
 )
 from vllm.model_executor.layers.fused_moe.config import nvfp4_moe_quant_config
 from vllm.model_executor.layers.fused_moe.cutlass_moe import CutlassExpertsFp4
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoEP,
+)
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    pad_nvfp4_activation_for_cutlass,
+    prepare_weights_for_nvfp4_cutlass,
+    slice_nvfp4_output,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
@@ -34,6 +41,12 @@ if not hasattr(tl, "dot_scaled"):
 
 DTYPE = torch.bfloat16
 DEVICE = "cuda:0"
+FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+FLOAT4_E2M1_MAX = 6.0
+
+
+def _global_scale(x: torch.Tensor) -> torch.Tensor:
+    return (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / x.abs().max()).to(torch.float32)
 
 
 def _make_nvfp4_moe_tensors(
@@ -253,3 +266,95 @@ def test_batch_invariant_nvfp4_moe_batch_size_invariance(
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
     assert torch.equal(out_single[0], out_batch[0])
+
+
+@torch.inference_mode()
+def test_grouped_matmul_nvfp4_packed_matches_cutlass_reference() -> None:
+    set_random_seed(17)
+
+    # Non-uniform M across experts exercises offset/problem-size dispatch.
+    per_expert_rows = [17, 131, 64, 5]
+    E = len(per_expert_rows)
+    N = 128
+    K = 256
+
+    xs = [
+        torch.randn((rows, K), dtype=DTYPE, device=DEVICE) for rows in per_expert_rows
+    ]
+    ws = [torch.randn((N, K), dtype=DTYPE, device=DEVICE) for _ in range(E)]
+
+    input_gs = [_global_scale(x) for x in xs]
+    weight_gs = [_global_scale(w) for w in ws]
+    alphas = [
+        (1.0 / (ig * wg)).to(torch.float32) for ig, wg in zip(input_gs, weight_gs)
+    ]
+
+    packed_a_fp4 = []
+    packed_a_scale = []
+    packed_b_fp4 = []
+    packed_b_scale = []
+    ref_outputs = []
+    expert_offsets = []
+    a_scale_offsets = []
+
+    row_offset = 0
+    scale_row_offset = 0
+    for expert_id, rows in enumerate(per_expert_rows):
+        a_fp4, a_scale = scaled_fp4_quant(
+            xs[expert_id], input_gs[expert_id], is_sf_swizzled_layout=True
+        )
+        b_fp4, b_scale_raw = scaled_fp4_quant(ws[expert_id], weight_gs[expert_id])
+        b_fp4, b_scale, weights_padding_cols = prepare_weights_for_nvfp4_cutlass(
+            b_fp4, b_scale_raw
+        )
+        a_fp4 = pad_nvfp4_activation_for_cutlass(a_fp4, weights_padding_cols)
+
+        # Reference: one CUTLASS launch per expert.
+        ref = cutlass_scaled_fp4_mm(
+            a_fp4,
+            b_fp4,
+            a_scale,
+            b_scale,
+            alphas[expert_id],
+            DTYPE,
+        )
+        ref_outputs.append(slice_nvfp4_output(ref, N))
+
+        packed_a_fp4.append(a_fp4)
+        packed_a_scale.append(a_scale)
+        packed_b_fp4.append(b_fp4)
+        packed_b_scale.append(b_scale)
+        expert_offsets.append(row_offset)
+        a_scale_offsets.append(scale_row_offset)
+        row_offset += rows
+        scale_row_offset += a_scale.shape[0]
+
+    packed_a_fp4_t = torch.cat(packed_a_fp4, dim=0)
+    packed_a_scale_t = torch.cat(packed_a_scale, dim=0)
+    packed_b_fp4_t = torch.stack(packed_b_fp4, dim=0)
+    packed_b_scale_t = torch.stack(packed_b_scale, dim=0)
+    alpha_t = torch.stack(alphas)
+    expert_offsets_t = torch.tensor(expert_offsets, dtype=torch.int32, device=DEVICE)
+    a_scale_offsets_t = torch.tensor(a_scale_offsets, dtype=torch.int32, device=DEVICE)
+    problem_sizes_t = torch.tensor(
+        [[rows, N, K] for rows in per_expert_rows],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+
+    packed_out = _grouped_matmul_nvfp4_packed(
+        a_fp4=packed_a_fp4_t,
+        b_fp4=packed_b_fp4_t,
+        a_scale=packed_a_scale_t,
+        b_scale=packed_b_scale_t,
+        alpha=alpha_t,
+        expert_offsets=expert_offsets_t,
+        a_scale_offsets=a_scale_offsets_t,
+        problem_sizes=problem_sizes_t,
+        output_dtype=DTYPE,
+    )
+    if packed_out.shape[1] != N:
+        packed_out = packed_out[:, :N].contiguous()
+
+    ref_cat = torch.cat(ref_outputs, dim=0)
+    torch.testing.assert_close(packed_out, ref_cat, atol=1e-1, rtol=1e-1)
