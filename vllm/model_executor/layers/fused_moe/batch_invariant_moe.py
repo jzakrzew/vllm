@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kNvfp4Dynamic,
@@ -732,6 +733,7 @@ def _grouped_matmul_nvfp4_packed(
     output_dtype: torch.dtype,
     *,
     a_scale_offsets: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed grouped NVFP4 GEMM with expert-local problem metadata.
 
@@ -749,6 +751,10 @@ def _grouped_matmul_nvfp4_packed(
         output_dtype: output dtype.
         a_scale_offsets: Optional [E] or [E+1] start row offsets in ``a_scale``.
             If not provided, ``expert_offsets`` are reused.
+        output: Optional pre-allocated [M_total + PAD_ROWS, N_max] tensor for
+            the GEMM output including guard rows.  When provided the function
+            writes into it (avoiding a dynamic allocation) and returns a view
+            of the first ``M_total`` rows.
 
     Returns:
         [M_total, N_max] tensor with grouped expert GEMM outputs.
@@ -812,70 +818,79 @@ def _grouped_matmul_nvfp4_packed(
     if not b_scale.is_contiguous():
         b_scale = b_scale.contiguous()
 
-    if torch.any(expert_offsets < 0) or torch.any(a_scale_offsets < 0):
-        raise RuntimeError("expert offsets must be non-negative.")
-    max_row_end = (
-        expert_offsets.to(torch.int64)
-        + problem_sizes[:, 0].to(torch.int64).clamp_min(0)
-    ).max()
-    if int(max_row_end.item()) > a_fp4.shape[0]:
-        raise RuntimeError(
-            "expert_offsets + M from problem_sizes exceed packed activation rows."
-        )
-    max_scale_row_end = (
-        a_scale_offsets.to(torch.int64)
-        + problem_sizes[:, 0].to(torch.int64).clamp_min(0)
-    ).max()
-    if int(max_scale_row_end.item()) > a_scale.shape[0]:
-        raise RuntimeError(
-            "a_scale_offsets + M from problem_sizes exceed packed scale rows."
-        )
-    if int(problem_sizes[:, 1].max().item()) > b_fp4.shape[1]:
-        raise RuntimeError(
-            "problem_sizes N exceeds packed expert-weight row dimension."
-        )
-    if int(problem_sizes[:, 2].max().item()) > a_fp4.shape[1] * 2:
-        raise RuntimeError("problem_sizes K exceeds packed activation K dimension.")
+    _is_capturing = (
+        torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
+    )
+
+    if not _is_capturing:
+        if torch.any(expert_offsets < 0) or torch.any(a_scale_offsets < 0):
+            raise RuntimeError("expert offsets must be non-negative.")
+        max_row_end = (
+            expert_offsets.to(torch.int64)
+            + problem_sizes[:, 0].to(torch.int64).clamp_min(0)
+        ).max()
+        if int(max_row_end.item()) > a_fp4.shape[0]:
+            raise RuntimeError(
+                "expert_offsets + M from problem_sizes exceed packed activation rows."
+            )
+        max_scale_row_end = (
+            a_scale_offsets.to(torch.int64)
+            + problem_sizes[:, 0].to(torch.int64).clamp_min(0)
+        ).max()
+        if int(max_scale_row_end.item()) > a_scale.shape[0]:
+            raise RuntimeError(
+                "a_scale_offsets + M from problem_sizes exceed packed scale rows."
+            )
+        if int(problem_sizes[:, 1].max().item()) > b_fp4.shape[1]:
+            raise RuntimeError(
+                "problem_sizes N exceeds packed expert-weight row dimension."
+            )
+        if int(problem_sizes[:, 2].max().item()) > a_fp4.shape[1] * 2:
+            raise RuntimeError("problem_sizes K exceeds packed activation K dimension.")
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 256
     PAD_ROWS = BLOCK_SIZE_M
 
-    m_tiles = torch.div(
-        problem_sizes[:, 0].clamp_min(0) + BLOCK_SIZE_M - 1,
-        BLOCK_SIZE_M,
-        rounding_mode="floor",
-    )
-    n_tiles = torch.div(
-        problem_sizes[:, 1].clamp_min(0) + BLOCK_SIZE_N - 1,
-        BLOCK_SIZE_N,
-        rounding_mode="floor",
-    )
-    max_tiles_per_expert = int((m_tiles * n_tiles).max().item())
+    # Worst-case grid from static tensor shapes so the grid is constant
+    # across calls -- required for CUDA graph compatibility.  The kernel
+    # early-exits for tiles beyond the actual per-expert problem size.
+    max_tiles_m = triton.cdiv(a_fp4.shape[0] + PAD_ROWS, BLOCK_SIZE_M)
+    max_tiles_n = triton.cdiv(b_fp4.shape[1], BLOCK_SIZE_N)
+    max_tiles_per_expert = max_tiles_m * max_tiles_n
 
     # Guard rows avoid descriptor OOB reads in the last expert tile.
     a_fp4_work = torch.nn.functional.pad(a_fp4, (0, 0, 0, PAD_ROWS)).contiguous()
     a_scale_work = torch.nn.functional.pad(a_scale, (0, 0, 0, PAD_ROWS)).contiguous()
-    c_work = torch.zeros(
-        (a_fp4_work.shape[0], b_fp4.shape[1]),
-        device=a_fp4.device,
-        dtype=output_dtype,
-    )
 
-    _validate_packed_nvfp4_descriptor_constraints(
-        a_fp4=a_fp4_work,
-        a_scale=a_scale_work,
-        b_fp4=b_fp4,
-        b_scale=b_scale,
-        c=c_work,
-        expert_offsets=expert_offsets,
-        a_scale_offsets=a_scale_offsets,
-        problem_sizes=problem_sizes,
-        block_size_m=BLOCK_SIZE_M,
-        block_size_n=BLOCK_SIZE_N,
-        block_size_k=BLOCK_SIZE_K,
-    )
+    M_padded = a_fp4_work.shape[0]
+    N_out = b_fp4.shape[1]
+    if output is not None:
+        assert output.shape[0] >= M_padded and output.shape[1] >= N_out
+        c_work = output.flatten()[: M_padded * N_out].view(M_padded, N_out)
+        c_work.zero_()
+    else:
+        c_work = torch.zeros(
+            (M_padded, N_out),
+            device=a_fp4.device,
+            dtype=output_dtype,
+        )
+
+    if not _is_capturing:
+        _validate_packed_nvfp4_descriptor_constraints(
+            a_fp4=a_fp4_work,
+            a_scale=a_scale_work,
+            b_fp4=b_fp4,
+            b_scale=b_scale,
+            c=c_work,
+            expert_offsets=expert_offsets,
+            a_scale_offsets=a_scale_offsets,
+            problem_sizes=problem_sizes,
+            block_size_m=BLOCK_SIZE_M,
+            block_size_n=BLOCK_SIZE_N,
+            block_size_k=BLOCK_SIZE_K,
+        )
 
     if max_tiles_per_expert == 0:
         return c_work[: a_fp4.shape[0]]
@@ -944,15 +959,18 @@ def fused_moe_batch_invariant_nvfp4(
     apply_router_weight_on_input: bool = False,
     expert_map: torch.Tensor | None = None,
     quant_backend: str = "cutlass",
+    workspace13: torch.Tensor | None = None,
+    workspace2: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Deterministic NVFP4 MoE using packed routing metadata and grouped GEMMs.
 
-    The input is expanded to ``[M * topk, K]`` and permuted into expert-major
-    packed order via CUTLASS metadata (`a_map`/`c_map`). Both GEMMs then run
-    in packed 2D form using per-expert offsets/problem sizes. The epilogue
-    uses ``moe_unpermute`` to gather, apply router weights and reduce back to
-    ``[M, K]`` while safely skipping invalid routes.
+    The input ``[M, K]`` is expanded and permuted into expert-major packed
+    order ``[M * topk, K]`` via ``shuffle_rows`` with CUTLASS metadata
+    (``a_map``/``c_map``).  Both GEMMs then run in packed 2D form using
+    per-expert offsets/problem sizes.  The epilogue uses ``moe_unpermute``
+    to gather, apply router weights and reduce back to ``[M, K]`` while
+    safely skipping invalid routes.
     """
     import torch.nn.functional as F
 
@@ -1011,16 +1029,12 @@ def fused_moe_batch_invariant_nvfp4(
     ).contiguous()
     routed_topk_weights = topk_weights.to(torch.float32).contiguous()
 
-    packed_hidden_states = (
-        hidden_states.unsqueeze(1)
-        .expand(num_tokens, top_k, hidden_dim)
-        .reshape(M_total, hidden_dim)
-        .contiguous()
-    )
     if apply_router_weight_on_input:
-        packed_hidden_states.mul_(
-            routed_topk_weights.view(-1, 1).to(packed_hidden_states.dtype)
+        packed_hidden_states = hidden_states * routed_topk_weights.view(-1, 1).to(
+            hidden_states.dtype
         )
+    else:
+        packed_hidden_states = hidden_states
 
     device = hidden_states.device
     dtype = hidden_states.dtype
@@ -1095,6 +1109,7 @@ def fused_moe_batch_invariant_nvfp4(
         a_scale_offsets=blockscale_offsets,
         problem_sizes=problem_sizes1,
         output_dtype=dtype,
+        output=workspace13,
     )
     if gemm1_out.shape[-1] != w1_output_size:
         gemm1_out = gemm1_out[:, :w1_output_size].contiguous()
@@ -1108,7 +1123,12 @@ def fused_moe_batch_invariant_nvfp4(
             top_k,
         )
     else:
-        act_out = torch.empty((M_total, activation_out_dim), device=device, dtype=dtype)
+        if workspace2 is not None:
+            act_out = _resize_cache(workspace2, (M_total, activation_out_dim))
+        else:
+            act_out = torch.empty(
+                (M_total, activation_out_dim), device=device, dtype=dtype
+            )
         apply_moe_activation(
             activation=activation_kind,
             output=act_out,
@@ -1134,6 +1154,7 @@ def fused_moe_batch_invariant_nvfp4(
         a_scale_offsets=blockscale_offsets,
         problem_sizes=problem_sizes2,
         output_dtype=dtype,
+        output=workspace13,
     )
     if gemm2_out.shape[-1] != w2_output_size:
         gemm2_out = gemm2_out[:, :w2_output_size].contiguous()
@@ -1144,14 +1165,15 @@ def fused_moe_batch_invariant_nvfp4(
         else routed_topk_weights
     )
     inv_permuted_idx = c_map.view(num_tokens, top_k)
-    reduced = torch.empty((num_tokens, hidden_dim), device=device, dtype=dtype)
+    if workspace2 is not None:
+        reduced = _resize_cache(workspace2, (num_tokens, hidden_dim))
+    else:
+        reduced = torch.empty((num_tokens, hidden_dim), device=device, dtype=dtype)
     moe_unpermute(
         out=reduced,
         permuted_hidden_states=gemm2_out,
         topk_weights=epilogue_topk_weights,
         inv_permuted_idx=inv_permuted_idx,
-        # The last entry stores num_valid_routes. Invalid routes in c_map are
-        # set to this sentinel and are skipped by moe_unpermute.
         expert_first_token_offset=expert_offsets.to(torch.int64),
     )
     return reduced
@@ -1224,6 +1246,8 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    _PAD_ROWS = 128
+
     def workspace_shapes(
         self,
         M: int,
@@ -1235,8 +1259,9 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        workspace13 = (M * topk, max(N, K))
-        workspace2 = (M * topk, self.adjust_N_for_activation(N, activation))
+        act_out_dim = self.adjust_N_for_activation(N, activation)
+        workspace13 = (M * topk + self._PAD_ROWS, max(N, K))
+        workspace2 = (M * topk, max(act_out_dim, K))
         output_shape = (M, K)
         return (workspace13, workspace2, output_shape)
 
@@ -1273,6 +1298,8 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
             activation=activation,
             apply_router_weight_on_input=bool(apply_router_weight_on_input),
             expert_map=expert_map,
+            workspace13=workspace13,
+            workspace2=workspace2,
         )
         output.copy_(result)
 
