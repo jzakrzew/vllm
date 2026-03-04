@@ -590,6 +590,137 @@ def _canonicalize_grouped_offsets(
     return offsets.contiguous()
 
 
+def _validate_packed_nvfp4_descriptor_constraints(
+    *,
+    a_fp4: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_fp4: torch.Tensor,
+    b_scale: torch.Tensor,
+    c: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    a_scale_offsets: torch.Tensor,
+    problem_sizes: torch.Tensor,
+    block_size_m: int,
+    block_size_n: int,
+    block_size_k: int,
+) -> None:
+    """Host-side descriptor math validation for packed grouped NVFP4 GEMM.
+
+    This mirrors the descriptor index arithmetic used in
+    ``_grouped_matmul_nvfp4_packed_kernel`` so invalid launch metadata fails
+    fast with a clear error instead of a GPU-side unspecified launch failure.
+    """
+    # Kernel compile-time constraints.
+    if block_size_m % 128 != 0:
+        raise RuntimeError("BLOCK_SIZE_M must be a multiple of 128.")
+    if block_size_n % 128 != 0:
+        raise RuntimeError("BLOCK_SIZE_N must be a multiple of 128.")
+    if (block_size_k // 16) % 4 != 0:
+        raise RuntimeError("BLOCK_SIZE_K//16 must be a multiple of 4.")
+
+    k_bytes_total = a_fp4.shape[1]
+    k_total = k_bytes_total * 2
+    k_bytes_tile = block_size_k // 2
+    scale_k_tile = block_size_k // 16
+    scale_k_tiles = scale_k_tile // 4
+
+    if k_total % 16 != 0:
+        raise RuntimeError("Packed K must be divisible by 16 for NVFP4 block scales.")
+    if a_scale.shape[1] % 4 != 0:
+        raise RuntimeError("a_scale cols must be divisible by 4 for swizzled layout.")
+    if b_scale.shape[2] % 4 != 0:
+        raise RuntimeError("b_scale cols must be divisible by 4 for swizzled layout.")
+    if not a_scale.is_contiguous():
+        raise RuntimeError("a_scale must be contiguous for descriptor swizzle strides.")
+    if not b_scale.is_contiguous():
+        raise RuntimeError("b_scale must be contiguous for descriptor swizzle strides.")
+    if a_scale.stride(1) != 1:
+        raise RuntimeError("a_scale must be contiguous in the last dimension.")
+    if b_scale.stride(2) != 1:
+        raise RuntimeError("b_scale must be contiguous in the last dimension.")
+    if b_scale.stride(1) != b_scale.shape[2]:
+        raise RuntimeError(
+            "b_scale row stride must match contiguous [N, K_scale] layout."
+        )
+    if a_scale_offsets.numel() > 0 and torch.any(a_scale_offsets % 128 != 0):
+        raise RuntimeError("a_scale_offsets must be 128-row aligned.")
+    if expert_offsets.numel() > 1 and torch.any(
+        expert_offsets[1:] < expert_offsets[:-1]
+    ):
+        raise RuntimeError("expert_offsets must be non-decreasing.")
+    if a_scale_offsets.numel() > 1 and torch.any(
+        a_scale_offsets[1:] < a_scale_offsets[:-1]
+    ):
+        raise RuntimeError("a_scale_offsets must be non-decreasing.")
+
+    for name, tensor in (
+        ("a_fp4", a_fp4),
+        ("a_scale", a_scale),
+        ("b_fp4", b_fp4),
+        ("b_scale", b_scale),
+        ("c", c),
+    ):
+        if tensor.data_ptr() % 16 != 0:
+            raise RuntimeError(f"{name} base pointer must be 16-byte aligned.")
+
+    m_total = a_fp4.shape[0]
+    n_total = b_fp4.shape[1]
+    a_scale_rows_total = a_scale.shape[0]
+    a_scale_k_tiles_total = a_scale.shape[1] // 4
+    b_scale_k_tiles_total = b_scale.shape[2] // 4
+    a_scale_row_tiles_total = triton.cdiv(a_scale_rows_total, 128)
+    b_scale_row_tiles_total = triton.cdiv(n_total, 128)
+
+    m = problem_sizes[:, 0].to(torch.int64).clamp_min(0)
+    n = problem_sizes[:, 1].to(torch.int64).clamp_min(0)
+    k = problem_sizes[:, 2].to(torch.int64).clamp_min(0)
+    if torch.any(problem_sizes[:, 0] < 0) or torch.any(problem_sizes[:, 1] < 0):
+        raise RuntimeError("problem_sizes M/N must be non-negative.")
+    if torch.any(problem_sizes[:, 2] < 0) or torch.any(problem_sizes[:, 2] % 2 != 0):
+        raise RuntimeError("problem_sizes K must be non-negative and even.")
+
+    m_tiles = torch.div(m + block_size_m - 1, block_size_m, rounding_mode="floor")
+    n_tiles = torch.div(n + block_size_n - 1, block_size_n, rounding_mode="floor")
+    k_tiles = torch.div(k + block_size_k - 1, block_size_k, rounding_mode="floor")
+
+    start_m_max = (m_tiles - 1).clamp_min(0) * block_size_m
+    start_n_max = (n_tiles - 1).clamp_min(0) * block_size_n
+    k_start_bytes_max = (k_tiles - 1).clamp_min(0) * k_bytes_tile
+    scale_tile_m_max = torch.div(start_m_max, 128, rounding_mode="floor")
+    scale_tile_n_max = torch.div(start_n_max, 128, rounding_mode="floor")
+    scale_tile_k_max = (k_tiles - 1).clamp_min(0) * scale_k_tiles
+
+    # Descriptor-relative index checks.
+    if torch.any(start_m_max >= m_total):
+        raise RuntimeError("Packed A descriptor M dimension is too small.")
+    if torch.any(start_n_max >= n_total):
+        raise RuntimeError("Packed B descriptor N dimension is too small.")
+    if torch.any(k_start_bytes_max >= k_bytes_total):
+        raise RuntimeError("Packed A/B descriptor K-bytes dimension is too small.")
+    if torch.any(scale_tile_m_max >= a_scale_row_tiles_total):
+        raise RuntimeError("Packed A scale descriptor row-tile dimension is too small.")
+    if torch.any(scale_tile_n_max >= b_scale_row_tiles_total):
+        raise RuntimeError("Packed B scale descriptor row-tile dimension is too small.")
+    if torch.any(scale_tile_k_max >= a_scale_k_tiles_total):
+        raise RuntimeError("Packed A scale descriptor K-tile dimension is too small.")
+    if torch.any(scale_tile_k_max >= b_scale_k_tiles_total):
+        raise RuntimeError("Packed B scale descriptor K-tile dimension is too small.")
+
+    # Base-pointer-offset + block-footprint checks.
+    max_a_row = expert_offsets.to(torch.int64) + start_m_max + (block_size_m - 1)
+    max_as_row = a_scale_offsets.to(torch.int64) + start_m_max + (block_size_m - 1)
+    if torch.any(max_a_row >= m_total):
+        raise RuntimeError(
+            "A/C descriptor base offset + tile footprint exceeds packed rows."
+        )
+    if torch.any(max_as_row >= a_scale_rows_total):
+        raise RuntimeError(
+            "A scale descriptor base offset + tile footprint exceeds packed scale rows."
+        )
+    if c.shape[0] < m_total or c.shape[1] < n_total:
+        raise RuntimeError("Output tensor does not match descriptor logical extents.")
+
+
 def _grouped_matmul_nvfp4_packed(
     a_fp4: torch.Tensor,
     b_fp4: torch.Tensor,
@@ -731,6 +862,21 @@ def _grouped_matmul_nvfp4_packed(
         device=a_fp4.device,
         dtype=output_dtype,
     )
+
+    _validate_packed_nvfp4_descriptor_constraints(
+        a_fp4=a_fp4_work,
+        a_scale=a_scale_work,
+        b_fp4=b_fp4,
+        b_scale=b_scale,
+        c=c_work,
+        expert_offsets=expert_offsets,
+        a_scale_offsets=a_scale_offsets,
+        problem_sizes=problem_sizes,
+        block_size_m=BLOCK_SIZE_M,
+        block_size_n=BLOCK_SIZE_N,
+        block_size_k=BLOCK_SIZE_K,
+    )
+
     if max_tiles_per_expert == 0:
         return c_work[: a_fp4.shape[0]]
 
