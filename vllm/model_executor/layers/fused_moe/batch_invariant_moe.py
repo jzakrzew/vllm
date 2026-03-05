@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import num_compute_units
 
 logger = init_logger(__name__)
 
@@ -106,6 +107,31 @@ def _nvfp4_moe_map_experts(
 # ---------------------------------------------------------------------------
 # Packed grouped NVFP4 GEMM kernel and wrapper
 # ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _find_expert_bin_search(
+    expert_tile_start_ptr,
+    global_tile_id,
+    num_experts,
+):
+    """Binary search to find which expert owns ``global_tile_id``.
+
+    ``expert_tile_start_ptr`` points to an ``[E+1]`` prefix-sum array where
+    ``expert_tile_start[e]`` is the first global tile belonging to expert
+    ``e``.  Returns the expert index ``e`` such that
+    ``expert_tile_start[e] <= global_tile_id < expert_tile_start[e+1]``.
+    """
+    lo: tl.int32 = 0
+    hi: tl.int32 = num_experts
+    while lo < hi:
+        mid = (lo + hi) // 2
+        val = tl.load(expert_tile_start_ptr + mid + 1).to(tl.int32)
+        if val <= global_tile_id:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
 
 
 @triton.jit
@@ -308,6 +334,228 @@ def _grouped_matmul_nvfp4_packed_kernel(
         c_expert_ptr + offs_m_c[:, None] * stride_cm + offs_n_c[None, :] * stride_cn
     )
     tl.store(c_ptrs, c, mask=m_mask[:, None] & n_mask[None, :])
+
+
+@triton.jit
+def _grouped_matmul_nvfp4_packed_persistent_kernel(
+    a_ptr,
+    a_scale_ptr,
+    b_ptr,
+    b_scale_ptr,
+    c_ptr,
+    alpha_ptr,
+    expert_offsets_ptr,
+    a_scale_offsets_ptr,
+    problem_sizes_ptr,
+    expert_tile_start_ptr,
+    num_experts,
+    M_total,
+    N_total,
+    K_total,
+    a_scale_rows_total,
+    stride_ps0,
+    stride_ps1,
+    stride_am,
+    stride_ak,
+    stride_asm,
+    stride_ask,
+    stride_bm,
+    stride_bk,
+    stride_bsk,
+    stride_cm,
+    stride_cn,
+    a_scale_cols_total,
+    b_scale_cols_total,
+    b_scale_n_per_expert,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    A_LARGE: tl.constexpr,
+    B_LARGE: tl.constexpr,
+):
+    """Persistent packed grouped NVFP4 GEMM.
+
+    Launches ``NUM_SMS`` programs that loop over a global tile index space
+    built from a prefix-sum of per-expert tile counts.  Each iteration maps
+    a global tile id to ``(expert_id, local_tile_id)`` via binary search,
+    then executes the same GEMM tile logic as the non-persistent kernel.
+
+    B and B-scale tensors are pre-flattened by the wrapper:
+    ``b_fp4`` from ``[E, N, K_packed]`` to ``[E*N, K_packed]``, and
+    ``b_scale`` from ``[E, N_pad, K_s]`` to ``[E*N_pad, K_s]``.
+    ``b_scale_n_per_expert`` = N_pad (may differ from N_total).
+    """
+    start_pid = tl.program_id(axis=0)
+    total_tiles = tl.load(expert_tile_start_ptr + num_experts).to(tl.int32)
+
+    K_BYTES: tl.constexpr = BLOCK_SIZE_K // 2
+    SCALE_K_TILE: tl.constexpr = BLOCK_SIZE_K // 16
+    SCALE_K_TILES: tl.constexpr = SCALE_K_TILE // 4
+    SCALE_M_TILES: tl.constexpr = BLOCK_SIZE_M // 128
+    SCALE_N_TILES: tl.constexpr = BLOCK_SIZE_N // 128
+
+    k_bytes_total = K_total // 2
+
+    # Global descriptors created once before the loop.
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M_total, k_bytes_total],
+        strides=[stride_am, stride_ak],
+        block_shape=[BLOCK_SIZE_M, K_BYTES],
+        padding_option="zero",
+    )
+    # B flattened to [E*N, K_packed] by the wrapper.
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[num_experts * N_total, k_bytes_total],
+        strides=[stride_bm, stride_bk],
+        block_shape=[BLOCK_SIZE_N, K_BYTES],
+        padding_option="zero",
+    )
+    a_scale_desc = tl.make_tensor_descriptor(
+        a_scale_ptr,
+        shape=[1, tl.cdiv(a_scale_rows_total, 128), a_scale_cols_total // 4, 2, 256],
+        strides=[
+            tl.cdiv(a_scale_rows_total, 128)
+            * (a_scale_cols_total // 4)
+            * 512
+            * stride_ask,
+            (a_scale_cols_total // 4) * 512 * stride_ask,
+            512 * stride_ask,
+            256 * stride_ask,
+            stride_ask,
+        ],
+        block_shape=[1, SCALE_M_TILES, SCALE_K_TILES, 2, 256],
+        padding_option="zero",
+    )
+    # B-scale flattened to [E*N_pad, K_s] by the wrapper.
+    b_scale_n_tiles = tl.cdiv(num_experts * b_scale_n_per_expert, 128)
+    b_scale_desc = tl.make_tensor_descriptor(
+        b_scale_ptr,
+        shape=[1, b_scale_n_tiles, b_scale_cols_total // 4, 2, 256],
+        strides=[
+            b_scale_n_tiles * (b_scale_cols_total // 4) * 512 * stride_bsk,
+            (b_scale_cols_total // 4) * 512 * stride_bsk,
+            512 * stride_bsk,
+            256 * stride_bsk,
+            stride_bsk,
+        ],
+        block_shape=[1, SCALE_N_TILES, SCALE_K_TILES, 2, 256],
+        padding_option="zero",
+    )
+
+    for global_tid in tl.range(start_pid, total_tiles, NUM_SMS, flatten=True):
+        expert_id = _find_expert_bin_search(
+            expert_tile_start_ptr, global_tid, num_experts
+        )
+        local_tile_start = tl.load(expert_tile_start_ptr + expert_id).to(tl.int32)
+        local_tile_id = global_tid - local_tile_start
+
+        p_ptr = problem_sizes_ptr + expert_id * stride_ps0
+        M = tl.load(p_ptr + 0 * stride_ps1).to(tl.int32)
+        N = tl.load(p_ptr + 1 * stride_ps1).to(tl.int32)
+        K = tl.load(p_ptr + 2 * stride_ps1).to(tl.int32)
+
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+        pid_m, pid_n = _compute_pid(
+            local_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, 0
+        )
+
+        expert_row_offset = tl.load(expert_offsets_ptr + expert_id).to(tl.int32)
+        expert_scale_offset = tl.load(a_scale_offsets_ptr + expert_id).to(tl.int32)
+        if A_LARGE:
+            expert_row_offset = expert_row_offset.to(tl.int64)
+            expert_scale_offset = expert_scale_offset.to(tl.int64)
+
+        k_bytes = K // 2
+        alpha = tl.load(alpha_ptr + expert_id).to(tl.float32)
+        start_m = pid_m * BLOCK_SIZE_M
+        start_n = pid_n * BLOCK_SIZE_N
+        offs_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+        offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)
+        m_mask = offs_m < M
+        n_mask = offs_n < N
+
+        # B offset into the flattened [E*N, K_packed] view.
+        b_row_offset = expert_id * N_total
+        # B-scale offset into the flattened [E*N_pad, K_s] view.
+        bs_row_offset = expert_id * b_scale_n_per_expert
+        if B_LARGE:
+            b_row_offset = b_row_offset.to(tl.int64)
+            bs_row_offset = bs_row_offset.to(tl.int64)
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            k_start_bytes = ki * K_BYTES
+            if A_LARGE or B_LARGE:
+                k_start_bytes = k_start_bytes.to(tl.int64)
+            k_byte_mask = (ki * K_BYTES + tl.arange(0, K_BYTES)) < k_bytes
+
+            a_m_start = expert_row_offset + start_m
+            b_n_start = b_row_offset + start_n
+            if A_LARGE:
+                a_m_start = a_m_start.to(tl.int64)
+            if B_LARGE:
+                b_n_start = b_n_start.to(tl.int64)
+
+            a = a_desc.load([a_m_start, k_start_bytes])
+            b_raw = b_desc.load([b_n_start, k_start_bytes])
+            a = tl.where(m_mask[:, None] & k_byte_mask[None, :], a, 0)
+            b = tl.where(n_mask[:, None] & k_byte_mask[None, :], b_raw, 0).T
+
+            scale_tile_k = ki * SCALE_K_TILES
+            if A_LARGE or B_LARGE:
+                scale_tile_k = scale_tile_k.to(tl.int64)
+            scale_tile_m = (expert_scale_offset + start_m) // 128
+            scale_tile_n = (bs_row_offset + start_n) // 128
+            if A_LARGE:
+                scale_tile_m = scale_tile_m.to(tl.int64)
+            if B_LARGE:
+                scale_tile_n = scale_tile_n.to(tl.int64)
+
+            a_scale_raw = a_scale_desc.load([0, scale_tile_m, scale_tile_k, 0, 0])
+            b_scale_raw = b_scale_desc.load([0, scale_tile_n, scale_tile_k, 0, 0])
+
+            a_scale = _unswizzle_scale(
+                a_scale_raw.reshape(BLOCK_SIZE_M, SCALE_K_TILE),
+                TILE_ROWS=BLOCK_SIZE_M,
+                TILE_SCALE_COLS=SCALE_K_TILE,
+            )
+            b_scale = _unswizzle_scale(
+                b_scale_raw.reshape(BLOCK_SIZE_N, SCALE_K_TILE),
+                TILE_ROWS=BLOCK_SIZE_N,
+                TILE_SCALE_COLS=SCALE_K_TILE,
+            )
+
+            accumulator = tl.dot_scaled(
+                a,
+                a_scale,
+                "e2m1",
+                b,
+                b_scale,
+                "e2m1",
+                accumulator,
+            )
+
+        accumulator *= alpha
+        c = accumulator.to(c_ptr.dtype.element_ty)
+        c_expert_ptr = c_ptr + expert_row_offset * stride_cm
+        offs_m_c = offs_m
+        offs_n_c = offs_n
+        if A_LARGE:
+            offs_m_c = offs_m_c.to(tl.int64)
+        if B_LARGE:
+            offs_n_c = offs_n_c.to(tl.int64)
+        c_ptrs = (
+            c_expert_ptr + offs_m_c[:, None] * stride_cm + offs_n_c[None, :] * stride_cn
+        )
+        tl.store(c_ptrs, c, mask=m_mask[:, None] & n_mask[None, :])
 
 
 def _canonicalize_grouped_offsets(
@@ -644,45 +892,120 @@ def _grouped_matmul_nvfp4_packed(
     if max_tiles_per_expert == 0:
         return c_work[:M_logical]
 
-    grid = (E, max_tiles_per_expert)
-    _grouped_matmul_nvfp4_packed_kernel[grid](
-        a_fp4_work,
-        a_scale_work,
-        b_fp4,
-        b_scale,
-        c_work,
-        alpha,
-        expert_offsets,
-        a_scale_offsets,
-        problem_sizes,
-        a_fp4_work.shape[0],
-        b_fp4.shape[1],
-        a_fp4_work.shape[1] * 2,
-        a_scale_work.shape[0],
-        problem_sizes.stride(0),
-        problem_sizes.stride(1),
-        a_fp4_work.stride(0),
-        a_fp4_work.stride(1),
-        a_scale_work.stride(0),
-        a_scale_work.stride(1),
-        b_fp4.stride(0),
-        b_scale.stride(0),
-        b_fp4.stride(1),
-        b_fp4.stride(2),
-        b_scale.stride(2),
-        c_work.stride(0),
-        c_work.stride(1),
-        a_scale_work.shape[1],
-        b_scale.shape[2],
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=8,
-        A_LARGE=max(a_fp4_work.numel(), a_scale_work.numel(), c_work.numel()) > 2**31,
-        B_LARGE=max(b_fp4.numel(), b_scale.numel()) > 2**31,
-        num_stages=2,
-        num_warps=8,
-    )
+    A_LARGE = max(a_fp4_work.numel(), a_scale_work.numel(), c_work.numel()) > 2**31
+    B_LARGE = max(b_fp4.numel(), b_scale.numel()) > 2**31
+    worst_case_tiles = E * max_tiles_per_expert
+    NUM_SMS = num_compute_units(a_fp4.device.index)
+    use_persistent = worst_case_tiles > NUM_SMS
+
+    if use_persistent:
+        # Pre-compute tile-to-expert mapping (all device-side, no host sync).
+        M_per_expert = problem_sizes[:, 0].to(torch.int32).clamp(min=0)
+        N_per_expert = problem_sizes[:, 1].to(torch.int32).clamp(min=0)
+        K_per_expert = problem_sizes[:, 2].to(torch.int32).clamp(min=0)
+        valid = (M_per_expert > 0) & (N_per_expert > 0) & (K_per_expert > 0)
+        tiles_per_expert = (
+            torch.div(
+                M_per_expert + BLOCK_SIZE_M - 1,
+                BLOCK_SIZE_M,
+                rounding_mode="floor",
+            )
+            * torch.div(
+                N_per_expert + BLOCK_SIZE_N - 1,
+                BLOCK_SIZE_N,
+                rounding_mode="floor",
+            )
+            * valid.to(torch.int32)
+        )
+        expert_tile_start = torch.zeros(E + 1, dtype=torch.int32, device=a_fp4.device)
+        expert_tile_start[1:] = torch.cumsum(tiles_per_expert, dim=0)
+
+        # Flatten B [E, N, K] -> [E*N, K] and B-scale [E, Np, Ks] -> [E*Np, Ks]
+        # for a single global TMA descriptor.
+        b_fp4_flat = b_fp4.reshape(-1, b_fp4.shape[2])
+        b_scale_flat = b_scale.reshape(-1, b_scale.shape[2])
+
+        grid_persistent = (min(NUM_SMS, worst_case_tiles),)
+        _grouped_matmul_nvfp4_packed_persistent_kernel[grid_persistent](
+            a_fp4_work,
+            a_scale_work,
+            b_fp4_flat,
+            b_scale_flat,
+            c_work,
+            alpha,
+            expert_offsets,
+            a_scale_offsets,
+            problem_sizes,
+            expert_tile_start,
+            E,
+            a_fp4_work.shape[0],
+            b_fp4.shape[1],
+            a_fp4_work.shape[1] * 2,
+            a_scale_work.shape[0],
+            problem_sizes.stride(0),
+            problem_sizes.stride(1),
+            a_fp4_work.stride(0),
+            a_fp4_work.stride(1),
+            a_scale_work.stride(0),
+            a_scale_work.stride(1),
+            b_fp4_flat.stride(0),
+            b_fp4_flat.stride(1),
+            b_scale_flat.stride(1),
+            c_work.stride(0),
+            c_work.stride(1),
+            a_scale_work.shape[1],
+            b_scale.shape[2],
+            b_scale.shape[1],
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=8,
+            NUM_SMS=NUM_SMS,
+            A_LARGE=A_LARGE,
+            B_LARGE=B_LARGE,
+            num_stages=2,
+            num_warps=8,
+        )
+    else:
+        grid = (E, max_tiles_per_expert)
+        _grouped_matmul_nvfp4_packed_kernel[grid](
+            a_fp4_work,
+            a_scale_work,
+            b_fp4,
+            b_scale,
+            c_work,
+            alpha,
+            expert_offsets,
+            a_scale_offsets,
+            problem_sizes,
+            a_fp4_work.shape[0],
+            b_fp4.shape[1],
+            a_fp4_work.shape[1] * 2,
+            a_scale_work.shape[0],
+            problem_sizes.stride(0),
+            problem_sizes.stride(1),
+            a_fp4_work.stride(0),
+            a_fp4_work.stride(1),
+            a_scale_work.stride(0),
+            a_scale_work.stride(1),
+            b_fp4.stride(0),
+            b_scale.stride(0),
+            b_fp4.stride(1),
+            b_fp4.stride(2),
+            b_scale.stride(2),
+            c_work.stride(0),
+            c_work.stride(1),
+            a_scale_work.shape[1],
+            b_scale.shape[2],
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=8,
+            A_LARGE=A_LARGE,
+            B_LARGE=B_LARGE,
+            num_stages=2,
+            num_warps=8,
+        )
     return c_work[:M_logical]
 
 
