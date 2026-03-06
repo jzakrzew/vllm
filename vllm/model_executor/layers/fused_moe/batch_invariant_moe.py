@@ -104,19 +104,6 @@ def _nvfp4_moe_map_experts(
     return mapped.view_as(topk_ids)
 
 
-def _storage_data_ptr(x: torch.Tensor) -> int:
-    # untyped_storage() is the stable way to compare underlying storage.
-    if hasattr(x, "untyped_storage"):
-        return x.untyped_storage().data_ptr()
-    return x.storage().data_ptr()
-
-
-def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
-    if a.numel() == 0 or b.numel() == 0:
-        return False
-    return _storage_data_ptr(a) == _storage_data_ptr(b)
-
-
 # ---------------------------------------------------------------------------
 # Packed grouped NVFP4 GEMM kernel and wrapper
 # ---------------------------------------------------------------------------
@@ -905,16 +892,6 @@ def fused_moe_batch_invariant_nvfp4(
                 f"Need at least ({M_total}, {required_workspace2_cols}), "
                 f"got {tuple(workspace2.shape)}."
             )
-    if (
-        workspace13 is not None
-        and workspace2 is not None
-        and _shares_storage(workspace13, workspace2)
-    ):
-        raise RuntimeError(
-            "workspace13 and workspace2 must not alias storage for "
-            "batch-invariant NVFP4 MoE."
-        )
-
     # Per-expert metadata/permutations for packed grouped-GEMM.
     expert_offsets = torch.empty((num_experts + 1), dtype=torch.int32, device=device)
     blockscale_offsets = torch.empty(
@@ -1043,10 +1020,6 @@ def fused_moe_batch_invariant_nvfp4(
         reduced = output
     else:
         reduced = torch.empty((num_tokens, hidden_dim), device=device, dtype=dtype)
-    if _shares_storage(gemm2_out, reduced):
-        raise RuntimeError(
-            "moe_unpermute destination must not alias GEMM2 source buffer."
-        )
     moe_unpermute(
         out=reduced,
         permuted_hidden_states=gemm2_out,
