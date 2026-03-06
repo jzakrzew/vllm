@@ -492,17 +492,15 @@ def _validate_packed_nvfp4_descriptor_constraints(
     if torch.any(scale_tile_k_max >= b_scale_k_tiles_total):
         raise RuntimeError("Packed B scale descriptor K-tile dimension is too small.")
 
-    # Base-pointer-offset + block-footprint checks.
-    max_a_row = expert_offsets.to(torch.int64) + start_m_max + (block_size_m - 1)
-    max_as_row = a_scale_offsets.to(torch.int64) + start_m_max + (block_size_m - 1)
-    if torch.any(max_a_row >= m_total):
-        raise RuntimeError(
-            "A/C descriptor base offset + tile footprint exceeds packed rows."
-        )
-    if torch.any(max_as_row >= a_scale_rows_total):
-        raise RuntimeError(
-            "A scale descriptor base offset + tile footprint exceeds packed scale rows."
-        )
+    # Tile-start checks -- TMA zero-padding handles tile overshoot beyond
+    # the descriptor shape, so we only need the start of the last tile to
+    # fall within the physical tensor.
+    max_a_tile_start = expert_offsets.to(torch.int64) + start_m_max
+    max_as_tile_start = a_scale_offsets.to(torch.int64) + start_m_max
+    if torch.any(max_a_tile_start >= m_total):
+        raise RuntimeError("A/C descriptor tile start exceeds packed rows.")
+    if torch.any(max_as_tile_start >= a_scale_rows_total):
+        raise RuntimeError("A scale descriptor tile start exceeds packed scale rows.")
     if c.shape[0] < m_total or c.shape[1] < n_total:
         raise RuntimeError("Output tensor does not match descriptor logical extents.")
 
@@ -519,17 +517,19 @@ def _grouped_matmul_nvfp4_packed(
     *,
     a_scale_offsets: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
-    pre_padded: bool = False,
 ) -> torch.Tensor:
     """Packed grouped NVFP4 GEMM with expert-local problem metadata.
 
+    TMA descriptors use ``padding_option="zero"`` so boundary tiles that
+    overshoot ``M_total`` are zero-filled by hardware -- no guard rows or
+    ``F.pad`` copies are needed.
+
     Args:
-        a_fp4: [M_total, K_packed] (or [M_total + PAD, K_packed] if
-            ``pre_padded``) uint8 packed FP4 activations in expert-packed
-            row order.
+        a_fp4: [M_total, K_packed] uint8 packed FP4 activations in
+            expert-packed row order.
         b_fp4: [E, N_max, K_packed] uint8 packed FP4 expert weights.
-        a_scale: [S_total, K_s] (or [S_total + PAD, K_s] if ``pre_padded``)
-            float8_e4m3fn swizzled activation block scales.
+        a_scale: [S_total, K_s] float8_e4m3fn swizzled activation block
+            scales.
         b_scale: [E, N_pad, K_s] float8_e4m3fn swizzled weight block scales.
         alpha: [E] float32 per-expert alpha.
         expert_offsets: [E] or [E+1] start row offsets in ``a_fp4``/output.
@@ -537,12 +537,9 @@ def _grouped_matmul_nvfp4_packed(
         output_dtype: output dtype.
         a_scale_offsets: Optional [E] or [E+1] start row offsets in ``a_scale``.
             If not provided, ``expert_offsets`` are reused.
-        output: Optional pre-allocated [M_total + PAD_ROWS, N_max] tensor for
-            the GEMM output including guard rows.  When provided the function
-            writes into it (avoiding a dynamic allocation) and returns a view
-            of the first ``M_total`` rows.
-        pre_padded: If True, ``a_fp4`` and ``a_scale`` already include
-            PAD_ROWS guard rows at the end, so the internal F.pad is skipped.
+        output: Optional pre-allocated [>= M_total, >= N_max] tensor for the
+            GEMM output.  When provided the function writes into it (avoiding
+            a dynamic allocation).
 
     Returns:
         [M_total, N_max] tensor with grouped expert GEMM outputs.
@@ -639,44 +636,32 @@ def _grouped_matmul_nvfp4_packed(
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 256
-    PAD_ROWS = BLOCK_SIZE_M
 
-    if pre_padded:
-        a_fp4_work = a_fp4
-        a_scale_work = a_scale
-        M_logical = a_fp4.shape[0] - PAD_ROWS
-    else:
-        M_logical = a_fp4.shape[0]
-        a_fp4_work = torch.nn.functional.pad(a_fp4, (0, 0, 0, PAD_ROWS)).contiguous()
-        a_scale_work = torch.nn.functional.pad(
-            a_scale, (0, 0, 0, PAD_ROWS)
-        ).contiguous()
+    M_logical = a_fp4.shape[0]
 
     # Upper-bound tile count from static tensor shapes.  The persistent
     # kernel grid is min(NUM_SMS, worst_case_tiles), both derived from
     # fixed shapes / device properties, so the grid is constant across
     # calls and safe for CUDA graph capture.
-    max_tiles_m = triton.cdiv(a_fp4_work.shape[0], BLOCK_SIZE_M)
+    max_tiles_m = triton.cdiv(M_logical, BLOCK_SIZE_M)
     max_tiles_n = triton.cdiv(b_fp4.shape[1], BLOCK_SIZE_N)
     max_tiles_per_expert = max_tiles_m * max_tiles_n
 
-    M_padded = a_fp4_work.shape[0]
     N_out = b_fp4.shape[1]
     if output is not None:
-        assert output.shape[0] >= M_padded and output.shape[1] >= N_out
-        c_work = output.flatten()[: M_padded * N_out].view(M_padded, N_out)
+        assert output.shape[0] >= M_logical and output.shape[1] >= N_out
+        c_work = output.flatten()[: M_logical * N_out].view(M_logical, N_out)
     else:
         c_work = torch.empty(
-            (M_padded, N_out),
+            (M_logical, N_out),
             device=a_fp4.device,
             dtype=output_dtype,
         )
-    c_work[M_logical:].zero_()
 
     if _NVFP4_MOE_DEBUG and not _is_capturing:
         _validate_packed_nvfp4_descriptor_constraints(
-            a_fp4=a_fp4_work,
-            a_scale=a_scale_work,
+            a_fp4=a_fp4,
+            a_scale=a_scale,
             b_fp4=b_fp4,
             b_scale=b_scale,
             c=c_work,
@@ -689,9 +674,9 @@ def _grouped_matmul_nvfp4_packed(
         )
 
     if max_tiles_per_expert == 0:
-        return c_work[:M_logical]
+        return c_work
 
-    A_LARGE = max(a_fp4_work.numel(), a_scale_work.numel(), c_work.numel()) > 2**31
+    A_LARGE = max(a_fp4.numel(), a_scale.numel(), c_work.numel()) > 2**31
     B_LARGE = max(b_fp4.numel(), b_scale.numel()) > 2**31
     NUM_SMS = num_compute_units(a_fp4.device.index)
     worst_case_tiles = E * max_tiles_per_expert
@@ -724,8 +709,8 @@ def _grouped_matmul_nvfp4_packed(
 
     grid = (min(NUM_SMS, worst_case_tiles),)
     _grouped_matmul_nvfp4_packed_persistent_kernel[grid](
-        a_fp4_work,
-        a_scale_work,
+        a_fp4,
+        a_scale,
         b_fp4_flat,
         b_scale_flat,
         c_work,
@@ -735,22 +720,22 @@ def _grouped_matmul_nvfp4_packed(
         problem_sizes,
         expert_tile_start,
         E,
-        a_fp4_work.shape[0],
+        a_fp4.shape[0],
         b_fp4.shape[1],
-        a_fp4_work.shape[1] * 2,
-        a_scale_work.shape[0],
+        a_fp4.shape[1] * 2,
+        a_scale.shape[0],
         problem_sizes.stride(0),
         problem_sizes.stride(1),
-        a_fp4_work.stride(0),
-        a_fp4_work.stride(1),
-        a_scale_work.stride(0),
-        a_scale_work.stride(1),
+        a_fp4.stride(0),
+        a_fp4.stride(1),
+        a_scale.stride(0),
+        a_scale.stride(1),
         b_fp4_flat.stride(0),
         b_fp4_flat.stride(1),
         b_scale_flat.stride(1),
         c_work.stride(0),
         c_work.stride(1),
-        a_scale_work.shape[1],
+        a_scale.shape[1],
         b_scale.shape[2],
         b_scale.shape[1],
         BLOCK_SIZE_M=BLOCK_SIZE_M,
@@ -763,7 +748,7 @@ def _grouped_matmul_nvfp4_packed(
         num_stages=2,
         num_warps=8,
     )
-    return c_work[:M_logical]
+    return c_work
 
 
 # ---------------------------------------------------------------------------
@@ -921,17 +906,6 @@ def fused_moe_batch_invariant_nvfp4(
     g1_alpha_vec = _ensure_expert_vec(g1_alphas, "g1_alphas")
     g2_alpha_vec = _ensure_expert_vec(g2_alphas, "g2_alphas")
 
-    _PAD = 128
-
-    def _pad_for_gemm(
-        fp4: torch.Tensor, scale: torch.Tensor, col_pad: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if col_pad > 0:
-            fp4 = F.pad(fp4, (0, col_pad))
-        fp4 = F.pad(fp4, (0, 0, 0, _PAD)).contiguous()
-        scale = F.pad(scale, (0, 0, 0, _PAD)).contiguous()
-        return fp4, scale
-
     a1_fp4, a1_scale = ops.scaled_fp4_experts_quant(
         packed_hidden_states,
         a1_gscale_vec,
@@ -939,7 +913,8 @@ def fused_moe_batch_invariant_nvfp4(
         blockscale_offsets,
         top_k,
     )
-    a1_fp4, a1_scale = _pad_for_gemm(a1_fp4, a1_scale, w1_padding_cols)
+    if w1_padding_cols > 0:
+        a1_fp4 = F.pad(a1_fp4, (0, w1_padding_cols))
 
     gemm1_out = _grouped_matmul_nvfp4_packed(
         a_fp4=a1_fp4,
@@ -952,7 +927,6 @@ def fused_moe_batch_invariant_nvfp4(
         problem_sizes=problem_sizes1,
         output_dtype=dtype,
         output=workspace13,
-        pre_padded=True,
     )
     if gemm1_out.shape[-1] != w1_output_size:
         gemm1_out = gemm1_out[:, :w1_output_size].contiguous()
@@ -984,7 +958,8 @@ def fused_moe_batch_invariant_nvfp4(
             blockscale_offsets,
             top_k,
         )
-    int_fp4, int_scale = _pad_for_gemm(int_fp4, int_scale, w2_padding_cols)
+    if w2_padding_cols > 0:
+        int_fp4 = F.pad(int_fp4, (0, w2_padding_cols))
 
     gemm2_out = _grouped_matmul_nvfp4_packed(
         a_fp4=int_fp4,
@@ -997,7 +972,6 @@ def fused_moe_batch_invariant_nvfp4(
         problem_sizes=problem_sizes2,
         output_dtype=dtype,
         output=workspace13,
-        pre_padded=True,
     )
     if gemm2_out.shape[-1] != w2_output_size:
         gemm2_out = gemm2_out[:, :w2_output_size].contiguous()
@@ -1115,8 +1089,6 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
         )
         return self._cached_scale_vecs
 
-    _PAD_ROWS = 128
-
     def workspace_shapes(
         self,
         M: int,
@@ -1129,7 +1101,7 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         act_out_dim = self.adjust_N_for_activation(N, activation)
-        workspace13 = (M * topk + self._PAD_ROWS, max(N, K))
+        workspace13 = (M * topk, max(N, K))
         workspace2 = (M * topk, max(act_out_dim, K))
         output_shape = (M, K)
         return (workspace13, workspace2, output_shape)
