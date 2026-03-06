@@ -104,6 +104,19 @@ def _nvfp4_moe_map_experts(
     return mapped.view_as(topk_ids)
 
 
+def _storage_data_ptr(x: torch.Tensor) -> int:
+    # untyped_storage() is the stable way to compare underlying storage.
+    if hasattr(x, "untyped_storage"):
+        return x.untyped_storage().data_ptr()
+    return x.storage().data_ptr()
+
+
+def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+    if a.numel() == 0 or b.numel() == 0:
+        return False
+    return _storage_data_ptr(a) == _storage_data_ptr(b)
+
+
 # ---------------------------------------------------------------------------
 # Packed grouped NVFP4 GEMM kernel and wrapper
 # ---------------------------------------------------------------------------
@@ -775,6 +788,7 @@ def fused_moe_batch_invariant_nvfp4(
     quant_backend: str = "cutlass",
     workspace13: torch.Tensor | None = None,
     workspace2: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Deterministic NVFP4 MoE using packed routing metadata and grouped GEMMs.
@@ -784,7 +798,8 @@ def fused_moe_batch_invariant_nvfp4(
     (``a_map``/``c_map``).  Both GEMMs then run in packed 2D form using
     per-expert offsets/problem sizes.  The epilogue uses ``moe_unpermute``
     to gather, apply router weights and reduce back to ``[M, K]`` while
-    safely skipping invalid routes.
+    safely skipping invalid routes.  When ``output`` is provided, the final
+    reduction writes directly into that tensor.
     """
     import torch.nn.functional as F
 
@@ -829,7 +844,27 @@ def fused_moe_batch_invariant_nvfp4(
     num_experts = w13_weight.shape[0]
     top_k = topk_ids.shape[1]
     M_total = num_tokens * top_k
+    if output is not None:
+        if output.device != hidden_states.device:
+            raise RuntimeError(
+                f"output must be on {hidden_states.device}, got {output.device}."
+            )
+        if output.dtype != hidden_states.dtype:
+            raise RuntimeError(
+                f"output dtype must be {hidden_states.dtype}, got {output.dtype}."
+            )
+        if output.shape != (num_tokens, hidden_dim):
+            raise RuntimeError(
+                "output must match hidden_states shape "
+                f"({num_tokens}, {hidden_dim}), got {tuple(output.shape)}."
+            )
+        if not output.is_contiguous():
+            raise RuntimeError(
+                "output must be contiguous for packed NVFP4 MoE unpermute."
+            )
     if M_total == 0:
+        if output is not None:
+            return output
         return hidden_states.new_empty((num_tokens, hidden_dim))
 
     routed_topk_ids = topk_ids
@@ -859,6 +894,26 @@ def fused_moe_batch_invariant_nvfp4(
     w2_output_size = hidden_dim
     w1_padding_cols = max(0, w13_weight.shape[-1] - hidden_dim // 2)
     w2_padding_cols = max(0, w2_weight.shape[-1] - activation_out_dim // 2)
+    if workspace2 is not None:
+        required_workspace2_cols = max(activation_out_dim, w2_output_size)
+        if (
+            workspace2.shape[0] < M_total
+            or workspace2.shape[1] < required_workspace2_cols
+        ):
+            raise RuntimeError(
+                "workspace2 is too small for activation/GEMM2 staging. "
+                f"Need at least ({M_total}, {required_workspace2_cols}), "
+                f"got {tuple(workspace2.shape)}."
+            )
+    if (
+        workspace13 is not None
+        and workspace2 is not None
+        and _shares_storage(workspace13, workspace2)
+    ):
+        raise RuntimeError(
+            "workspace13 and workspace2 must not alias storage for "
+            "batch-invariant NVFP4 MoE."
+        )
 
     # Per-expert metadata/permutations for packed grouped-GEMM.
     expert_offsets = torch.empty((num_experts + 1), dtype=torch.int32, device=device)
@@ -971,7 +1026,7 @@ def fused_moe_batch_invariant_nvfp4(
         a_scale_offsets=blockscale_offsets,
         problem_sizes=problem_sizes2,
         output_dtype=dtype,
-        output=workspace13,
+        output=workspace2,
     )
     if gemm2_out.shape[-1] != w2_output_size:
         gemm2_out = gemm2_out[:, :w2_output_size].contiguous()
@@ -982,10 +1037,16 @@ def fused_moe_batch_invariant_nvfp4(
         else routed_topk_weights
     )
     inv_permuted_idx = c_map.view(num_tokens, top_k)
-    if workspace2 is not None:
-        reduced = _resize_cache(workspace2, (num_tokens, hidden_dim))
+    # moe_unpermute reads from gemm2_out and writes to reduced. Source/destination
+    # must never alias (particularly in non-chunked mode where workspaces are reused).
+    if output is not None:
+        reduced = output
     else:
         reduced = torch.empty((num_tokens, hidden_dim), device=device, dtype=dtype)
+    if _shares_storage(gemm2_out, reduced):
+        raise RuntimeError(
+            "moe_unpermute destination must not alias GEMM2 source buffer."
+        )
     moe_unpermute(
         out=reduced,
         permuted_hidden_states=gemm2_out,
@@ -1102,6 +1163,8 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         act_out_dim = self.adjust_N_for_activation(N, activation)
         workspace13 = (M * topk, max(N, K))
+        # workspace2 is reused for both post-activation staging (M*topk, act_out)
+        # and GEMM2 output staging (M*topk, K).
         workspace2 = (M * topk, max(act_out_dim, K))
         output_shape = (M, K)
         return (workspace13, workspace2, output_shape)
@@ -1127,7 +1190,7 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
         a1_gscale_vec, a2_gscale_vec, g1_alpha_vec, g2_alpha_vec = (
             self._get_scale_vecs()
         )
-        result = fused_moe_batch_invariant_nvfp4(
+        fused_moe_batch_invariant_nvfp4(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
@@ -1144,8 +1207,8 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
             expert_map=expert_map,
             workspace13=workspace13,
             workspace2=workspace2,
+            output=output,
         )
-        output.copy_(result)
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for batch-invariant NVFP4 MoE")
