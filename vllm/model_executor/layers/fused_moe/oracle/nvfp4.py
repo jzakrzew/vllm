@@ -8,7 +8,6 @@ import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
 )
@@ -122,11 +121,11 @@ def backend_to_kernel_cls(
         return [MarlinExperts]
 
     elif backend == NvFp4MoeBackend.BATCH_INVARIANT:
-        from vllm.model_executor.layers.fused_moe.batch_invariant_moe import (
-            BatchInvariantNvfp4Experts,
+        from vllm.model_executor.layers.fused_moe.batch_invariant_fp4_moe import (
+            BatchInvariantFP4Experts,
         )
 
-        return [BatchInvariantNvfp4Experts]
+        return [BatchInvariantFP4Experts]
     else:
         raise ValueError(f"Unknown NvFP4 MoE backend: {backend.value}")
 
@@ -159,14 +158,13 @@ def select_nvfp4_moe_backend(
     Note: Shape-specific fallbacks may still occur at runtime.
     """
 
-    if vllm_is_batch_invariant():
+    if envs.VLLM_BATCH_INVARIANT:
         backend = NvFp4MoeBackend.BATCH_INVARIANT
-        k_cls = backend_to_kernel_cls(backend)
         logger.info_once(
             "Batch-invariant mode enabled: using '%s' NvFp4 MoE backend.",
             backend.value,
         )
-        return backend, k_cls
+        return backend, backend_to_kernel_cls(backend)[0]
 
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = [

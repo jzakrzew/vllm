@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Batch-invariant NVFP4 fused MoE expert implementation."""
+"""Batch-invariant FP4 fused MoE expert implementations (NVFP4 and MXFP4)."""
 
 import os
 from typing import Any
@@ -32,11 +32,13 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kMxfp4Static,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.platform_utils import num_compute_units
 
 logger = init_logger(__name__)
@@ -121,7 +123,7 @@ def _find_expert_bin_search(
 
 
 @triton.jit
-def _grouped_matmul_nvfp4_packed_persistent_kernel(
+def _grouped_matmul_fp4_packed_persistent_kernel(
     a_ptr,
     a_scale_ptr,
     b_ptr,
@@ -158,13 +160,20 @@ def _grouped_matmul_nvfp4_packed_persistent_kernel(
     NUM_SMS: tl.constexpr,
     A_LARGE: tl.constexpr,
     B_LARGE: tl.constexpr,
+    A_IS_FP4: tl.constexpr,
+    B_SCALE_GROUP: tl.constexpr,
+    HAS_ALPHA: tl.constexpr,
 ):
-    """Persistent packed grouped NVFP4 GEMM.
+    """Persistent packed grouped FP4 GEMM (NVFP4 and MXFP4).
 
     Launches ``NUM_SMS`` programs that loop over a global tile index space
     built from a prefix-sum of per-expert tile counts.  Each iteration maps
     a global tile id to ``(expert_id, local_tile_id)`` via binary search,
     then executes the same GEMM tile logic as the non-persistent kernel.
+
+    When ``A_IS_FP4=True`` (NVFP4), both A and B are packed FP4 with
+    block scales.  When ``A_IS_FP4=False`` (MXFP4 W4A16), A is BF16
+    and only B has FP4 weights with block scales.
 
     B and B-scale tensors are pre-flattened by the wrapper:
     ``b_fp4`` from ``[E, N, K_packed]`` to ``[E*N, K_packed]``, and
@@ -175,7 +184,7 @@ def _grouped_matmul_nvfp4_packed_persistent_kernel(
     total_tiles = tl.load(expert_tile_start_ptr + num_experts).to(tl.int32)
 
     K_BYTES: tl.constexpr = BLOCK_SIZE_K // 2
-    SCALE_K_TILE: tl.constexpr = BLOCK_SIZE_K // 16
+    SCALE_K_TILE: tl.constexpr = BLOCK_SIZE_K // B_SCALE_GROUP
     SCALE_K_TILES: tl.constexpr = SCALE_K_TILE // 4
     SCALE_M_TILES: tl.constexpr = BLOCK_SIZE_M // 128
     SCALE_N_TILES: tl.constexpr = BLOCK_SIZE_N // 128
@@ -183,13 +192,22 @@ def _grouped_matmul_nvfp4_packed_persistent_kernel(
     k_bytes_total = K_total // 2
 
     # Global descriptors created once before the loop.
-    a_desc = tl.make_tensor_descriptor(
-        a_ptr,
-        shape=[M_total, k_bytes_total],
-        strides=[stride_am, stride_ak],
-        block_shape=[BLOCK_SIZE_M, K_BYTES],
-        padding_option="zero",
-    )
+    if A_IS_FP4:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M_total, k_bytes_total],
+            strides=[stride_am, stride_ak],
+            block_shape=[BLOCK_SIZE_M, K_BYTES],
+            padding_option="zero",
+        )
+    else:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M_total, K_total],
+            strides=[stride_am, stride_ak],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+            padding_option="zero",
+        )
     # B flattened to [E*N, K_packed] by the wrapper.
     b_desc = tl.make_tensor_descriptor(
         b_ptr,
@@ -198,22 +216,29 @@ def _grouped_matmul_nvfp4_packed_persistent_kernel(
         block_shape=[BLOCK_SIZE_N, K_BYTES],
         padding_option="zero",
     )
-    a_scale_desc = tl.make_tensor_descriptor(
-        a_scale_ptr,
-        shape=[1, tl.cdiv(a_scale_rows_total, 128), a_scale_cols_total // 4, 2, 256],
-        strides=[
-            tl.cdiv(a_scale_rows_total, 128)
-            * (a_scale_cols_total // 4)
-            * 512
-            * stride_ask,
-            (a_scale_cols_total // 4) * 512 * stride_ask,
-            512 * stride_ask,
-            256 * stride_ask,
-            stride_ask,
-        ],
-        block_shape=[1, SCALE_M_TILES, SCALE_K_TILES, 2, 256],
-        padding_option="zero",
-    )
+    if A_IS_FP4:
+        a_scale_desc = tl.make_tensor_descriptor(
+            a_scale_ptr,
+            shape=[
+                1,
+                tl.cdiv(a_scale_rows_total, 128),
+                a_scale_cols_total // 4,
+                2,
+                256,
+            ],
+            strides=[
+                tl.cdiv(a_scale_rows_total, 128)
+                * (a_scale_cols_total // 4)
+                * 512
+                * stride_ask,
+                (a_scale_cols_total // 4) * 512 * stride_ask,
+                512 * stride_ask,
+                256 * stride_ask,
+                stride_ask,
+            ],
+            block_shape=[1, SCALE_M_TILES, SCALE_K_TILES, 2, 256],
+            padding_option="zero",
+        )
     # B-scale flattened to [E*N_pad, K_s] by the wrapper.
     b_scale_n_tiles = tl.cdiv(num_experts * b_scale_n_per_expert, 128)
     b_scale_desc = tl.make_tensor_descriptor(
@@ -252,13 +277,16 @@ def _grouped_matmul_nvfp4_packed_persistent_kernel(
         )
 
         expert_row_offset = tl.load(expert_offsets_ptr + expert_id).to(tl.int32)
-        expert_scale_offset = tl.load(a_scale_offsets_ptr + expert_id).to(tl.int32)
+        if A_IS_FP4:
+            expert_scale_offset = tl.load(a_scale_offsets_ptr + expert_id).to(tl.int32)
         if A_LARGE:
             expert_row_offset = expert_row_offset.to(tl.int64)
-            expert_scale_offset = expert_scale_offset.to(tl.int64)
+            if A_IS_FP4:
+                expert_scale_offset = expert_scale_offset.to(tl.int64)
 
         k_bytes = K // 2
-        alpha = tl.load(alpha_ptr + expert_id).to(tl.float32)
+        if HAS_ALPHA:
+            alpha = tl.load(alpha_ptr + expert_id).to(tl.float32)
         start_m = pid_m * BLOCK_SIZE_M
         start_n = pid_n * BLOCK_SIZE_N
         offs_m = start_m + tl.arange(0, BLOCK_SIZE_M)
@@ -288,46 +316,65 @@ def _grouped_matmul_nvfp4_packed_persistent_kernel(
             if B_LARGE:
                 b_n_start = b_n_start.to(tl.int64)
 
-            a = a_desc.load([a_m_start, k_start_bytes])
+            if A_IS_FP4:
+                a = a_desc.load([a_m_start, k_start_bytes])
+                a = tl.where(m_mask[:, None] & k_byte_mask[None, :], a, 0)
+            else:
+                k_start_elems = ki * BLOCK_SIZE_K
+                if A_LARGE:
+                    k_start_elems = k_start_elems.to(tl.int64)
+                k_elem_mask = (ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)) < K
+                a = a_desc.load([a_m_start, k_start_elems])
+                a = tl.where(m_mask[:, None] & k_elem_mask[None, :], a, 0)
             b_raw = b_desc.load([b_n_start, k_start_bytes])
-            a = tl.where(m_mask[:, None] & k_byte_mask[None, :], a, 0)
             b = tl.where(n_mask[:, None] & k_byte_mask[None, :], b_raw, 0).T
 
             scale_tile_k = ki * SCALE_K_TILES
             if A_LARGE or B_LARGE:
                 scale_tile_k = scale_tile_k.to(tl.int64)
-            scale_tile_m = (expert_scale_offset + start_m) // 128
             scale_tile_n = (bs_row_offset + start_n) // 128
-            if A_LARGE:
-                scale_tile_m = scale_tile_m.to(tl.int64)
             if B_LARGE:
                 scale_tile_n = scale_tile_n.to(tl.int64)
 
-            a_scale_raw = a_scale_desc.load([0, scale_tile_m, scale_tile_k, 0, 0])
             b_scale_raw = b_scale_desc.load([0, scale_tile_n, scale_tile_k, 0, 0])
-
-            a_scale = _unswizzle_scale(
-                a_scale_raw.reshape(BLOCK_SIZE_M, SCALE_K_TILE),
-                TILE_ROWS=BLOCK_SIZE_M,
-                TILE_SCALE_COLS=SCALE_K_TILE,
-            )
             b_scale = _unswizzle_scale(
                 b_scale_raw.reshape(BLOCK_SIZE_N, SCALE_K_TILE),
                 TILE_ROWS=BLOCK_SIZE_N,
                 TILE_SCALE_COLS=SCALE_K_TILE,
             )
 
-            accumulator = tl.dot_scaled(
-                a,
-                a_scale,
-                "e2m1",
-                b,
-                b_scale,
-                "e2m1",
-                accumulator,
-            )
+            if A_IS_FP4:
+                scale_tile_m = (expert_scale_offset + start_m) // 128
+                if A_LARGE:
+                    scale_tile_m = scale_tile_m.to(tl.int64)
+                a_scale_raw = a_scale_desc.load([0, scale_tile_m, scale_tile_k, 0, 0])
+                a_scale = _unswizzle_scale(
+                    a_scale_raw.reshape(BLOCK_SIZE_M, SCALE_K_TILE),
+                    TILE_ROWS=BLOCK_SIZE_M,
+                    TILE_SCALE_COLS=SCALE_K_TILE,
+                )
+                accumulator = tl.dot_scaled(
+                    a,
+                    a_scale,
+                    "e2m1",
+                    b,
+                    b_scale,
+                    "e2m1",
+                    accumulator,
+                )
+            else:
+                accumulator = tl.dot_scaled(
+                    a,
+                    None,
+                    "bf16",
+                    b,
+                    b_scale,
+                    "e2m1",
+                    accumulator,
+                )
 
-        accumulator *= alpha
+        if HAS_ALPHA:
+            accumulator *= alpha
         c = accumulator.to(c_ptr.dtype.element_ty)
         c_expert_ptr = c_ptr + expert_row_offset * stride_cm
         offs_m_c = offs_m
@@ -621,7 +668,7 @@ def _grouped_matmul_nvfp4_packed(
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 256
+    BLOCK_SIZE_K = 128
 
     M_logical = a_fp4.shape[0]
 
@@ -693,8 +740,11 @@ def _grouped_matmul_nvfp4_packed(
     b_fp4_flat = b_fp4.reshape(-1, b_fp4.shape[2])
     b_scale_flat = b_scale.reshape(-1, b_scale.shape[2])
 
+    # TMA tensor descriptors allocate host-side metadata; Triton requires an allocator.
+    set_triton_allocator(a_fp4.device)
+
     grid = (min(NUM_SMS, worst_case_tiles),)
-    _grouped_matmul_nvfp4_packed_persistent_kernel[grid](
+    _grouped_matmul_fp4_packed_persistent_kernel[grid](
         a_fp4,
         a_scale,
         b_fp4_flat,
@@ -731,6 +781,9 @@ def _grouped_matmul_nvfp4_packed(
         NUM_SMS=NUM_SMS,
         A_LARGE=A_LARGE,
         B_LARGE=B_LARGE,
+        A_IS_FP4=True,
+        B_SCALE_GROUP=16,
+        HAS_ALPHA=True,
         num_stages=2,
         num_warps=8,
     )
@@ -1008,17 +1061,362 @@ def fused_moe_batch_invariant_nvfp4(
 
 
 # ---------------------------------------------------------------------------
+# MXFP4 (W4A16) grouped GEMM wrapper
+# ---------------------------------------------------------------------------
+
+
+def _grouped_matmul_mxfp4_packed(
+    a_bf16: torch.Tensor,
+    b_fp4: torch.Tensor,
+    b_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    problem_sizes: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Packed grouped MXFP4 W4A16 GEMM (BF16 activations, MXFP4 weights).
+
+    Args:
+        a_bf16: [M_total, K] bfloat16 activations in expert-packed row order.
+        b_fp4: [E, N_max, K_packed] uint8 packed FP4 expert weights.
+        b_scale: [E, N_pad, K_s] swizzled weight block scales (group 32).
+        expert_offsets: [E] or [E+1] start row offsets in ``a_bf16``/output.
+        problem_sizes: [E, 3] int tensor containing per-expert (M, N, K).
+        output_dtype: output dtype.
+        output: Optional pre-allocated output tensor.
+
+    Returns:
+        [M_total, N_max] tensor with grouped expert GEMM outputs.
+    """
+    assert a_bf16.ndim == 2 and b_fp4.ndim == 3
+    assert a_bf16.dtype in (torch.bfloat16, torch.float16)
+    assert b_fp4.dtype == torch.uint8
+    assert b_scale.ndim == 3
+    assert problem_sizes.ndim == 2 and problem_sizes.shape[1] == 3
+
+    E = b_fp4.shape[0]
+    if E == 0:
+        return torch.empty(
+            (a_bf16.shape[0], b_fp4.shape[1]),
+            device=a_bf16.device,
+            dtype=output_dtype,
+        )
+
+    assert problem_sizes.shape[0] == E
+
+    expert_offsets = _canonicalize_grouped_offsets(
+        expert_offsets, num_experts=E, name="expert_offsets"
+    )
+    problem_sizes = problem_sizes.to(dtype=torch.int32).contiguous()
+    if not a_bf16.is_contiguous():
+        a_bf16 = a_bf16.contiguous()
+    if not b_scale.is_contiguous():
+        b_scale = b_scale.contiguous()
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 128
+
+    M_logical = a_bf16.shape[0]
+    K = a_bf16.shape[1]
+
+    max_tiles_m = triton.cdiv(M_logical, BLOCK_SIZE_M)
+    max_tiles_n = triton.cdiv(b_fp4.shape[1], BLOCK_SIZE_N)
+    max_tiles_per_expert = max_tiles_m * max_tiles_n
+
+    N_out = b_fp4.shape[1]
+    if output is not None:
+        assert output.shape[0] >= M_logical and output.shape[1] >= N_out
+        c_work = output.flatten()[: M_logical * N_out].view(M_logical, N_out)
+    else:
+        c_work = torch.empty(
+            (M_logical, N_out),
+            device=a_bf16.device,
+            dtype=output_dtype,
+        )
+
+    if max_tiles_per_expert == 0:
+        return c_work
+
+    A_LARGE = max(a_bf16.numel(), c_work.numel()) > 2**31
+    B_LARGE = max(b_fp4.numel(), b_scale.numel()) > 2**31
+    NUM_SMS = num_compute_units(a_bf16.device.index)
+    worst_case_tiles = E * max_tiles_per_expert
+
+    M_per_expert = problem_sizes[:, 0].to(torch.int32).clamp(min=0)
+    N_per_expert = problem_sizes[:, 1].to(torch.int32).clamp(min=0)
+    K_per_expert = problem_sizes[:, 2].to(torch.int32).clamp(min=0)
+    valid = (M_per_expert > 0) & (N_per_expert > 0) & (K_per_expert > 0)
+    tiles_per_expert = (
+        torch.div(
+            M_per_expert + BLOCK_SIZE_M - 1,
+            BLOCK_SIZE_M,
+            rounding_mode="floor",
+        )
+        * torch.div(
+            N_per_expert + BLOCK_SIZE_N - 1,
+            BLOCK_SIZE_N,
+            rounding_mode="floor",
+        )
+        * valid.to(torch.int32)
+    )
+    expert_tile_start = torch.zeros(E + 1, dtype=torch.int32, device=a_bf16.device)
+    expert_tile_start[1:] = torch.cumsum(tiles_per_expert, dim=0)
+
+    b_fp4_flat = b_fp4.reshape(-1, b_fp4.shape[2])
+    b_scale_flat = b_scale.reshape(-1, b_scale.shape[2])
+
+    # Dummy tensors for unused A-scale and alpha kernel arguments.
+    dummy_a_scale = torch.empty(0, device=a_bf16.device, dtype=torch.uint8)
+    dummy_alpha = torch.empty(0, device=a_bf16.device, dtype=torch.float32)
+    dummy_a_scale_offsets = expert_offsets
+
+    # TMA tensor descriptors allocate host-side metadata; Triton requires an allocator.
+    set_triton_allocator(a_bf16.device)
+
+    grid = (min(NUM_SMS, worst_case_tiles),)
+    _grouped_matmul_fp4_packed_persistent_kernel[grid](
+        a_bf16,
+        dummy_a_scale,
+        b_fp4_flat,
+        b_scale_flat,
+        c_work,
+        dummy_alpha,
+        expert_offsets,
+        dummy_a_scale_offsets,
+        problem_sizes,
+        expert_tile_start,
+        E,
+        a_bf16.shape[0],
+        b_fp4.shape[1],
+        K,
+        0,  # a_scale_rows_total (unused)
+        problem_sizes.stride(0),
+        problem_sizes.stride(1),
+        a_bf16.stride(0),
+        a_bf16.stride(1),
+        0,  # stride_asm (unused)
+        0,  # stride_ask (unused)
+        b_fp4_flat.stride(0),
+        b_fp4_flat.stride(1),
+        b_scale_flat.stride(1),
+        c_work.stride(0),
+        c_work.stride(1),
+        0,  # a_scale_cols_total (unused)
+        b_scale.shape[2],
+        b_scale.shape[1],
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        NUM_SMS=NUM_SMS,
+        A_LARGE=A_LARGE,
+        B_LARGE=B_LARGE,
+        A_IS_FP4=False,
+        B_SCALE_GROUP=32,
+        HAS_ALPHA=False,
+        num_stages=2,
+        num_warps=8,
+    )
+    return c_work
+
+
+# ---------------------------------------------------------------------------
+# Standalone deterministic MXFP4 W4A16 MoE implementation
+# ---------------------------------------------------------------------------
+
+
+def fused_moe_batch_invariant_mxfp4(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    activation: Any,
+    *,
+    apply_router_weight_on_input: bool = False,
+    expert_map: torch.Tensor | None = None,
+    workspace13: torch.Tensor | None = None,
+    workspace2: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Deterministic MXFP4 W4A16 MoE using packed routing and grouped GEMMs.
+
+    Activations stay in BF16 throughout (no FP4 activation quantization).
+    """
+    if hidden_states.ndim != 2:
+        raise RuntimeError(f"Expected 2D hidden_states, got {hidden_states.shape}.")
+    if topk_ids.shape != topk_weights.shape:
+        raise RuntimeError("topk_ids and topk_weights must have identical shapes.")
+    if topk_ids.ndim != 2:
+        raise RuntimeError(
+            f"Expected 2D top-k routing tensors, got shape {topk_ids.shape}."
+        )
+    if apply_router_weight_on_input and topk_ids.shape[1] != 1:
+        raise RuntimeError(
+            "apply_router_weight_on_input=True is only supported for top_k == 1."
+        )
+
+    activation_kind = (
+        activation
+        if isinstance(activation, MoEActivation)
+        else MoEActivation.from_str(str(activation))
+    )
+
+    num_tokens, hidden_dim = hidden_states.shape
+    num_experts = w13_weight.shape[0]
+    top_k = topk_ids.shape[1]
+    M_total = num_tokens * top_k
+
+    if output is not None:
+        if output.device != hidden_states.device:
+            raise RuntimeError(
+                f"output must be on {hidden_states.device}, got {output.device}."
+            )
+        if output.dtype != hidden_states.dtype:
+            raise RuntimeError(
+                f"output dtype must be {hidden_states.dtype}, got {output.dtype}."
+            )
+        if output.shape != (num_tokens, hidden_dim):
+            raise RuntimeError(
+                "output must match hidden_states shape "
+                f"({num_tokens}, {hidden_dim}), got {tuple(output.shape)}."
+            )
+        if not output.is_contiguous():
+            raise RuntimeError("output must be contiguous.")
+
+    if M_total == 0:
+        if output is not None:
+            return output
+        return hidden_states.new_empty((num_tokens, hidden_dim))
+
+    routed_topk_ids = topk_ids
+    if expert_map is not None:
+        routed_topk_ids = _nvfp4_moe_map_experts(topk_ids, expert_map)
+    routed_topk_ids = routed_topk_ids.to(torch.int32)
+    valid_routes = (routed_topk_ids >= 0) & (routed_topk_ids < num_experts)
+    routed_topk_ids = torch.where(
+        valid_routes, routed_topk_ids, torch.full_like(routed_topk_ids, -1)
+    )
+    routed_topk_weights = topk_weights.to(torch.float32)
+
+    if apply_router_weight_on_input:
+        packed_hidden_states = hidden_states * routed_topk_weights.view(-1, 1).to(
+            hidden_states.dtype
+        )
+    else:
+        packed_hidden_states = hidden_states
+
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+    w1_output_size = w13_weight.shape[1]
+    activation_out_dim = (
+        w1_output_size // 2 if activation_kind.is_gated else w1_output_size
+    )
+    w2_output_size = hidden_dim
+
+    expert_offsets = torch.empty((num_experts + 1), dtype=torch.int32, device=device)
+    blockscale_offsets = torch.empty(
+        (num_experts + 1), dtype=torch.int32, device=device
+    )
+    problem_sizes1 = torch.empty((num_experts, 3), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.empty((num_experts, 3), dtype=torch.int32, device=device)
+    a_map = torch.zeros((M_total,), dtype=torch.int32, device=device)
+    c_map = torch.empty((M_total,), dtype=torch.int32, device=device)
+    ops.get_cutlass_moe_mm_data(
+        routed_topk_ids,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+        num_experts,
+        activation_out_dim,
+        hidden_dim,
+        blockscale_offsets,
+    )
+
+    if not activation_kind.is_gated:
+        problem_sizes1[:, 1].fill_(w1_output_size)
+        problem_sizes2[:, 2].fill_(activation_out_dim)
+
+    packed_hidden_states = ops.shuffle_rows(packed_hidden_states, a_map)
+
+    # GEMM1: BF16 activations x MXFP4 weights
+    gemm1_out = _grouped_matmul_mxfp4_packed(
+        a_bf16=packed_hidden_states,
+        b_fp4=w13_weight,
+        b_scale=w13_weight_scale,
+        expert_offsets=expert_offsets,
+        problem_sizes=problem_sizes1,
+        output_dtype=dtype,
+        output=workspace13,
+    )
+    if gemm1_out.shape[-1] != w1_output_size:
+        gemm1_out = gemm1_out[:, :w1_output_size].contiguous()
+
+    # Activation
+    if workspace2 is not None:
+        act_out = _resize_cache(workspace2, (M_total, activation_out_dim))
+    else:
+        act_out = torch.empty((M_total, activation_out_dim), device=device, dtype=dtype)
+    apply_moe_activation(
+        activation=activation_kind,
+        output=act_out,
+        input=gemm1_out,
+    )
+
+    # GEMM2: BF16 activation output x MXFP4 weights
+    gemm2_out = _grouped_matmul_mxfp4_packed(
+        a_bf16=act_out,
+        b_fp4=w2_weight,
+        b_scale=w2_weight_scale,
+        expert_offsets=expert_offsets,
+        problem_sizes=problem_sizes2,
+        output_dtype=dtype,
+        output=workspace2,
+    )
+    if gemm2_out.shape[-1] != w2_output_size:
+        gemm2_out = gemm2_out[:, :w2_output_size].contiguous()
+
+    epilogue_topk_weights = (
+        torch.ones_like(routed_topk_weights)
+        if apply_router_weight_on_input
+        else routed_topk_weights
+    )
+    inv_permuted_idx = c_map.view(num_tokens, top_k)
+    if output is not None:
+        reduced = output
+    else:
+        reduced = torch.empty((num_tokens, hidden_dim), device=device, dtype=dtype)
+    moe_unpermute(
+        out=reduced,
+        permuted_hidden_states=gemm2_out,
+        topk_weights=epilogue_topk_weights,
+        inv_permuted_idx=inv_permuted_idx,
+        expert_first_token_offset=expert_offsets.to(torch.int64),
+    )
+    return reduced
+
+
+# ---------------------------------------------------------------------------
 # Modular-kernel wrapper class
 # ---------------------------------------------------------------------------
 
 
-class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
-    """Deterministic, batch-invariant NVFP4 MoE expert implementation.
+class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
+    """Deterministic, batch-invariant FP4 MoE expert implementation.
 
-    Wraps ``fused_moe_batch_invariant_nvfp4`` (per-expert Triton
-    ``tl.dot_scaled`` GEMMs) into the modular-kernel interface so it
-    can be used as a drop-in backend alongside FlashInfer/CUTLASS.
+    Supports both NVFP4 (W4A4) and MXFP4 (W4A16) via per-expert Triton
+    ``tl.dot_scaled`` GEMMs.  Dispatches to the appropriate wrapper based
+    on ``quant_config.weight_quant_dtype``.
     """
+
+    _SUPPORTED_DTYPES = {"nvfp4", "mxfp4"}
 
     def __init__(
         self,
@@ -1026,9 +1424,10 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config, quant_config)
-        assert quant_config.weight_quant_dtype == "nvfp4", (
-            "BatchInvariantNvfp4Experts only supports nvfp4 weight quantization, "
-            f"got {quant_config.weight_quant_dtype}"
+        self._quant_dtype = quant_config.weight_quant_dtype
+        assert self._quant_dtype in self._SUPPORTED_DTYPES, (
+            f"BatchInvariantFP4Experts supports {self._SUPPORTED_DTYPES}, "
+            f"got {self._quant_dtype!r}"
         )
         self._num_local_experts = moe_config.num_local_experts
         self._cached_scale_vecs: (
@@ -1053,7 +1452,10 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        return (weight_key, activation_key) == (kNvfp4Static, kNvfp4Dynamic)
+        return (weight_key, activation_key) in {
+            (kNvfp4Static, kNvfp4Dynamic),
+            (kMxfp4Static, None),
+        }
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
@@ -1082,7 +1484,7 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
-    def _get_scale_vecs(
+    def _get_nvfp4_scale_vecs(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._cached_scale_vecs is not None:
@@ -1117,8 +1519,6 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         act_out_dim = self.adjust_N_for_activation(N, activation)
         workspace13 = (M * topk, max(N, K))
-        # workspace2 is reused for both post-activation staging (M*topk, act_out)
-        # and GEMM2 output staging (M*topk, K).
         workspace2 = (M * topk, max(act_out_dim, K))
         output_shape = (M, K)
         return (workspace13, workspace2, output_shape)
@@ -1141,28 +1541,49 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        a1_gscale_vec, a2_gscale_vec, g1_alpha_vec, g2_alpha_vec = (
-            self._get_scale_vecs()
-        )
-        fused_moe_batch_invariant_nvfp4(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            w13_weight=w1,
-            w13_weight_scale=self.w1_scale,
-            w2_weight=w2,
-            w2_weight_scale=self.w2_scale,
-            a1_gscale=a1_gscale_vec,
-            g1_alphas=g1_alpha_vec,
-            a2_gscale=a2_gscale_vec,
-            g2_alphas=g2_alpha_vec,
-            activation=activation,
-            apply_router_weight_on_input=bool(apply_router_weight_on_input),
-            expert_map=expert_map,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            output=output,
-        )
+        if self._quant_dtype == "nvfp4":
+            a1_gscale_vec, a2_gscale_vec, g1_alpha_vec, g2_alpha_vec = (
+                self._get_nvfp4_scale_vecs()
+            )
+            fused_moe_batch_invariant_nvfp4(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                w13_weight=w1,
+                w13_weight_scale=self.w1_scale,
+                w2_weight=w2,
+                w2_weight_scale=self.w2_scale,
+                a1_gscale=a1_gscale_vec,
+                g1_alphas=g1_alpha_vec,
+                a2_gscale=a2_gscale_vec,
+                g2_alphas=g2_alpha_vec,
+                activation=activation,
+                apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                expert_map=expert_map,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                output=output,
+            )
+        else:
+            fused_moe_batch_invariant_mxfp4(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                w13_weight=w1,
+                w13_weight_scale=self.w1_scale,
+                w2_weight=w2,
+                w2_weight_scale=self.w2_scale,
+                activation=activation,
+                apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                expert_map=expert_map,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                output=output,
+            )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        raise NotImplementedError("LoRA is not supported for batch-invariant NVFP4 MoE")
+        raise NotImplementedError("LoRA is not supported for batch-invariant FP4 MoE")
+
+
+# Backward-compatible alias for existing imports.
+BatchInvariantNvfp4Experts = BatchInvariantFP4Experts

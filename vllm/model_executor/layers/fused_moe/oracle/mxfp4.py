@@ -61,6 +61,8 @@ class Mxfp4MoeBackend(Enum):
     TRITON_UNFUSED = "TRITON_UNFUSED"
     # XPU
     XPU = "XPU"
+    # Batch-invariant (deterministic)
+    BATCH_INVARIANT = "BATCH_INVARIANT"
 
 
 # Backends that share the same TRTLLM weight format
@@ -142,6 +144,13 @@ def backend_to_kernel_cls(
 
         return [XPUExpertsMXFp4]
 
+    elif backend == Mxfp4MoeBackend.BATCH_INVARIANT:
+        from vllm.model_executor.layers.fused_moe.batch_invariant_fp4_moe import (
+            BatchInvariantFP4Experts,
+        )
+
+        return [BatchInvariantFP4Experts]
+
     else:
         raise ValueError(f"Unknown MXFP4 MoE backend: {backend.value}")
 
@@ -201,6 +210,14 @@ def select_mxfp4_moe_backend(
     Select the primary MXFP4 MoE backend.
     Note: Shape-specific fallbacks may still occur at runtime.
     """
+    if envs.VLLM_BATCH_INVARIANT:
+        backend = Mxfp4MoeBackend.BATCH_INVARIANT
+        logger.info_once(
+            "Batch-invariant mode enabled: using '%s' MXFP4 MoE backend.",
+            backend.value,
+        )
+        return backend, backend_to_kernel_cls(backend)[0]
+
     triton_kernels_supported = has_triton_kernels() and (
         9,
         0,
@@ -752,6 +769,30 @@ def convert_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.BATCH_INVARIANT:
+        from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+            swizzle_blockscale,
+        )
+
+        # The batch-invariant Triton kernel reads B-scales through TMA
+        # descriptors with a 128x4 block-interleaved layout (same permutation
+        # as NVFP4).  Apply that swizzle to the uint8 e8m0fnu scales by
+        # temporarily viewing them as float8_e4m3fn (same byte width).
+        w13_scale_swizzled = swizzle_blockscale(
+            w13_weight_scale.data.view(torch.float8_e4m3fn)
+        ).view(torch.uint8)
+        w2_scale_swizzled = swizzle_blockscale(
+            w2_weight_scale.data.view(torch.float8_e4m3fn)
+        ).view(torch.uint8)
+        return (
+            w13_weight,
+            w2_weight,
+            w13_scale_swizzled,
+            w2_scale_swizzled,
+            w13_bias,
+            w2_bias,
+        )
+
     elif mxfp4_backend == Mxfp4MoeBackend.XPU:
         # No additional transformation needed for XPU backend
         return (
@@ -795,6 +836,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.AITER,
+        Mxfp4MoeBackend.BATCH_INVARIANT,
     ):
         return mxfp4_w4a16_moe_quant_config(
             w1_bias=w1_bias,

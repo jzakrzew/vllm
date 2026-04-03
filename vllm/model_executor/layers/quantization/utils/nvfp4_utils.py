@@ -13,7 +13,6 @@ from vllm._custom_ops import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     matmul_nvfp4_persistent,
-    vllm_is_batch_invariant,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
@@ -122,8 +121,7 @@ def select_nvfp4_linear_backend() -> NvFp4LinearBackend:
         return NvFp4LinearBackend.EMULATION
 
     selected_backend: NvFp4LinearBackend | None = None
-
-    if vllm_is_batch_invariant():
+    if envs.VLLM_BATCH_INVARIANT:
         selected_backend = NvFp4LinearBackend.BATCH_INVARIANT
     elif envs.VLLM_USE_FBGEMM:
         try:
