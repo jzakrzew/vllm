@@ -1262,7 +1262,8 @@ def linear_batch_invariant_nvfp4(
         )
     if input.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError(
-            f"Batch-invariant NVFP4 path only supports fp16/bf16 inputs, got {input.dtype}."
+            "Batch-invariant NVFP4 path only supports fp16/bf16 inputs, "
+            f"got {input.dtype}."
         )
 
     original_shape = input.shape

@@ -6,17 +6,25 @@ import os
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
+import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     _compute_pid,
     _unswizzle_scale,
 )
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.activation import (
+    MoEActivation,
+    apply_moe_activation,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+)
+from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
+    moe_unpermute,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -39,28 +47,6 @@ _NVFP4_MOE_DEBUG = os.environ.get("VLLM_NVFP4_MOE_DEBUG", "0") != "0"
 # ---------------------------------------------------------------------------
 # Helpers used by ``fused_moe_batch_invariant_nvfp4``
 # ---------------------------------------------------------------------------
-
-
-def _nvfp4_get_expert_scalar(
-    tensor: torch.Tensor | None,
-    expert_id: int,
-    *,
-    field_name: str,
-) -> torch.Tensor:
-    if tensor is None:
-        raise RuntimeError(f"Missing required NVFP4 MoE tensor: {field_name}")
-
-    if tensor.ndim == 0 or tensor.numel() == 1:
-        value = tensor.reshape(())
-    else:
-        if expert_id >= tensor.shape[0]:
-            raise RuntimeError(
-                f"NVFP4 MoE tensor '{field_name}' is missing expert {expert_id}."
-            )
-        value = tensor[expert_id]
-        if value.ndim != 0:
-            value = value.reshape(())
-    return value.to(dtype=torch.float32)
 
 
 def _nvfp4_get_expert_vector(
@@ -788,15 +774,6 @@ def fused_moe_batch_invariant_nvfp4(
     safely skipping invalid routes.  When ``output`` is provided, the final
     reduction writes directly into that tensor.
     """
-    import torch.nn.functional as F
-
-    import vllm._custom_ops as ops
-    from vllm.model_executor.layers.fused_moe.activation import (
-        apply_moe_activation,
-    )
-    from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
-        moe_unpermute,
-    )
 
     if hidden_states.ndim != 2:
         raise RuntimeError(
@@ -1086,6 +1063,10 @@ class BatchInvariantNvfp4Experts(mk.FusedMoEPermuteExpertsUnpermute):
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
+        return True
+
+    @staticmethod
+    def _supports_batch_invariance() -> bool:
         return True
 
     @staticmethod
