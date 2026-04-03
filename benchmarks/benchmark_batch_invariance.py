@@ -243,9 +243,7 @@ def _read_bench_config() -> dict:
         "max_prompt": int(os.getenv("VLLM_BENCH_MAX_PROMPT", "2048")),
         "max_tokens": int(os.getenv("VLLM_BENCH_MAX_TOKENS", "128")),
         "temperature": float(os.getenv("VLLM_BENCH_TEMPERATURE", "0.0")),
-        "gpu_mem_util": float(
-            os.getenv("VLLM_BENCH_GPU_MEMORY_UTILIZATION", "0.4")
-        ),
+        "gpu_mem_util": float(os.getenv("VLLM_BENCH_GPU_MEMORY_UTILIZATION", "0.4")),
         "max_model_len": int(os.getenv("VLLM_BENCH_MAX_MODEL_LEN", "5120")),
         "backend": os.getenv("VLLM_BENCH_BACKEND", "FLASH_ATTN"),
     }
@@ -260,10 +258,7 @@ def worker_main():
     """
     from vllm.platforms import current_platform
 
-    if not (
-        current_platform.is_cuda()
-        and current_platform.has_device_capability(90)
-    ):
+    if not (current_platform.is_cuda() and current_platform.has_device_capability(90)):
         print("ERROR: Requires CUDA and >= Hopper (SM90)", file=sys.stderr)
         sys.exit(1)
 
