@@ -774,12 +774,28 @@ def convert_to_mxfp4_moe_kernel_format(
             swizzle_blockscale,
         )
 
+        # De-interleave w13 rows: the checkpoint stores gate/up pairs as
+        # [g0, u0, g1, u1, ...].  The kernel + silu_and_mul expect all gate
+        # rows first, then all up rows: [g0, g1, ..., u0, u1, ...].
+        w13_w = w13_weight.data
+        gate_w, up_w = w13_w[:, ::2, :], w13_w[:, 1::2, :]
+        w13_weight = torch.cat([gate_w, up_w], dim=1).contiguous()
+
+        w13_s = w13_weight_scale.data
+        gate_s, up_s = w13_s[:, ::2, :], w13_s[:, 1::2, :]
+        w13_scale_deinterleaved = torch.cat([gate_s, up_s], dim=1).contiguous()
+
+        if w13_bias is not None:
+            w13_b = w13_bias.data
+            gate_b, up_b = w13_b[:, ::2], w13_b[:, 1::2]
+            w13_bias = torch.cat([gate_b, up_b], dim=1).contiguous()
+
         # The batch-invariant Triton kernel reads B-scales through TMA
         # descriptors with a 128x4 block-interleaved layout (same permutation
         # as NVFP4).  Apply that swizzle to the uint8 e8m0fnu scales by
         # temporarily viewing them as float8_e4m3fn (same byte width).
         w13_scale_swizzled = swizzle_blockscale(
-            w13_weight_scale.data.view(torch.float8_e4m3fn)
+            w13_scale_deinterleaved.view(torch.float8_e4m3fn)
         ).view(torch.uint8)
         w2_scale_swizzled = swizzle_blockscale(
             w2_weight_scale.data.view(torch.float8_e4m3fn)

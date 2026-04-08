@@ -747,6 +747,8 @@ def _reference_fused_moe_mxfp4_dequant(
     *,
     apply_router_weight_on_input: bool = False,
     expert_map: torch.Tensor | None = None,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Slow BF16 reference: dequantize MXFP4 weights, then MoE forward in PyTorch."""
     device = hidden_states.device
@@ -790,6 +792,8 @@ def _reference_fused_moe_mxfp4_dequant(
             if apply_router_weight_on_input:
                 x = x * w
             gemm1_out = x @ w13_deq[eid].T
+            if w13_bias is not None:
+                gemm1_out = gemm1_out + w13_bias[eid : eid + 1].to(dtype)
             if act_kind.is_gated:
                 act_dim = gemm1_out.shape[-1] // 2
             else:
@@ -797,6 +801,8 @@ def _reference_fused_moe_mxfp4_dequant(
             act_buf = torch.empty(1, act_dim, device=device, dtype=dtype)
             apply_moe_activation(act_kind, act_buf, gemm1_out)
             y = act_buf @ w2_deq[eid].T
+            if w2_bias is not None:
+                y = y + w2_bias[eid : eid + 1].to(dtype)
             acc = acc + y if apply_router_weight_on_input else acc + y * w
         out[i] = acc[0]
     return out
@@ -1406,3 +1412,85 @@ def test_grouped_matmul_mxfp4_packed_matches_reference(
         torch.testing.assert_close(packed_out, ref_cat, atol=5e-2, rtol=5e-2)
     else:
         assert packed_out.numel() == 0
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 expert bias tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "topk,apply_router_weight_on_input",
+    [
+        (2, False),
+        (1, True),
+    ],
+)
+@pytest.mark.parametrize(
+    "m,e,n,k",
+    [
+        (32, 8, 128, 256),
+        (64, 4, 256, 128),
+    ],
+)
+@torch.inference_mode()
+def test_batch_invariant_mxfp4_moe_with_bias(
+    m: int,
+    e: int,
+    n: int,
+    k: int,
+    topk: int,
+    apply_router_weight_on_input: bool,
+) -> None:
+    """``fused_moe_batch_invariant_mxfp4`` with non-zero expert biases
+    must match a BF16 dequant reference that also applies the biases."""
+    set_random_seed(42)
+
+    hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
+    score = torch.randn(m, e, device=DEVICE, dtype=DTYPE)
+    topk_weights, topk_ids, _ = fused_topk(
+        hidden_states, score, topk, renormalize=False
+    )
+
+    (
+        w13_fp4,
+        w13_scale,
+        w2_fp4,
+        w2_scale,
+        w13_scale_raw,
+        w2_scale_raw,
+    ) = _make_mxfp4_moe_weights(e=e, n=n, k=k)
+
+    w13_bias = torch.randn(e, 2 * n, device=DEVICE, dtype=torch.float32) / 10
+    w2_bias = torch.randn(e, k, device=DEVICE, dtype=torch.float32) / 10
+
+    out = fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_fp4,
+        w13_weight_scale=w13_scale,
+        w2_weight=w2_fp4,
+        w2_weight_scale=w2_scale,
+        activation=MoEActivation.SILU,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    ref = _reference_fused_moe_mxfp4_dequant(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_fp4=w13_fp4,
+        w13_scale_raw=w13_scale_raw,
+        w2_fp4=w2_fp4,
+        w2_scale_raw=w2_scale_raw,
+        activation=MoEActivation.SILU,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    assert out.shape == (m, k)
+    assert out.dtype == DTYPE
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
