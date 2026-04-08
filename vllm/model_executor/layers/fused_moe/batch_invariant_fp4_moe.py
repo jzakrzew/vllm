@@ -130,6 +130,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
     b_scale_ptr,
     c_ptr,
     alpha_ptr,
+    bias_ptr,
     expert_offsets_ptr,
     a_scale_offsets_ptr,
     problem_sizes_ptr,
@@ -150,6 +151,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
     stride_bsk,
     stride_cm,
     stride_cn,
+    stride_bias_e,
     a_scale_cols_total,
     b_scale_cols_total,
     b_scale_n_per_expert,
@@ -163,6 +165,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
     A_IS_FP4: tl.constexpr,
     B_SCALE_GROUP: tl.constexpr,
     HAS_ALPHA: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     """Persistent packed grouped FP4 GEMM (NVFP4 and MXFP4).
 
@@ -179,6 +182,10 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
     ``b_fp4`` from ``[E, N, K_packed]`` to ``[E*N, K_packed]``, and
     ``b_scale`` from ``[E, N_pad, K_s]`` to ``[E*N_pad, K_s]``.
     ``b_scale_n_per_expert`` = N_pad (may differ from N_total).
+
+    When ``HAS_BIAS=True``, a per-expert bias vector ``[E, N]`` is added
+    to the float32 accumulator after the optional alpha multiply and before
+    the output cast/store.
     """
     start_pid = tl.program_id(axis=0)
     total_tiles = tl.load(expert_tile_start_ptr + num_experts).to(tl.int32)
@@ -375,6 +382,10 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
 
         if HAS_ALPHA:
             accumulator *= alpha
+        if HAS_BIAS:
+            bias_ptrs = bias_ptr + expert_id * stride_bias_e + offs_n
+            bias_vals = tl.load(bias_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+            accumulator += bias_vals[None, :]
         c = accumulator.to(c_ptr.dtype.element_ty)
         c_expert_ptr = c_ptr + expert_row_offset * stride_cm
         offs_m_c = offs_m
@@ -744,6 +755,7 @@ def _grouped_matmul_nvfp4_packed(
     set_triton_allocator(a_fp4.device)
 
     grid = (min(NUM_SMS, worst_case_tiles),)
+    dummy_bias = torch.empty(0, device=a_fp4.device, dtype=torch.float32)
     _grouped_matmul_fp4_packed_persistent_kernel[grid](
         a_fp4,
         a_scale,
@@ -751,6 +763,7 @@ def _grouped_matmul_nvfp4_packed(
         b_scale_flat,
         c_work,
         alpha,
+        dummy_bias,
         expert_offsets,
         a_scale_offsets,
         problem_sizes,
@@ -771,6 +784,7 @@ def _grouped_matmul_nvfp4_packed(
         b_scale_flat.stride(1),
         c_work.stride(0),
         c_work.stride(1),
+        0,  # stride_bias_e (unused)
         a_scale.shape[1],
         b_scale.shape[2],
         b_scale.shape[1],
@@ -784,6 +798,7 @@ def _grouped_matmul_nvfp4_packed(
         A_IS_FP4=True,
         B_SCALE_GROUP=16,
         HAS_ALPHA=True,
+        HAS_BIAS=False,
         num_stages=2,
         num_warps=8,
     )
@@ -1073,6 +1088,7 @@ def _grouped_matmul_mxfp4_packed(
     problem_sizes: torch.Tensor,
     output_dtype: torch.dtype,
     *,
+    bias: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed grouped MXFP4 W4A16 GEMM (BF16 activations, MXFP4 weights).
@@ -1084,6 +1100,7 @@ def _grouped_matmul_mxfp4_packed(
         expert_offsets: [E] or [E+1] start row offsets in ``a_bf16``/output.
         problem_sizes: [E, 3] int tensor containing per-expert (M, N, K).
         output_dtype: output dtype.
+        bias: Optional [E, N] per-expert bias added after the GEMM.
         output: Optional pre-allocated output tensor.
 
     Returns:
@@ -1172,6 +1189,13 @@ def _grouped_matmul_mxfp4_packed(
     dummy_alpha = torch.empty(0, device=a_bf16.device, dtype=torch.float32)
     dummy_a_scale_offsets = expert_offsets
 
+    has_bias = bias is not None
+    bias_tensor = (
+        bias
+        if bias is not None
+        else torch.empty(0, device=a_bf16.device, dtype=torch.float32)
+    )
+
     # TMA tensor descriptors allocate host-side metadata; Triton requires an allocator.
     set_triton_allocator(a_bf16.device)
 
@@ -1183,6 +1207,7 @@ def _grouped_matmul_mxfp4_packed(
         b_scale_flat,
         c_work,
         dummy_alpha,
+        bias_tensor,
         expert_offsets,
         dummy_a_scale_offsets,
         problem_sizes,
@@ -1203,6 +1228,7 @@ def _grouped_matmul_mxfp4_packed(
         b_scale_flat.stride(1),
         c_work.stride(0),
         c_work.stride(1),
+        bias_tensor.stride(0) if has_bias else 0,
         0,  # a_scale_cols_total (unused)
         b_scale.shape[2],
         b_scale.shape[1],
@@ -1216,6 +1242,7 @@ def _grouped_matmul_mxfp4_packed(
         A_IS_FP4=False,
         B_SCALE_GROUP=32,
         HAS_ALPHA=False,
+        HAS_BIAS=has_bias,
         num_stages=2,
         num_warps=8,
     )
@@ -1237,6 +1264,8 @@ def fused_moe_batch_invariant_mxfp4(
     w2_weight_scale: torch.Tensor,
     activation: Any,
     *,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
     expert_map: torch.Tensor | None = None,
     workspace13: torch.Tensor | None = None,
@@ -1354,6 +1383,7 @@ def fused_moe_batch_invariant_mxfp4(
         expert_offsets=expert_offsets,
         problem_sizes=problem_sizes1,
         output_dtype=dtype,
+        bias=w13_bias,
         output=workspace13,
     )
     if gemm1_out.shape[-1] != w1_output_size:
@@ -1378,6 +1408,7 @@ def fused_moe_batch_invariant_mxfp4(
         expert_offsets=expert_offsets,
         problem_sizes=problem_sizes2,
         output_dtype=dtype,
+        bias=w2_bias,
         output=workspace13,
     )
     if gemm2_out.shape[-1] != w2_output_size:
@@ -1611,6 +1642,8 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
                 w2_weight=w2,
                 w2_weight_scale=self.w2_scale,
                 activation=activation,
+                w13_bias=self.w1_bias,
+                w2_bias=self.w2_bias,
                 apply_router_weight_on_input=bool(apply_router_weight_on_input),
                 expert_map=expert_map,
                 workspace13=workspace13,
