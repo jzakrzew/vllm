@@ -274,6 +274,10 @@ def test_batch_invariant_nvfp4_moe_batch_size_invariance(
     assert torch.equal(out_single[0], out_batch[0])
 
 
+# NVFP4 MoE does not support expert parallelism yet; this test fails until it does.
+@pytest.mark.skip(
+    reason="NVFP4 MoE expert parallelism not supported; test fails until then.",
+)
 @torch.inference_mode()
 def test_batch_invariant_nvfp4_moe_ignores_invalid_sentinel_routes() -> None:
     set_random_seed(23)
@@ -334,6 +338,10 @@ def test_batch_invariant_nvfp4_moe_ignores_invalid_sentinel_routes() -> None:
     torch.testing.assert_close(out_with_invalid, out_valid_only, atol=1e-1, rtol=1e-1)
 
 
+# NVFP4 MoE does not support expert parallelism yet; this test fails until it does.
+@pytest.mark.skip(
+    reason="NVFP4 MoE expert parallelism not supported; test fails until then.",
+)
 @torch.inference_mode()
 def test_batch_invariant_nvfp4_moe_expert_map_invalidation_matches_local_routes() -> (
     None
@@ -749,6 +757,109 @@ def test_batch_invariant_mxfp4_moe_batch_size_invariance() -> None:
         activation=MoEActivation.SILU,
     )
     assert torch.equal(out_single[0], out_batch[0])
+
+
+@torch.inference_mode()
+def test_batch_invariant_mxfp4_moe_ignores_invalid_sentinel_routes() -> None:
+    """Invalid -1 expert slots should be ignored; output matches valid-only top-1."""
+    set_random_seed(23)
+    m, e, n, k = 32, 8, 128, 256
+    hidden_states = torch.randn((m, k), device=DEVICE, dtype=DTYPE) / 10
+    w13_fp4, w13_scale, w2_fp4, w2_scale = _make_mxfp4_moe_weights(e=e, n=n, k=k)
+
+    valid_topk_ids = torch.randint(0, e, (m, 1), device=DEVICE, dtype=torch.int64)
+    valid_topk_weights = torch.rand((m, 1), device=DEVICE, dtype=torch.float32)
+    invalid_topk_ids = torch.full((m, 1), -1, device=DEVICE, dtype=torch.int64)
+    invalid_topk_weights = torch.rand((m, 1), device=DEVICE, dtype=torch.float32)
+
+    topk_ids_with_invalid = torch.cat([valid_topk_ids, invalid_topk_ids], dim=1)
+    topk_weights_with_invalid = torch.cat(
+        [valid_topk_weights, invalid_topk_weights], dim=1
+    )
+
+    out_with_invalid = fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids_with_invalid,
+        topk_weights=topk_weights_with_invalid,
+        w13_weight=w13_fp4,
+        w13_weight_scale=w13_scale,
+        w2_weight=w2_fp4,
+        w2_weight_scale=w2_scale,
+        activation=MoEActivation.SILU,
+    )
+    out_valid_only = fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=valid_topk_ids,
+        topk_weights=valid_topk_weights,
+        w13_weight=w13_fp4,
+        w13_weight_scale=w13_scale,
+        w2_weight=w2_fp4,
+        w2_weight_scale=w2_scale,
+        activation=MoEActivation.SILU,
+    )
+
+    torch.testing.assert_close(out_with_invalid, out_valid_only, atol=1e-1, rtol=1e-1)
+
+
+@torch.inference_mode()
+def test_batch_invariant_mxfp4_moe_expert_map_invalidation_matches_local_routes() -> (
+    None
+):
+    """Global IDs + expert_map must match local indices
+    (no separate expert_map path)."""
+    set_random_seed(29)
+    m, e_local, n, k = 32, 4, 128, 256
+    hidden_states = torch.randn((m, k), device=DEVICE, dtype=DTYPE) / 10
+    w13_fp4, w13_scale, w2_fp4, w2_scale = _make_mxfp4_moe_weights(e=e_local, n=n, k=k)
+
+    global_num_experts = 8
+    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32, device=DEVICE)
+    mapped_global_ids = torch.tensor([1, 3, 5, 7], dtype=torch.int64, device=DEVICE)
+    expert_map[mapped_global_ids] = torch.arange(
+        e_local, dtype=torch.int32, device=DEVICE
+    )
+
+    valid_global_ids = mapped_global_ids[
+        torch.randint(0, mapped_global_ids.numel(), (m, 1), device=DEVICE)
+    ]
+    invalid_global_candidates = torch.tensor(
+        [0, 2, 4, 6], dtype=torch.int64, device=DEVICE
+    )
+    invalid_global_ids = invalid_global_candidates[
+        torch.randint(0, invalid_global_candidates.numel(), (m, 1), device=DEVICE)
+    ]
+    topk_ids_global = torch.cat([valid_global_ids, invalid_global_ids], dim=1)
+    topk_weights_global = torch.rand((m, 2), device=DEVICE, dtype=torch.float32)
+
+    out_with_expert_map = fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids_global,
+        topk_weights=topk_weights_global,
+        w13_weight=w13_fp4,
+        w13_weight_scale=w13_scale,
+        w2_weight=w2_fp4,
+        w2_weight_scale=w2_scale,
+        activation=MoEActivation.SILU,
+        expert_map=expert_map,
+    )
+
+    topk_ids_local = expert_map[topk_ids_global[:, :1]].to(torch.int64)
+    assert torch.all(topk_ids_local >= 0)
+    out_local_only = fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids_local,
+        topk_weights=topk_weights_global[:, :1].contiguous(),
+        w13_weight=w13_fp4,
+        w13_weight_scale=w13_scale,
+        w2_weight=w2_fp4,
+        w2_weight_scale=w2_scale,
+        activation=MoEActivation.SILU,
+        expert_map=None,
+    )
+
+    torch.testing.assert_close(
+        out_with_expert_map, out_local_only, atol=1e-1, rtol=1e-1
+    )
 
 
 @torch.inference_mode()

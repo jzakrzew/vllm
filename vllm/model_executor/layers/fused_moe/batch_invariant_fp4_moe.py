@@ -1414,6 +1414,15 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
     Supports both NVFP4 (W4A4) and MXFP4 (W4A16) via per-expert Triton
     ``tl.dot_scaled`` GEMMs.  Dispatches to the appropriate wrapper based
     on ``quant_config.weight_quant_dtype``.
+
+    **NVFP4 and expert parallel:** EP is not supported for the NVFP4 path
+    (``ep_size`` must be 1). Expert maps mark non-local experts with ``-1``;
+    packed MoE keeps a fixed ``(M * topk, K)`` activation tensor for CUDA graph
+    capture, while only ``expert_offsets[-1]`` rows correspond to real assignments.
+    The libtorch/stable NVFP4 expert quant kernels
+    (``torch.ops._C.scaled_fp4_experts_quant`` / ``nvfp4_experts_quant.cu``) are
+    tightly coupled to that layout. MXFP4 uses BF16 activations and does not use
+    those kernels, so EP remains available for MXFP4.
     """
 
     _SUPPORTED_DTYPES = {"nvfp4", "mxfp4"}
@@ -1475,8 +1484,36 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
 
+    @staticmethod
+    def is_supported_config(
+        cls,
+        moe_config: mk.FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        # NVFP4 + EP: expert_map maps non-local experts to -1. MoE shuffle keeps a
+        # fixed (M * topk, K) buffer so CUDA graphs see stable tensor shapes; valid
+        # packed rows are only expert_offsets[-1]. Padding rows must not be quantized
+        # incorrectly (see nvfp4_experts_quant.cu). Combining EP, expert_map, graphs,
+        # and libtorch NVFP4 expert quant is unsupported—require ep_size == 1.
+        if (weight_key, activation_key) == (
+            kNvfp4Static,
+            kNvfp4Dynamic,
+        ) and moe_config.moe_parallel_config.ep_size > 1:
+            return (
+                False,
+                "kernel does not support expert parallel for NVFP4 batch-invariant "
+                "MoE (expert_map / -1 routes, fixed (M*topk,K) activations for CUDA "
+                "graphs vs expert_offsets[-1] packed rows; libtorch "
+                "scaled_fp4_experts_quant). Use ep_size==1.",
+            )
+        return mk.FusedMoEExperts.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
+
     def supports_expert_map(self) -> bool:
-        return True
+        return self._quant_dtype != "nvfp4"
 
     def supports_chunking(self) -> bool:
         return True
