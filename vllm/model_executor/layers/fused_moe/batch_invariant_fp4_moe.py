@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Batch-invariant FP4 fused MoE expert implementations (NVFP4 and MXFP4)."""
 
-import os
 from typing import Any
 
 import torch
@@ -42,8 +41,6 @@ from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.platform_utils import num_compute_units
 
 logger = init_logger(__name__)
-
-_NVFP4_MOE_DEBUG = os.environ.get("VLLM_NVFP4_MOE_DEBUG", "0") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -420,135 +417,6 @@ def _canonicalize_grouped_offsets(
     return offsets.contiguous()
 
 
-def _validate_packed_nvfp4_descriptor_constraints(
-    *,
-    a_fp4: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_fp4: torch.Tensor,
-    b_scale: torch.Tensor,
-    c: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    a_scale_offsets: torch.Tensor,
-    problem_sizes: torch.Tensor,
-    block_size_m: int,
-    block_size_n: int,
-    block_size_k: int,
-) -> None:
-    """Host-side descriptor math validation for packed grouped NVFP4 GEMM.
-
-    This mirrors the descriptor index arithmetic used in the persistent
-    grouped GEMM kernel so invalid launch metadata fails fast with a clear
-    error instead of a GPU-side unspecified launch failure.
-    """
-    # Kernel compile-time constraints.
-    if block_size_m % 128 != 0:
-        raise RuntimeError("BLOCK_SIZE_M must be a multiple of 128.")
-    if block_size_n % 128 != 0:
-        raise RuntimeError("BLOCK_SIZE_N must be a multiple of 128.")
-    if (block_size_k // 16) % 4 != 0:
-        raise RuntimeError("BLOCK_SIZE_K//16 must be a multiple of 4.")
-
-    k_bytes_total = a_fp4.shape[1]
-    k_total = k_bytes_total * 2
-    k_bytes_tile = block_size_k // 2
-    scale_k_tile = block_size_k // 16
-    scale_k_tiles = scale_k_tile // 4
-
-    if k_total % 16 != 0:
-        raise RuntimeError("Packed K must be divisible by 16 for NVFP4 block scales.")
-    if a_scale.shape[1] % 4 != 0:
-        raise RuntimeError("a_scale cols must be divisible by 4 for swizzled layout.")
-    if b_scale.shape[2] % 4 != 0:
-        raise RuntimeError("b_scale cols must be divisible by 4 for swizzled layout.")
-    if not a_scale.is_contiguous():
-        raise RuntimeError("a_scale must be contiguous for descriptor swizzle strides.")
-    if not b_scale.is_contiguous():
-        raise RuntimeError("b_scale must be contiguous for descriptor swizzle strides.")
-    if a_scale.stride(1) != 1:
-        raise RuntimeError("a_scale must be contiguous in the last dimension.")
-    if b_scale.stride(2) != 1:
-        raise RuntimeError("b_scale must be contiguous in the last dimension.")
-    if b_scale.stride(1) != b_scale.shape[2]:
-        raise RuntimeError(
-            "b_scale row stride must match contiguous [N, K_scale] layout."
-        )
-    if a_scale_offsets.numel() > 0 and torch.any(a_scale_offsets % 128 != 0):
-        raise RuntimeError("a_scale_offsets must be 128-row aligned.")
-    if expert_offsets.numel() > 1 and torch.any(
-        expert_offsets[1:] < expert_offsets[:-1]
-    ):
-        raise RuntimeError("expert_offsets must be non-decreasing.")
-    if a_scale_offsets.numel() > 1 and torch.any(
-        a_scale_offsets[1:] < a_scale_offsets[:-1]
-    ):
-        raise RuntimeError("a_scale_offsets must be non-decreasing.")
-
-    for name, tensor in (
-        ("a_fp4", a_fp4),
-        ("a_scale", a_scale),
-        ("b_fp4", b_fp4),
-        ("b_scale", b_scale),
-        ("c", c),
-    ):
-        if tensor.data_ptr() % 16 != 0:
-            raise RuntimeError(f"{name} base pointer must be 16-byte aligned.")
-
-    m_total = a_fp4.shape[0]
-    n_total = b_fp4.shape[1]
-    a_scale_rows_total = a_scale.shape[0]
-    a_scale_k_tiles_total = a_scale.shape[1] // 4
-    b_scale_k_tiles_total = b_scale.shape[2] // 4
-    a_scale_row_tiles_total = triton.cdiv(a_scale_rows_total, 128)
-    b_scale_row_tiles_total = triton.cdiv(n_total, 128)
-
-    m = problem_sizes[:, 0].to(torch.int64).clamp_min(0)
-    n = problem_sizes[:, 1].to(torch.int64).clamp_min(0)
-    k = problem_sizes[:, 2].to(torch.int64).clamp_min(0)
-    if torch.any(problem_sizes[:, 0] < 0) or torch.any(problem_sizes[:, 1] < 0):
-        raise RuntimeError("problem_sizes M/N must be non-negative.")
-    if torch.any(problem_sizes[:, 2] < 0) or torch.any(problem_sizes[:, 2] % 2 != 0):
-        raise RuntimeError("problem_sizes K must be non-negative and even.")
-
-    m_tiles = torch.div(m + block_size_m - 1, block_size_m, rounding_mode="floor")
-    n_tiles = torch.div(n + block_size_n - 1, block_size_n, rounding_mode="floor")
-    k_tiles = torch.div(k + block_size_k - 1, block_size_k, rounding_mode="floor")
-
-    start_m_max = (m_tiles - 1).clamp_min(0) * block_size_m
-    start_n_max = (n_tiles - 1).clamp_min(0) * block_size_n
-    k_start_bytes_max = (k_tiles - 1).clamp_min(0) * k_bytes_tile
-    scale_tile_m_max = torch.div(start_m_max, 128, rounding_mode="floor")
-    scale_tile_n_max = torch.div(start_n_max, 128, rounding_mode="floor")
-    scale_tile_k_max = (k_tiles - 1).clamp_min(0) * scale_k_tiles
-
-    # Descriptor-relative index checks.
-    if torch.any(start_m_max >= m_total):
-        raise RuntimeError("Packed A descriptor M dimension is too small.")
-    if torch.any(start_n_max >= n_total):
-        raise RuntimeError("Packed B descriptor N dimension is too small.")
-    if torch.any(k_start_bytes_max >= k_bytes_total):
-        raise RuntimeError("Packed A/B descriptor K-bytes dimension is too small.")
-    if torch.any(scale_tile_m_max >= a_scale_row_tiles_total):
-        raise RuntimeError("Packed A scale descriptor row-tile dimension is too small.")
-    if torch.any(scale_tile_n_max >= b_scale_row_tiles_total):
-        raise RuntimeError("Packed B scale descriptor row-tile dimension is too small.")
-    if torch.any(scale_tile_k_max >= a_scale_k_tiles_total):
-        raise RuntimeError("Packed A scale descriptor K-tile dimension is too small.")
-    if torch.any(scale_tile_k_max >= b_scale_k_tiles_total):
-        raise RuntimeError("Packed B scale descriptor K-tile dimension is too small.")
-
-    # Tile-start checks -- TMA zero-padding handles tile overshoot beyond
-    # the descriptor shape, so we only need the start of the last tile to
-    # fall within the physical tensor.
-    max_a_tile_start = expert_offsets.to(torch.int64) + start_m_max
-    max_as_tile_start = a_scale_offsets.to(torch.int64) + start_m_max
-    if torch.any(max_a_tile_start >= m_total):
-        raise RuntimeError("A/C descriptor tile start exceeds packed rows.")
-    if torch.any(max_as_tile_start >= a_scale_rows_total):
-        raise RuntimeError("A scale descriptor tile start exceeds packed scale rows.")
-    if c.shape[0] < m_total or c.shape[1] < n_total:
-        raise RuntimeError("Output tensor does not match descriptor logical extents.")
-
-
 def _grouped_matmul_nvfp4_packed(
     a_fp4: torch.Tensor,
     b_fp4: torch.Tensor,
@@ -557,10 +425,9 @@ def _grouped_matmul_nvfp4_packed(
     alpha: torch.Tensor,
     expert_offsets: torch.Tensor,
     problem_sizes: torch.Tensor,
-    output_dtype: torch.dtype,
     *,
+    output: torch.Tensor,
     a_scale_offsets: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed grouped NVFP4 GEMM with expert-local problem metadata.
 
@@ -578,12 +445,9 @@ def _grouped_matmul_nvfp4_packed(
         alpha: [E] float32 per-expert alpha.
         expert_offsets: [E] or [E+1] start row offsets in ``a_fp4``/output.
         problem_sizes: [E, 3] int tensor containing per-expert (M, N, K).
-        output_dtype: output dtype.
         a_scale_offsets: Optional [E] or [E+1] start row offsets in ``a_scale``.
             If not provided, ``expert_offsets`` are reused.
-        output: Optional pre-allocated [>= M_total, >= N_max] tensor for the
-            GEMM output.  When provided the function writes into it (avoiding
-            a dynamic allocation).
+        output: Pre-allocated [>= M_total, >= N_max] tensor for the GEMM output.
 
     Returns:
         [M_total, N_max] tensor with grouped expert GEMM outputs.
@@ -601,11 +465,9 @@ def _grouped_matmul_nvfp4_packed(
 
     E = b_fp4.shape[0]
     if E == 0:
-        return torch.empty(
-            (a_fp4.shape[0], b_fp4.shape[1]),
-            device=a_fp4.device,
-            dtype=output_dtype,
-        )
+        M_logical = a_fp4.shape[0]
+        N_out = b_fp4.shape[1]
+        return output.flatten()[: M_logical * N_out].view(M_logical, N_out)
 
     assert problem_sizes.shape[0] == E, (
         f"Expected problem_sizes.shape[0] == num_experts ({E}), "
@@ -647,36 +509,6 @@ def _grouped_matmul_nvfp4_packed(
     if not b_scale.is_contiguous():
         b_scale = b_scale.contiguous()
 
-    _is_capturing = (
-        torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
-    )
-
-    if _NVFP4_MOE_DEBUG and not _is_capturing:
-        if torch.any(expert_offsets < 0) or torch.any(a_scale_offsets < 0):
-            raise RuntimeError("expert offsets must be non-negative.")
-        max_row_end = (
-            expert_offsets.to(torch.int64)
-            + problem_sizes[:, 0].to(torch.int64).clamp_min(0)
-        ).max()
-        if int(max_row_end.item()) > a_fp4.shape[0]:
-            raise RuntimeError(
-                "expert_offsets + M from problem_sizes exceed packed activation rows."
-            )
-        max_scale_row_end = (
-            a_scale_offsets.to(torch.int64)
-            + problem_sizes[:, 0].to(torch.int64).clamp_min(0)
-        ).max()
-        if int(max_scale_row_end.item()) > a_scale.shape[0]:
-            raise RuntimeError(
-                "a_scale_offsets + M from problem_sizes exceed packed scale rows."
-            )
-        if int(problem_sizes[:, 1].max().item()) > b_fp4.shape[1]:
-            raise RuntimeError(
-                "problem_sizes N exceeds packed expert-weight row dimension."
-            )
-        if int(problem_sizes[:, 2].max().item()) > a_fp4.shape[1] * 2:
-            raise RuntimeError("problem_sizes K exceeds packed activation K dimension.")
-
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 128
@@ -692,30 +524,7 @@ def _grouped_matmul_nvfp4_packed(
     max_tiles_per_expert = max_tiles_m * max_tiles_n
 
     N_out = b_fp4.shape[1]
-    if output is not None:
-        assert output.shape[0] >= M_logical and output.shape[1] >= N_out
-        c_work = output.flatten()[: M_logical * N_out].view(M_logical, N_out)
-    else:
-        c_work = torch.empty(
-            (M_logical, N_out),
-            device=a_fp4.device,
-            dtype=output_dtype,
-        )
-
-    if _NVFP4_MOE_DEBUG and not _is_capturing:
-        _validate_packed_nvfp4_descriptor_constraints(
-            a_fp4=a_fp4,
-            a_scale=a_scale,
-            b_fp4=b_fp4,
-            b_scale=b_scale,
-            c=c_work,
-            expert_offsets=expert_offsets,
-            a_scale_offsets=a_scale_offsets,
-            problem_sizes=problem_sizes,
-            block_size_m=BLOCK_SIZE_M,
-            block_size_n=BLOCK_SIZE_N,
-            block_size_k=BLOCK_SIZE_K,
-        )
+    c_work = output.flatten()[: M_logical * N_out].view(M_logical, N_out)
 
     if max_tiles_per_expert == 0:
         return c_work
@@ -826,10 +635,10 @@ def fused_moe_batch_invariant_nvfp4(
     *,
     workspace13: torch.Tensor,
     workspace2: torch.Tensor,
+    output: torch.Tensor,
     apply_router_weight_on_input: bool = False,
     expert_map: torch.Tensor | None = None,
     quant_backend: str = "cutlass",
-    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Deterministic NVFP4 MoE using packed routing metadata and grouped GEMMs.
@@ -839,35 +648,28 @@ def fused_moe_batch_invariant_nvfp4(
     (``a_map``/``c_map``).  Both GEMMs then run in packed 2D form using
     per-expert offsets/problem sizes.  The epilogue uses ``moe_unpermute``
     to gather, apply router weights and reduce back to ``[M, K]`` while
-    safely skipping invalid routes.  When ``output`` is provided, the final
-    reduction writes directly into that tensor.
+    safely skipping invalid routes.  The final reduction writes into
+    ``output``.
 
     ``workspace13`` and ``workspace2`` must match ``BatchInvariantFP4Experts.
     workspace_shapes`` (large enough for GEMM1 / GEMM2 staging and activations).
     """
 
-    if hidden_states.ndim != 2:
-        raise RuntimeError(
-            f"Expected 2D hidden_states for NVFP4 MoE fallback, "
-            f"got {hidden_states.shape}."
-        )
-    if topk_ids.shape != topk_weights.shape:
-        raise RuntimeError(
-            "NVFP4 MoE fallback expects topk_ids and topk_weights "
-            "to have identical shapes."
-        )
-    if topk_ids.ndim != 2:
-        raise RuntimeError(
-            f"Expected 2D top-k routing tensors, got shape {topk_ids.shape}."
-        )
-    if apply_router_weight_on_input and topk_ids.shape[1] != 1:
-        raise RuntimeError(
-            "apply_router_weight_on_input=True is only supported for top_k == 1."
-        )
-    if quant_backend != "cutlass":
-        raise RuntimeError(
-            "Packed batch-invariant NVFP4 MoE requires quant_backend='cutlass'."
-        )
+    assert hidden_states.ndim == 2, (
+        f"Expected 2D hidden_states for NVFP4 MoE fallback, got {hidden_states.shape}."
+    )
+    assert topk_ids.shape == topk_weights.shape, (
+        "NVFP4 MoE fallback expects topk_ids and topk_weights to have identical shapes."
+    )
+    assert topk_ids.ndim == 2, (
+        f"Expected 2D top-k routing tensors, got shape {topk_ids.shape}."
+    )
+    assert not apply_router_weight_on_input or topk_ids.shape[1] == 1, (
+        "apply_router_weight_on_input=True is only supported for top_k == 1."
+    )
+    assert quant_backend == "cutlass", (
+        "Packed batch-invariant NVFP4 MoE requires quant_backend='cutlass'."
+    )
 
     activation_kind = (
         activation
@@ -879,28 +681,8 @@ def fused_moe_batch_invariant_nvfp4(
     num_experts = w13_weight.shape[0]
     top_k = topk_ids.shape[1]
     M_total = num_tokens * top_k
-    if output is not None:
-        if output.device != hidden_states.device:
-            raise RuntimeError(
-                f"output must be on {hidden_states.device}, got {output.device}."
-            )
-        if output.dtype != hidden_states.dtype:
-            raise RuntimeError(
-                f"output dtype must be {hidden_states.dtype}, got {output.dtype}."
-            )
-        if output.shape != (num_tokens, hidden_dim):
-            raise RuntimeError(
-                "output must match hidden_states shape "
-                f"({num_tokens}, {hidden_dim}), got {tuple(output.shape)}."
-            )
-        if not output.is_contiguous():
-            raise RuntimeError(
-                "output must be contiguous for packed NVFP4 MoE unpermute."
-            )
     if M_total == 0:
-        if output is not None:
-            return output
-        return hidden_states.new_empty((num_tokens, hidden_dim))
+        return output
 
     routed_topk_ids = topk_ids
     if expert_map is not None:
@@ -921,7 +703,6 @@ def fused_moe_batch_invariant_nvfp4(
         packed_hidden_states = hidden_states
 
     device = hidden_states.device
-    dtype = hidden_states.dtype
     w1_output_size = w13_weight.shape[1]
     activation_out_dim = (
         w1_output_size // 2 if activation_kind.is_gated else w1_output_size
@@ -1008,7 +789,6 @@ def fused_moe_batch_invariant_nvfp4(
         expert_offsets=expert_offsets,
         a_scale_offsets=blockscale_offsets,
         problem_sizes=problem_sizes1,
-        output_dtype=dtype,
         output=workspace13,
     )
     if gemm1_out.shape[-1] != w1_output_size:
@@ -1048,7 +828,6 @@ def fused_moe_batch_invariant_nvfp4(
         expert_offsets=expert_offsets,
         a_scale_offsets=blockscale_offsets,
         problem_sizes=problem_sizes2,
-        output_dtype=dtype,
         output=workspace2,
     )
     if gemm2_out.shape[-1] != w2_output_size:
@@ -1062,10 +841,7 @@ def fused_moe_batch_invariant_nvfp4(
     inv_permuted_idx = c_map.view(num_tokens, top_k)
     # moe_unpermute reads from gemm2_out and writes to reduced. Source/destination
     # must never alias (particularly in non-chunked mode where workspaces are reused).
-    if output is not None:
-        reduced = output
-    else:
-        reduced = torch.empty((num_tokens, hidden_dim), device=device, dtype=dtype)
+    reduced = output
     moe_unpermute(
         out=reduced,
         permuted_hidden_states=gemm2_out,
@@ -1087,10 +863,9 @@ def _grouped_matmul_mxfp4_packed(
     b_scale: torch.Tensor,
     expert_offsets: torch.Tensor,
     problem_sizes: torch.Tensor,
-    output_dtype: torch.dtype,
     *,
+    output: torch.Tensor,
     bias: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed grouped MXFP4 W4A16 GEMM (BF16 activations, MXFP4 weights).
 
@@ -1100,9 +875,8 @@ def _grouped_matmul_mxfp4_packed(
         b_scale: [E, N_pad, K_s] swizzled weight block scales (group 32).
         expert_offsets: [E] or [E+1] start row offsets in ``a_bf16``/output.
         problem_sizes: [E, 3] int tensor containing per-expert (M, N, K).
-        output_dtype: output dtype.
         bias: Optional [E, N] per-expert bias added after the GEMM.
-        output: Optional pre-allocated output tensor.
+        output: Pre-allocated output tensor (shape [>= M_total, >= N_max]).
 
     Returns:
         [M_total, N_max] tensor with grouped expert GEMM outputs.
@@ -1115,11 +889,9 @@ def _grouped_matmul_mxfp4_packed(
 
     E = b_fp4.shape[0]
     if E == 0:
-        return torch.empty(
-            (a_bf16.shape[0], b_fp4.shape[1]),
-            device=a_bf16.device,
-            dtype=output_dtype,
-        )
+        M_logical = a_bf16.shape[0]
+        N_out = b_fp4.shape[1]
+        return output.flatten()[: M_logical * N_out].view(M_logical, N_out)
 
     assert problem_sizes.shape[0] == E
 
@@ -1144,15 +916,7 @@ def _grouped_matmul_mxfp4_packed(
     max_tiles_per_expert = max_tiles_m * max_tiles_n
 
     N_out = b_fp4.shape[1]
-    if output is not None:
-        assert output.shape[0] >= M_logical and output.shape[1] >= N_out
-        c_work = output.flatten()[: M_logical * N_out].view(M_logical, N_out)
-    else:
-        c_work = torch.empty(
-            (M_logical, N_out),
-            device=a_bf16.device,
-            dtype=output_dtype,
-        )
+    c_work = output.flatten()[: M_logical * N_out].view(M_logical, N_out)
 
     if max_tiles_per_expert == 0:
         return c_work
@@ -1267,11 +1031,11 @@ def fused_moe_batch_invariant_mxfp4(
     *,
     workspace13: torch.Tensor,
     workspace2: torch.Tensor,
+    output: torch.Tensor,
     w13_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
     expert_map: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Deterministic MXFP4 W4A16 MoE using packed routing and grouped GEMMs.
@@ -1282,18 +1046,18 @@ def fused_moe_batch_invariant_mxfp4(
     ``workspace2`` (avoiding overlap with ``fused_out`` in the modular kernel
     and avoiding A/C aliasing in a single buffer).
     """
-    if hidden_states.ndim != 2:
-        raise RuntimeError(f"Expected 2D hidden_states, got {hidden_states.shape}.")
-    if topk_ids.shape != topk_weights.shape:
-        raise RuntimeError("topk_ids and topk_weights must have identical shapes.")
-    if topk_ids.ndim != 2:
-        raise RuntimeError(
-            f"Expected 2D top-k routing tensors, got shape {topk_ids.shape}."
-        )
-    if apply_router_weight_on_input and topk_ids.shape[1] != 1:
-        raise RuntimeError(
-            "apply_router_weight_on_input=True is only supported for top_k == 1."
-        )
+    assert hidden_states.ndim == 2, (
+        f"Expected 2D hidden_states, got {hidden_states.shape}."
+    )
+    assert topk_ids.shape == topk_weights.shape, (
+        "topk_ids and topk_weights must have identical shapes."
+    )
+    assert topk_ids.ndim == 2, (
+        f"Expected 2D top-k routing tensors, got shape {topk_ids.shape}."
+    )
+    assert not apply_router_weight_on_input or topk_ids.shape[1] == 1, (
+        "apply_router_weight_on_input=True is only supported for top_k == 1."
+    )
 
     activation_kind = (
         activation
@@ -1306,27 +1070,8 @@ def fused_moe_batch_invariant_mxfp4(
     top_k = topk_ids.shape[1]
     M_total = num_tokens * top_k
 
-    if output is not None:
-        if output.device != hidden_states.device:
-            raise RuntimeError(
-                f"output must be on {hidden_states.device}, got {output.device}."
-            )
-        if output.dtype != hidden_states.dtype:
-            raise RuntimeError(
-                f"output dtype must be {hidden_states.dtype}, got {output.dtype}."
-            )
-        if output.shape != (num_tokens, hidden_dim):
-            raise RuntimeError(
-                "output must match hidden_states shape "
-                f"({num_tokens}, {hidden_dim}), got {tuple(output.shape)}."
-            )
-        if not output.is_contiguous():
-            raise RuntimeError("output must be contiguous.")
-
     if M_total == 0:
-        if output is not None:
-            return output
-        return hidden_states.new_empty((num_tokens, hidden_dim))
+        return output
 
     routed_topk_ids = topk_ids
     if expert_map is not None:
@@ -1346,7 +1091,6 @@ def fused_moe_batch_invariant_mxfp4(
         packed_hidden_states = hidden_states
 
     device = hidden_states.device
-    dtype = hidden_states.dtype
     w1_output_size = w13_weight.shape[1]
     activation_out_dim = (
         w1_output_size // 2 if activation_kind.is_gated else w1_output_size
@@ -1402,9 +1146,8 @@ def fused_moe_batch_invariant_mxfp4(
         b_scale=w13_weight_scale,
         expert_offsets=expert_offsets,
         problem_sizes=problem_sizes1,
-        output_dtype=dtype,
-        bias=w13_bias,
         output=workspace13,
+        bias=w13_bias,
     )
     if gemm1_out.shape[-1] != w1_output_size:
         gemm1_out = gemm1_out[:, :w1_output_size].contiguous()
@@ -1427,9 +1170,8 @@ def fused_moe_batch_invariant_mxfp4(
         b_scale=w2_weight_scale,
         expert_offsets=expert_offsets,
         problem_sizes=problem_sizes2,
-        output_dtype=dtype,
-        bias=w2_bias,
         output=workspace2,
+        bias=w2_bias,
     )
     if gemm2_out.shape[-1] != w2_output_size:
         gemm2_out = gemm2_out[:, :w2_output_size].contiguous()
@@ -1440,10 +1182,7 @@ def fused_moe_batch_invariant_mxfp4(
         else routed_topk_weights
     )
     inv_permuted_idx = c_map.view(num_tokens, top_k)
-    if output is not None:
-        reduced = output
-    else:
-        reduced = torch.empty((num_tokens, hidden_dim), device=device, dtype=dtype)
+    reduced = output
     moe_unpermute(
         out=reduced,
         permuted_hidden_states=gemm2_out,
@@ -1646,11 +1385,11 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
                 a2_gscale=a2_gscale_vec,
                 g2_alphas=g2_alpha_vec,
                 activation=activation,
-                apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                expert_map=expert_map,
                 workspace13=workspace13,
                 workspace2=workspace2,
                 output=output,
+                apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                expert_map=expert_map,
             )
         else:
             fused_moe_batch_invariant_mxfp4(
@@ -1662,13 +1401,13 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
                 w2_weight=w2,
                 w2_weight_scale=self.w2_scale,
                 activation=activation,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                output=output,
                 w13_bias=self.w1_bias,
                 w2_bias=self.w2_bias,
                 apply_router_weight_on_input=bool(apply_router_weight_on_input),
                 expert_map=expert_map,
-                workspace13=workspace13,
-                workspace2=workspace2,
-                output=output,
             )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
