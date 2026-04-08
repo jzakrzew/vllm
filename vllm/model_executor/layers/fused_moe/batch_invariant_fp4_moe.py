@@ -1378,7 +1378,7 @@ def fused_moe_batch_invariant_mxfp4(
         expert_offsets=expert_offsets,
         problem_sizes=problem_sizes2,
         output_dtype=dtype,
-        output=workspace2,
+        output=workspace13,
     )
     if gemm2_out.shape[-1] != w2_output_size:
         gemm2_out = gemm2_out[:, :w2_output_size].contiguous()

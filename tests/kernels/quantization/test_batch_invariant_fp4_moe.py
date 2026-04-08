@@ -8,7 +8,10 @@ from tests.kernels.moe.utils import make_dummy_moe_config, make_test_weights
 from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.activation import (
+    MoEActivation,
+    apply_moe_activation,
+)
 from vllm.model_executor.layers.fused_moe.batch_invariant_fp4_moe import (
     _grouped_matmul_mxfp4_packed,
     _grouped_matmul_nvfp4_packed,
@@ -633,15 +636,36 @@ def _swizzle_mxfp4_scale(scale_uint8: torch.Tensor) -> torch.Tensor:
 
 
 def _make_mxfp4_moe_weights(
-    *, e: int, n: int, k: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *, e: int, n: int, k: int, interleaved: bool = False
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Create MXFP4 MoE weight tensors (w13 and w2) with swizzled scales.
+
+    Args:
+        e: number of experts.
+        n: intermediate size per projection (gate or up).
+        k: hidden size.
+        interleaved: if True, return w13 weights and scales with interleaved
+            gate/up rows ``[g0, u0, g1, u1, ...]`` (checkpoint format) and
+            raw (un-swizzled) scales.  The caller is responsible for
+            de-interleaving and swizzling, e.g. via
+            ``convert_to_mxfp4_moe_kernel_format``.
 
     Returns:
         w13_fp4: [E, 2*N, K//2] uint8
-        w13_scale: [E, 2*N_pad, K_s_pad] uint8 swizzled
+        w13_scale: [E, 2*N_pad, K_s_pad] uint8 swizzled (or raw if
+            interleaved)
         w2_fp4: [E, K, N//2] uint8
         w2_scale: [E, K_pad, N_s_pad] uint8 swizzled
+        w13_scale_raw: [E, 2*N, K//32] uint8 (row-major, for dequant
+            reference; always in concatenated gate-then-up order)
+        w2_scale_raw: [E, K, N//32] uint8
     """
 
     w13_list, w13_scale_list = [], []
@@ -664,10 +688,118 @@ def _make_mxfp4_moe_weights(
     w2_fp4 = torch.stack(w2_list)
     w2_scale_raw = torch.stack(w2_scale_list)
 
+    if interleaved:
+        # Simulate checkpoint format: interleave gate/up rows and return
+        # raw (un-swizzled) scales so the caller can run the full
+        # convert_to_mxfp4_moe_kernel_format pipeline.
+        w13_fp4 = _interleave_gate_up(w13_fp4)
+        w13_scale_interleaved = _interleave_gate_up(w13_scale_raw)
+        return (
+            w13_fp4,
+            w13_scale_interleaved,
+            w2_fp4,
+            w2_scale_raw,
+            w13_scale_raw,
+            w2_scale_raw,
+        )
+
     w13_scale = _swizzle_mxfp4_scale(w13_scale_raw)
     w2_scale = _swizzle_mxfp4_scale(w2_scale_raw)
 
-    return w13_fp4, w13_scale, w2_fp4, w2_scale
+    return w13_fp4, w13_scale, w2_fp4, w2_scale, w13_scale_raw, w2_scale_raw
+
+
+def _interleave_gate_up(t: torch.Tensor) -> torch.Tensor:
+    """Interleave the gate and up halves along dim 1.
+
+    [E, 2*N, ...] with layout [g0,g1,...,u0,u1,...] ->
+    [E, 2*N, ...] with layout [g0,u0,g1,u1,...].
+    """
+    half = t.shape[1] // 2
+    gate, up = t[:, :half], t[:, half:]
+    paired = torch.stack([gate, up], dim=2)  # [E, N, 2, ...]
+    return paired.reshape(t.shape[0], t.shape[1], *t.shape[2:]).contiguous()
+
+
+def _map_topk_with_expert_map(
+    topk_ids: torch.Tensor, expert_map: torch.Tensor
+) -> torch.Tensor:
+    """Same global→local mapping as ``_nvfp4_moe_map_experts`` (for reference MoE)."""
+    flat_ids = topk_ids.reshape(-1).to(torch.long)
+    if expert_map.numel() == 0:
+        return torch.full_like(topk_ids, -1, dtype=torch.long)
+    valid = (flat_ids >= 0) & (flat_ids < expert_map.numel())
+    clamped = flat_ids.clamp(min=0, max=max(0, expert_map.numel() - 1))
+    remapped = expert_map.to(torch.long).index_select(0, clamped)
+    mapped = torch.where(valid, remapped, torch.full_like(remapped, -1))
+    return mapped.view_as(topk_ids)
+
+
+def _reference_fused_moe_mxfp4_dequant(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13_fp4: torch.Tensor,
+    w13_scale_raw: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_scale_raw: torch.Tensor,
+    activation: MoEActivation,
+    *,
+    apply_router_weight_on_input: bool = False,
+    expert_map: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Slow BF16 reference: dequantize MXFP4 weights, then MoE forward in PyTorch."""
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+    m, hidden_dim = hidden_states.shape
+    num_experts = w13_fp4.shape[0]
+    top_k = topk_ids.shape[1]
+
+    act_kind = (
+        activation
+        if isinstance(activation, MoEActivation)
+        else MoEActivation.from_str(str(activation))
+    )
+
+    w13_deq = [
+        _dequant_mxfp4(w13_fp4[e], w13_scale_raw[e]).to(dtype)
+        for e in range(num_experts)
+    ]
+    w2_deq = [
+        _dequant_mxfp4(w2_fp4[e], w2_scale_raw[e]).to(dtype) for e in range(num_experts)
+    ]
+
+    routed = topk_ids.to(torch.long)
+    if expert_map is not None:
+        routed = _map_topk_with_expert_map(topk_ids, expert_map)
+    valid_routes = (routed >= 0) & (routed < num_experts)
+    routed = torch.where(
+        valid_routes, routed, torch.full_like(routed, -1, dtype=torch.long)
+    )
+    rw = topk_weights.to(torch.float32)
+
+    out = torch.zeros(m, hidden_dim, device=device, dtype=dtype)
+    for i in range(m):
+        acc = torch.zeros(1, hidden_dim, device=device, dtype=dtype)
+        for j in range(top_k):
+            eid = int(routed[i, j].item())
+            if eid < 0:
+                continue
+            w = rw[i, j].to(dtype)
+            x = hidden_states[i : i + 1]
+            if apply_router_weight_on_input:
+                x = x * w
+            gemm1_out = x @ w13_deq[eid].T
+            if act_kind.is_gated:
+                act_dim = gemm1_out.shape[-1] // 2
+            else:
+                act_dim = gemm1_out.shape[-1]
+            act_buf = torch.empty(1, act_dim, device=device, dtype=dtype)
+            apply_moe_activation(act_kind, act_buf, gemm1_out)
+            y = act_buf @ w2_deq[eid].T
+            acc = acc + y if apply_router_weight_on_input else acc + y * w
+        out[i] = acc[0]
+    return out
 
 
 @pytest.mark.parametrize(
@@ -679,14 +811,25 @@ def _make_mxfp4_moe_weights(
         (1, True),
     ],
 )
+@pytest.mark.parametrize(
+    "m,e,n,k",
+    [
+        (32, 8, 128, 256),
+        (64, 4, 256, 128),
+        (128, 8, 256, 384),
+    ],
+)
 @torch.inference_mode()
-def test_batch_invariant_mxfp4_moe_runs(
+def test_batch_invariant_mxfp4_moe_matches_dequant_reference(
+    m: int,
+    e: int,
+    n: int,
+    k: int,
     topk: int,
     apply_router_weight_on_input: bool,
 ) -> None:
-    """Smoke test: fused_moe_batch_invariant_mxfp4 runs without errors."""
+    """``fused_moe_batch_invariant_mxfp4`` matches a BF16 MoE with dequant weights."""
     set_random_seed(42)
-    m, e, n, k = 32, 8, 128, 256
 
     hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
     score = torch.randn(m, e, device=DEVICE, dtype=DTYPE)
@@ -694,7 +837,14 @@ def test_batch_invariant_mxfp4_moe_runs(
         hidden_states, score, topk, renormalize=False
     )
 
-    w13_fp4, w13_scale, w2_fp4, w2_scale = _make_mxfp4_moe_weights(e=e, n=n, k=k)
+    (
+        w13_fp4,
+        w13_scale,
+        w2_fp4,
+        w2_scale,
+        w13_scale_raw,
+        w2_scale_raw,
+    ) = _make_mxfp4_moe_weights(e=e, n=n, k=k)
 
     out = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
@@ -707,9 +857,157 @@ def test_batch_invariant_mxfp4_moe_runs(
         activation=MoEActivation.SILU,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
+    ref = _reference_fused_moe_mxfp4_dequant(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_fp4=w13_fp4,
+        w13_scale_raw=w13_scale_raw,
+        w2_fp4=w2_fp4,
+        w2_scale_raw=w2_scale_raw,
+        activation=MoEActivation.SILU,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
     assert out.shape == (m, k)
     assert out.dtype == DTYPE
     assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@torch.inference_mode()
+def test_batch_invariant_mxfp4_moe_interleaved_checkpoint_format() -> None:
+    """End-to-end: interleaved w13 -> convert_to_mxfp4_moe_kernel_format
+    -> fused_moe_batch_invariant_mxfp4 must match the dequant reference.
+
+    Real MXFP4 checkpoints store w13 with interleaved gate/up rows
+    [g0, u0, g1, u1, ...].  ``convert_to_mxfp4_moe_kernel_format`` must
+    de-interleave before the kernel sees the weights.
+    """
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        convert_to_mxfp4_moe_kernel_format,
+    )
+
+    set_random_seed(99)
+    m, e, n, k = 32, 8, 128, 256
+    topk = 2
+
+    hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
+    score = torch.randn(m, e, device=DEVICE, dtype=DTYPE)
+    topk_weights, topk_ids, _ = fused_topk(
+        hidden_states, score, topk, renormalize=False
+    )
+
+    (
+        w13_fp4_interleaved,
+        w13_scale_interleaved,
+        w2_fp4,
+        w2_scale,
+        w13_scale_raw,
+        w2_scale_raw,
+    ) = _make_mxfp4_moe_weights(e=e, n=n, k=k, interleaved=True)
+
+    # Run the production convert path (de-interleave + swizzle).
+    (w13_fp4_conv, w2_conv, w13_scale_conv, w2_scale_conv, _, _) = (
+        convert_to_mxfp4_moe_kernel_format(
+            mxfp4_backend=Mxfp4MoeBackend.BATCH_INVARIANT,
+            layer=None,  # type: ignore[arg-type]
+            w13_weight=w13_fp4_interleaved,
+            w2_weight=w2_fp4,
+            w13_weight_scale=w13_scale_interleaved,
+            w2_weight_scale=w2_scale,
+        )
+    )
+
+    out = fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_fp4_conv,
+        w13_weight_scale=w13_scale_conv,
+        w2_weight=w2_conv,
+        w2_weight_scale=w2_scale_conv,
+        activation=MoEActivation.SILU,
+    )
+
+    # The reference uses concatenated (non-interleaved) raw scales.
+    ref = _reference_fused_moe_mxfp4_dequant(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_fp4=w13_fp4_conv,
+        w13_scale_raw=w13_scale_raw,
+        w2_fp4=w2_fp4,
+        w2_scale_raw=w2_scale_raw,
+        activation=MoEActivation.SILU,
+    )
+
+    assert out.shape == (m, k)
+    assert out.dtype == DTYPE
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@torch.inference_mode()
+def test_batch_invariant_mxfp4_moe_with_preallocated_workspaces_matches_reference() -> (
+    None
+):
+    """GEMM2 must not alias `act_out` in workspace2; same numerics as reference."""
+    set_random_seed(43)
+    m, e, n, k = 32, 8, 128, 256
+    topk = 2
+    activation = MoEActivation.SILU
+
+    hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
+    score = torch.randn(m, e, device=DEVICE, dtype=DTYPE)
+    topk_weights, topk_ids, _ = fused_topk(
+        hidden_states, score, topk, renormalize=False
+    )
+
+    (
+        w13_fp4,
+        w13_scale,
+        w2_fp4,
+        w2_scale,
+        w13_scale_raw,
+        w2_scale_raw,
+    ) = _make_mxfp4_moe_weights(e=e, n=n, k=k)
+
+    # Same shapes as BatchInvariantFP4Experts.workspace_shapes (N=w1 row dim, K=hidden).
+    w1_row_dim = w13_fp4.shape[1]
+    act_out_dim = mk.FusedMoEExpertsModular.adjust_N_for_activation(
+        w1_row_dim, activation
+    )
+    m_total = m * topk
+    workspace13_shape = (m_total, max(w1_row_dim, k))
+    workspace2_shape = (m_total, max(act_out_dim, k))
+    workspace13 = torch.empty(workspace13_shape, device=DEVICE, dtype=DTYPE)
+    workspace2 = torch.empty(workspace2_shape, device=DEVICE, dtype=DTYPE)
+
+    out = fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_fp4,
+        w13_weight_scale=w13_scale,
+        w2_weight=w2_fp4,
+        w2_weight_scale=w2_scale,
+        activation=activation,
+        workspace13=workspace13,
+        workspace2=workspace2,
+    )
+    ref = _reference_fused_moe_mxfp4_dequant(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_fp4=w13_fp4,
+        w13_scale_raw=w13_scale_raw,
+        w2_fp4=w2_fp4,
+        w2_scale_raw=w2_scale_raw,
+        activation=activation,
+    )
+    assert out.shape == (m, k)
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
 
 
 @torch.inference_mode()
@@ -724,7 +1022,7 @@ def test_batch_invariant_mxfp4_moe_batch_size_invariance() -> None:
         [x_single, torch.randn(7, k, device=DEVICE, dtype=DTYPE) / 10], dim=0
     )
 
-    w13_fp4, w13_scale, w2_fp4, w2_scale = _make_mxfp4_moe_weights(e=e, n=n, k=k)
+    w13_fp4, w13_scale, w2_fp4, w2_scale, _, _ = _make_mxfp4_moe_weights(e=e, n=n, k=k)
 
     topk_ids_single = torch.randint(0, e, (1, topk), device=DEVICE, dtype=torch.int64)
     topk_ids_batch = torch.cat(
@@ -765,7 +1063,7 @@ def test_batch_invariant_mxfp4_moe_ignores_invalid_sentinel_routes() -> None:
     set_random_seed(23)
     m, e, n, k = 32, 8, 128, 256
     hidden_states = torch.randn((m, k), device=DEVICE, dtype=DTYPE) / 10
-    w13_fp4, w13_scale, w2_fp4, w2_scale = _make_mxfp4_moe_weights(e=e, n=n, k=k)
+    w13_fp4, w13_scale, w2_fp4, w2_scale, _, _ = _make_mxfp4_moe_weights(e=e, n=n, k=k)
 
     valid_topk_ids = torch.randint(0, e, (m, 1), device=DEVICE, dtype=torch.int64)
     valid_topk_weights = torch.rand((m, 1), device=DEVICE, dtype=torch.float32)
@@ -810,7 +1108,9 @@ def test_batch_invariant_mxfp4_moe_expert_map_invalidation_matches_local_routes(
     set_random_seed(29)
     m, e_local, n, k = 32, 4, 128, 256
     hidden_states = torch.randn((m, k), device=DEVICE, dtype=DTYPE) / 10
-    w13_fp4, w13_scale, w2_fp4, w2_scale = _make_mxfp4_moe_weights(e=e_local, n=n, k=k)
+    w13_fp4, w13_scale, w2_fp4, w2_scale, _, _ = _make_mxfp4_moe_weights(
+        e=e_local, n=n, k=k
+    )
 
     global_num_experts = 8
     expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32, device=DEVICE)
@@ -869,7 +1169,7 @@ def test_batch_invariant_mxfp4_moe_all_invalid_routes_return_zero() -> None:
     m, e, n, k = 16, 8, 128, 256
 
     hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
-    w13_fp4, w13_scale, w2_fp4, w2_scale = _make_mxfp4_moe_weights(e=e, n=n, k=k)
+    w13_fp4, w13_scale, w2_fp4, w2_scale, _, _ = _make_mxfp4_moe_weights(e=e, n=n, k=k)
 
     topk_ids = torch.full((m, 2), -1, dtype=torch.int64, device=DEVICE)
     topk_weights = torch.rand(m, 2, dtype=torch.float32, device=DEVICE)
@@ -887,15 +1187,165 @@ def test_batch_invariant_mxfp4_moe_all_invalid_routes_return_zero() -> None:
     torch.testing.assert_close(out, torch.zeros_like(out), atol=0.0, rtol=0.0)
 
 
+def _make_mxfp4_moe_weights_non_gated(
+    *,
+    e: int,
+    n: int,
+    k: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Create MXFP4 MoE weights for non-gated activations.
+
+    w1 is ``[E, N, K//2]`` (no gate/up split) and w2 is ``[E, K, N//2]``.
+    """
+    w1_list, w1_scale_list = [], []
+    w2_list, w2_scale_list = [], []
+    for _ in range(e):
+        w1_bf16 = torch.randn(n, k, device=DEVICE, dtype=DTYPE) / 10
+        w1_q, w1_s = _quantize_mxfp4_block(w1_bf16)
+        w1_list.append(w1_q)
+        w1_scale_list.append(w1_s)
+
+        w2_bf16 = torch.randn(k, n, device=DEVICE, dtype=DTYPE) / 10
+        w2_q, w2_s = _quantize_mxfp4_block(w2_bf16)
+        w2_list.append(w2_q)
+        w2_scale_list.append(w2_s)
+
+    w1_fp4 = torch.stack(w1_list)
+    w1_scale_raw = torch.stack(w1_scale_list)
+    w2_fp4 = torch.stack(w2_list)
+    w2_scale_raw = torch.stack(w2_scale_list)
+
+    w1_scale = _swizzle_mxfp4_scale(w1_scale_raw)
+    w2_scale = _swizzle_mxfp4_scale(w2_scale_raw)
+
+    return w1_fp4, w1_scale, w2_fp4, w2_scale, w1_scale_raw, w2_scale_raw
+
+
+@pytest.mark.parametrize(
+    "activation",
+    [
+        MoEActivation.SILU_NO_MUL,
+        MoEActivation.GELU_NO_MUL,
+    ],
+)
 @torch.inference_mode()
-def test_grouped_matmul_mxfp4_packed_matches_reference() -> None:
+def test_batch_invariant_mxfp4_moe_non_gated_activation(
+    activation: MoEActivation,
+) -> None:
+    """Non-gated activations exercise the ``is_gated=False`` problem-sizes path."""
+    set_random_seed(70)
+    m, e, n, k = 32, 4, 128, 256
+    topk = 2
+
+    hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
+    score = torch.randn(m, e, device=DEVICE, dtype=DTYPE)
+    topk_weights, topk_ids, _ = fused_topk(
+        hidden_states, score, topk, renormalize=False
+    )
+
+    w1_fp4, w1_scale, w2_fp4, w2_scale, w1_scale_raw, w2_scale_raw = (
+        _make_mxfp4_moe_weights_non_gated(e=e, n=n, k=k)
+    )
+
+    out = fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w1_fp4,
+        w13_weight_scale=w1_scale,
+        w2_weight=w2_fp4,
+        w2_weight_scale=w2_scale,
+        activation=activation,
+    )
+    ref = _reference_fused_moe_mxfp4_dequant(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_fp4=w1_fp4,
+        w13_scale_raw=w1_scale_raw,
+        w2_fp4=w2_fp4,
+        w2_scale_raw=w2_scale_raw,
+        activation=activation,
+    )
+    assert out.shape == (m, k)
+    assert out.dtype == DTYPE
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@torch.inference_mode()
+def test_batch_invariant_mxfp4_moe_large_multi_tile() -> None:
+    """Larger shapes exercise multi-tile computation in M, N, and K."""
+    set_random_seed(77)
+    m, e, n, k = 256, 8, 512, 512
+    topk = 2
+
+    hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
+    score = torch.randn(m, e, device=DEVICE, dtype=DTYPE)
+    topk_weights, topk_ids, _ = fused_topk(
+        hidden_states, score, topk, renormalize=False
+    )
+
+    w13_fp4, w13_scale, w2_fp4, w2_scale, w13_scale_raw, w2_scale_raw = (
+        _make_mxfp4_moe_weights(e=e, n=n, k=k)
+    )
+
+    out = fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_fp4,
+        w13_weight_scale=w13_scale,
+        w2_weight=w2_fp4,
+        w2_weight_scale=w2_scale,
+        activation=MoEActivation.SILU,
+    )
+    ref = _reference_fused_moe_mxfp4_dequant(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_fp4=w13_fp4,
+        w13_scale_raw=w13_scale_raw,
+        w2_fp4=w2_fp4,
+        w2_scale_raw=w2_scale_raw,
+        activation=MoEActivation.SILU,
+    )
+    assert out.shape == (m, k)
+    assert out.dtype == DTYPE
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "per_expert_rows,N,K",
+    [
+        ([17, 131, 64, 5], 128, 256),
+        ([32, 64], 256, 128),
+        ([1, 200, 50], 256, 384),
+        ([0, 64, 0, 32], 128, 256),
+        ([140], 128, 256),
+        ([17, 131, 64, 5], 384, 256),
+    ],
+)
+@torch.inference_mode()
+def test_grouped_matmul_mxfp4_packed_matches_reference(
+    per_expert_rows: list[int],
+    N: int,
+    K: int,
+) -> None:
     """_grouped_matmul_mxfp4_packed must match a per-expert BF16 dequant reference."""
     set_random_seed(60)
 
-    per_expert_rows = [17, 131, 64, 5]
+    # Filter out zero-M experts for weight generation but keep them in
+    # problem_sizes so the kernel must handle them.
     E = len(per_expert_rows)
-    N = 128
-    K = 256
 
     bf16_weights = [
         torch.randn(N, K, device=DEVICE, dtype=DTYPE) / 10 for _ in range(E)
@@ -914,7 +1364,11 @@ def test_grouped_matmul_mxfp4_packed_matches_reference() -> None:
         torch.randn(rows, K, device=DEVICE, dtype=DTYPE) / 10
         for rows in per_expert_rows
     ]
-    a_bf16 = torch.cat(xs, dim=0)
+    a_bf16 = (
+        torch.cat(xs, dim=0)
+        if any(r > 0 for r in per_expert_rows)
+        else (torch.empty(0, K, device=DEVICE, dtype=DTYPE))
+    )
 
     expert_offsets = []
     row_offset = 0
@@ -939,11 +1393,16 @@ def test_grouped_matmul_mxfp4_packed_matches_reference() -> None:
 
     ref_outputs = []
     for i, rows in enumerate(per_expert_rows):
+        if rows == 0:
+            continue
         w_deq = _dequant_mxfp4(packed_b_fp4[i], packed_b_scale[i]).to(DTYPE)
         ref = xs[i] @ w_deq.T
         ref_outputs.append(ref)
 
     if packed_out.shape[1] != N:
         packed_out = packed_out[:, :N].contiguous()
-    ref_cat = torch.cat(ref_outputs, dim=0)
-    torch.testing.assert_close(packed_out, ref_cat, atol=2e-1, rtol=2e-1)
+    if ref_outputs:
+        ref_cat = torch.cat(ref_outputs, dim=0)
+        torch.testing.assert_close(packed_out, ref_cat, atol=5e-2, rtol=5e-2)
+    else:
+        assert packed_out.numel() == 0
