@@ -50,6 +50,29 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0
 
 
+def _batch_invariant_fp4_workspaces(
+    m: int,
+    topk: int,
+    w1_row_dim: int,
+    hidden_dim: int,
+    activation: MoEActivation,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scratch buffers matching ``BatchInvariantFP4Experts.workspace_shapes``."""
+    act_out_dim = mk.FusedMoEExpertsModular.adjust_N_for_activation(
+        w1_row_dim, activation
+    )
+    m_total = m * topk
+    workspace13 = torch.empty(
+        (m_total, max(w1_row_dim, hidden_dim)), device=device, dtype=dtype
+    )
+    workspace2 = torch.empty(
+        (m_total, max(act_out_dim, hidden_dim)), device=device, dtype=dtype
+    )
+    return workspace13, workspace2
+
+
 def _global_scale(x: torch.Tensor) -> torch.Tensor:
     return (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / x.abs().max()).to(torch.float32)
 
@@ -126,7 +149,6 @@ def _make_nvfp4_moe_tensors(
 def test_batch_invariant_nvfp4_moe_matches_cutlass(
     topk: int,
     apply_router_weight_on_input: bool,
-    workspace_init,
 ) -> None:
     set_random_seed(11)
     with set_current_vllm_config(
@@ -145,6 +167,16 @@ def test_batch_invariant_nvfp4_moe_matches_cutlass(
             g1_alphas,
             g2_alphas,
         ) = _make_nvfp4_moe_tensors(m=32, n=128, k=128, e=8, topk=topk)
+
+        w13, w2 = _batch_invariant_fp4_workspaces(
+            m=32,
+            topk=topk,
+            w1_row_dim=w1_q.shape[1],
+            hidden_dim=128,
+            activation=MoEActivation.SILU,
+            device=DEVICE,
+            dtype=DTYPE,
+        )
 
         quant_config = nvfp4_moe_quant_config(
             g1_alphas=g1_alphas,
@@ -188,6 +220,8 @@ def test_batch_invariant_nvfp4_moe_matches_cutlass(
             a2_gscale=a2_gscale,
             g2_alphas=g2_alphas,
             activation=MoEActivation.SILU,
+            workspace13=w13,
+            workspace2=w2,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
         torch.testing.assert_close(fallback_out, cutlass_out, atol=1e-1, rtol=1e-1)
@@ -244,6 +278,25 @@ def test_batch_invariant_nvfp4_moe_batch_size_invariance(
     topk_weights_batch /= topk_weights_batch.sum(dim=-1, keepdim=True)
     topk_weights_batch[0] = topk_weights_single[0]
 
+    w13_1, w2_1 = _batch_invariant_fp4_workspaces(
+        m=1,
+        topk=topk,
+        w1_row_dim=w1_q.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    w13_8, w2_8 = _batch_invariant_fp4_workspaces(
+        m=8,
+        topk=topk,
+        w1_row_dim=w1_q.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out_single = fused_moe_batch_invariant_nvfp4(
         hidden_states=x_single,
         topk_ids=topk_ids_single,
@@ -257,6 +310,8 @@ def test_batch_invariant_nvfp4_moe_batch_size_invariance(
         a2_gscale=a2_gscale,
         g2_alphas=g2_alphas,
         activation=MoEActivation.SILU,
+        workspace13=w13_1,
+        workspace2=w2_1,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
     out_batch = fused_moe_batch_invariant_nvfp4(
@@ -272,6 +327,8 @@ def test_batch_invariant_nvfp4_moe_batch_size_invariance(
         a2_gscale=a2_gscale,
         g2_alphas=g2_alphas,
         activation=MoEActivation.SILU,
+        workspace13=w13_8,
+        workspace2=w2_8,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
     assert torch.equal(out_single[0], out_batch[0])
@@ -309,6 +366,16 @@ def test_batch_invariant_nvfp4_moe_ignores_invalid_sentinel_routes() -> None:
         [valid_topk_weights, invalid_topk_weights], dim=1
     )
 
+    w13, w2 = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=2,
+        w1_row_dim=w1_q.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out_with_invalid = fused_moe_batch_invariant_nvfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids_with_invalid,
@@ -322,6 +389,8 @@ def test_batch_invariant_nvfp4_moe_ignores_invalid_sentinel_routes() -> None:
         a2_gscale=a2_gscale,
         g2_alphas=g2_alphas,
         activation=MoEActivation.SILU,
+        workspace13=w13,
+        workspace2=w2,
     )
     out_valid_only = fused_moe_batch_invariant_nvfp4(
         hidden_states=hidden_states,
@@ -336,6 +405,8 @@ def test_batch_invariant_nvfp4_moe_ignores_invalid_sentinel_routes() -> None:
         a2_gscale=a2_gscale,
         g2_alphas=g2_alphas,
         activation=MoEActivation.SILU,
+        workspace13=w13,
+        workspace2=w2,
     )
 
     torch.testing.assert_close(out_with_invalid, out_valid_only, atol=1e-1, rtol=1e-1)
@@ -384,6 +455,25 @@ def test_batch_invariant_nvfp4_moe_expert_map_invalidation_matches_local_routes(
     topk_ids_global = torch.cat([valid_global_ids, invalid_global_ids], dim=1)
     topk_weights_global = torch.rand((m, 2), device=DEVICE, dtype=torch.float32)
 
+    w13_g, w2_g = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=2,
+        w1_row_dim=w1_q.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    w13_l, w2_l = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=1,
+        w1_row_dim=w1_q.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out_with_expert_map = fused_moe_batch_invariant_nvfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids_global,
@@ -397,6 +487,8 @@ def test_batch_invariant_nvfp4_moe_expert_map_invalidation_matches_local_routes(
         a2_gscale=a2_gscale,
         g2_alphas=g2_alphas,
         activation=MoEActivation.SILU,
+        workspace13=w13_g,
+        workspace2=w2_g,
         expert_map=expert_map,
     )
 
@@ -415,6 +507,8 @@ def test_batch_invariant_nvfp4_moe_expert_map_invalidation_matches_local_routes(
         a2_gscale=a2_gscale,
         g2_alphas=g2_alphas,
         activation=MoEActivation.SILU,
+        workspace13=w13_l,
+        workspace2=w2_l,
         expert_map=None,
     )
 
@@ -443,6 +537,15 @@ def test_batch_invariant_nvfp4_moe_all_invalid_routes_return_zero() -> None:
 
     topk_ids = torch.full((m, 2), -1, dtype=torch.int64, device=DEVICE)
     topk_weights = torch.rand((m, 2), dtype=torch.float32, device=DEVICE)
+    w13_z, w2_z = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=2,
+        w1_row_dim=w1_q.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
     out = fused_moe_batch_invariant_nvfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
@@ -456,6 +559,8 @@ def test_batch_invariant_nvfp4_moe_all_invalid_routes_return_zero() -> None:
         a2_gscale=a2_gscale,
         g2_alphas=g2_alphas,
         activation=MoEActivation.SILU,
+        workspace13=w13_z,
+        workspace2=w2_z,
     )
 
     torch.testing.assert_close(out, torch.zeros_like(out), atol=0.0, rtol=0.0)
@@ -852,6 +957,16 @@ def test_batch_invariant_mxfp4_moe_matches_dequant_reference(
         w2_scale_raw,
     ) = _make_mxfp4_moe_weights(e=e, n=n, k=k)
 
+    workspace13, workspace2 = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=topk,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
@@ -861,6 +976,8 @@ def test_batch_invariant_mxfp4_moe_matches_dequant_reference(
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=workspace13,
+        workspace2=workspace2,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
     ref = _reference_fused_moe_mxfp4_dequant(
@@ -925,6 +1042,16 @@ def test_batch_invariant_mxfp4_moe_interleaved_checkpoint_format() -> None:
         )
     )
 
+    workspace13, workspace2 = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=topk,
+        w1_row_dim=w13_fp4_conv.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
@@ -934,6 +1061,8 @@ def test_batch_invariant_mxfp4_moe_interleaved_checkpoint_format() -> None:
         w2_weight=w2_conv,
         w2_weight_scale=w2_scale_conv,
         activation=MoEActivation.SILU,
+        workspace13=workspace13,
+        workspace2=workspace2,
     )
 
     # The reference uses concatenated (non-interleaved) raw scales.
@@ -951,68 +1080,6 @@ def test_batch_invariant_mxfp4_moe_interleaved_checkpoint_format() -> None:
     assert out.shape == (m, k)
     assert out.dtype == DTYPE
     assert torch.isfinite(out).all()
-    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
-
-
-@torch.inference_mode()
-def test_batch_invariant_mxfp4_moe_with_preallocated_workspaces_matches_reference() -> (
-    None
-):
-    """GEMM2 must not alias `act_out` in workspace2; same numerics as reference."""
-    set_random_seed(43)
-    m, e, n, k = 32, 8, 128, 256
-    topk = 2
-    activation = MoEActivation.SILU
-
-    hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
-    score = torch.randn(m, e, device=DEVICE, dtype=DTYPE)
-    topk_weights, topk_ids, _ = fused_topk(
-        hidden_states, score, topk, renormalize=False
-    )
-
-    (
-        w13_fp4,
-        w13_scale,
-        w2_fp4,
-        w2_scale,
-        w13_scale_raw,
-        w2_scale_raw,
-    ) = _make_mxfp4_moe_weights(e=e, n=n, k=k)
-
-    # Same shapes as BatchInvariantFP4Experts.workspace_shapes (N=w1 row dim, K=hidden).
-    w1_row_dim = w13_fp4.shape[1]
-    act_out_dim = mk.FusedMoEExpertsModular.adjust_N_for_activation(
-        w1_row_dim, activation
-    )
-    m_total = m * topk
-    workspace13_shape = (m_total, max(w1_row_dim, k))
-    workspace2_shape = (m_total, max(act_out_dim, k))
-    workspace13 = torch.empty(workspace13_shape, device=DEVICE, dtype=DTYPE)
-    workspace2 = torch.empty(workspace2_shape, device=DEVICE, dtype=DTYPE)
-
-    out = fused_moe_batch_invariant_mxfp4(
-        hidden_states=hidden_states,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        w13_weight=w13_fp4,
-        w13_weight_scale=w13_scale,
-        w2_weight=w2_fp4,
-        w2_weight_scale=w2_scale,
-        activation=activation,
-        workspace13=workspace13,
-        workspace2=workspace2,
-    )
-    ref = _reference_fused_moe_mxfp4_dequant(
-        hidden_states=hidden_states,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        w13_fp4=w13_fp4,
-        w13_scale_raw=w13_scale_raw,
-        w2_fp4=w2_fp4,
-        w2_scale_raw=w2_scale_raw,
-        activation=activation,
-    )
-    assert out.shape == (m, k)
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
 
 
@@ -1040,6 +1107,25 @@ def test_batch_invariant_mxfp4_moe_batch_size_invariance() -> None:
     topk_weights_batch /= topk_weights_batch.sum(dim=-1, keepdim=True)
     topk_weights_batch[0] = topk_weights_single[0]
 
+    w13_1, w2_1 = _batch_invariant_fp4_workspaces(
+        m=1,
+        topk=topk,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    w13_8, w2_8 = _batch_invariant_fp4_workspaces(
+        m=8,
+        topk=topk,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out_single = fused_moe_batch_invariant_mxfp4(
         hidden_states=x_single,
         topk_ids=topk_ids_single,
@@ -1049,6 +1135,8 @@ def test_batch_invariant_mxfp4_moe_batch_size_invariance() -> None:
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=w13_1,
+        workspace2=w2_1,
     )
     out_batch = fused_moe_batch_invariant_mxfp4(
         hidden_states=x_batch,
@@ -1059,6 +1147,8 @@ def test_batch_invariant_mxfp4_moe_batch_size_invariance() -> None:
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=w13_8,
+        workspace2=w2_8,
     )
     assert torch.equal(out_single[0], out_batch[0])
 
@@ -1081,6 +1171,16 @@ def test_batch_invariant_mxfp4_moe_ignores_invalid_sentinel_routes() -> None:
         [valid_topk_weights, invalid_topk_weights], dim=1
     )
 
+    w13, w2 = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=2,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out_with_invalid = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids_with_invalid,
@@ -1090,6 +1190,8 @@ def test_batch_invariant_mxfp4_moe_ignores_invalid_sentinel_routes() -> None:
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=w13,
+        workspace2=w2,
     )
     out_valid_only = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
@@ -1100,6 +1202,8 @@ def test_batch_invariant_mxfp4_moe_ignores_invalid_sentinel_routes() -> None:
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=w13,
+        workspace2=w2,
     )
 
     torch.testing.assert_close(out_with_invalid, out_valid_only, atol=1e-1, rtol=1e-1)
@@ -1137,6 +1241,25 @@ def test_batch_invariant_mxfp4_moe_expert_map_invalidation_matches_local_routes(
     topk_ids_global = torch.cat([valid_global_ids, invalid_global_ids], dim=1)
     topk_weights_global = torch.rand((m, 2), device=DEVICE, dtype=torch.float32)
 
+    w13_g, w2_g = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=2,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    w13_l, w2_l = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=1,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out_with_expert_map = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids_global,
@@ -1146,6 +1269,8 @@ def test_batch_invariant_mxfp4_moe_expert_map_invalidation_matches_local_routes(
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=w13_g,
+        workspace2=w2_g,
         expert_map=expert_map,
     )
 
@@ -1160,6 +1285,8 @@ def test_batch_invariant_mxfp4_moe_expert_map_invalidation_matches_local_routes(
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=w13_l,
+        workspace2=w2_l,
         expert_map=None,
     )
 
@@ -1180,6 +1307,16 @@ def test_batch_invariant_mxfp4_moe_all_invalid_routes_return_zero() -> None:
     topk_ids = torch.full((m, 2), -1, dtype=torch.int64, device=DEVICE)
     topk_weights = torch.rand(m, 2, dtype=torch.float32, device=DEVICE)
 
+    w13_z, w2_z = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=2,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
@@ -1189,6 +1326,8 @@ def test_batch_invariant_mxfp4_moe_all_invalid_routes_return_zero() -> None:
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=w13_z,
+        workspace2=w2_z,
     )
     torch.testing.assert_close(out, torch.zeros_like(out), atol=0.0, rtol=0.0)
 
@@ -1260,6 +1399,16 @@ def test_batch_invariant_mxfp4_moe_non_gated_activation(
         _make_mxfp4_moe_weights_non_gated(e=e, n=n, k=k)
     )
 
+    workspace13, workspace2 = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=topk,
+        w1_row_dim=w1_fp4.shape[1],
+        hidden_dim=k,
+        activation=activation,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
@@ -1269,6 +1418,8 @@ def test_batch_invariant_mxfp4_moe_non_gated_activation(
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=activation,
+        workspace13=workspace13,
+        workspace2=workspace2,
     )
     ref = _reference_fused_moe_mxfp4_dequant(
         hidden_states=hidden_states,
@@ -1303,6 +1454,16 @@ def test_batch_invariant_mxfp4_moe_large_multi_tile() -> None:
         _make_mxfp4_moe_weights(e=e, n=n, k=k)
     )
 
+    workspace13, workspace2 = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=topk,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
@@ -1312,6 +1473,8 @@ def test_batch_invariant_mxfp4_moe_large_multi_tile() -> None:
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=workspace13,
+        workspace2=workspace2,
     )
     ref = _reference_fused_moe_mxfp4_dequant(
         hidden_states=hidden_states,
@@ -1464,6 +1627,16 @@ def test_batch_invariant_mxfp4_moe_with_bias(
     w13_bias = torch.randn(e, 2 * n, device=DEVICE, dtype=torch.float32) / 10
     w2_bias = torch.randn(e, k, device=DEVICE, dtype=torch.float32) / 10
 
+    workspace13, workspace2 = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=topk,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     out = fused_moe_batch_invariant_mxfp4(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
@@ -1473,6 +1646,8 @@ def test_batch_invariant_mxfp4_moe_with_bias(
         w2_weight=w2_fp4,
         w2_weight_scale=w2_scale,
         activation=MoEActivation.SILU,
+        workspace13=workspace13,
+        workspace2=workspace2,
         w13_bias=w13_bias,
         w2_bias=w2_bias,
         apply_router_weight_on_input=apply_router_weight_on_input,

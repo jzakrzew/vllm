@@ -824,11 +824,11 @@ def fused_moe_batch_invariant_nvfp4(
     g2_alphas: torch.Tensor | None,
     activation: Any,
     *,
+    workspace13: torch.Tensor,
+    workspace2: torch.Tensor,
     apply_router_weight_on_input: bool = False,
     expert_map: torch.Tensor | None = None,
     quant_backend: str = "cutlass",
-    workspace13: torch.Tensor | None = None,
-    workspace2: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
@@ -841,6 +841,9 @@ def fused_moe_batch_invariant_nvfp4(
     to gather, apply router weights and reduce back to ``[M, K]`` while
     safely skipping invalid routes.  When ``output`` is provided, the final
     reduction writes directly into that tensor.
+
+    ``workspace13`` and ``workspace2`` must match ``BatchInvariantFP4Experts.
+    workspace_shapes`` (large enough for GEMM1 / GEMM2 staging and activations).
     """
 
     if hidden_states.ndim != 2:
@@ -926,17 +929,20 @@ def fused_moe_batch_invariant_nvfp4(
     w2_output_size = hidden_dim
     w1_padding_cols = max(0, w13_weight.shape[-1] - hidden_dim // 2)
     w2_padding_cols = max(0, w2_weight.shape[-1] - activation_out_dim // 2)
-    if workspace2 is not None:
-        required_workspace2_cols = max(activation_out_dim, w2_output_size)
-        if (
-            workspace2.shape[0] < M_total
-            or workspace2.shape[1] < required_workspace2_cols
-        ):
-            raise RuntimeError(
-                "workspace2 is too small for activation/GEMM2 staging. "
-                f"Need at least ({M_total}, {required_workspace2_cols}), "
-                f"got {tuple(workspace2.shape)}."
-            )
+    min_w13_cols = max(w13_weight.shape[1], hidden_dim)
+    if workspace13.shape[0] < M_total or workspace13.shape[1] < min_w13_cols:
+        raise RuntimeError(
+            "workspace13 is too small for GEMM1 staging. "
+            f"Need at least ({M_total}, {min_w13_cols}), "
+            f"got {tuple(workspace13.shape)}."
+        )
+    required_workspace2_cols = max(activation_out_dim, w2_output_size)
+    if workspace2.shape[0] < M_total or workspace2.shape[1] < required_workspace2_cols:
+        raise RuntimeError(
+            "workspace2 is too small for activation/GEMM2 staging. "
+            f"Need at least ({M_total}, {required_workspace2_cols}), "
+            f"got {tuple(workspace2.shape)}."
+        )
     # Per-expert metadata/permutations for packed grouped-GEMM.
     expert_offsets = torch.empty((num_experts + 1), dtype=torch.int32, device=device)
     blockscale_offsets = torch.empty(
@@ -1017,12 +1023,7 @@ def fused_moe_batch_invariant_nvfp4(
             top_k,
         )
     else:
-        if workspace2 is not None:
-            act_out = _resize_cache(workspace2, (M_total, activation_out_dim))
-        else:
-            act_out = torch.empty(
-                (M_total, activation_out_dim), device=device, dtype=dtype
-            )
+        act_out = _resize_cache(workspace2, (M_total, activation_out_dim))
         apply_moe_activation(
             activation=activation_kind,
             output=act_out,
@@ -1264,18 +1265,22 @@ def fused_moe_batch_invariant_mxfp4(
     w2_weight_scale: torch.Tensor,
     activation: Any,
     *,
+    workspace13: torch.Tensor,
+    workspace2: torch.Tensor,
     w13_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
     expert_map: torch.Tensor | None = None,
-    workspace13: torch.Tensor | None = None,
-    workspace2: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Deterministic MXFP4 W4A16 MoE using packed routing and grouped GEMMs.
 
     Activations stay in BF16 throughout (no FP4 activation quantization).
+    After the activation, activations are copied from ``workspace2`` into
+    ``workspace13`` so GEMM2 can read A from ``workspace13`` and write C into
+    ``workspace2`` (avoiding overlap with ``fused_out`` in the modular kernel
+    and avoiding A/C aliasing in a single buffer).
     """
     if hidden_states.ndim != 2:
         raise RuntimeError(f"Expected 2D hidden_states, got {hidden_states.shape}.")
@@ -1348,6 +1353,21 @@ def fused_moe_batch_invariant_mxfp4(
     )
     w2_output_size = hidden_dim
 
+    min_w13_cols = max(w1_output_size, hidden_dim)
+    if workspace13.shape[0] < M_total or workspace13.shape[1] < min_w13_cols:
+        raise RuntimeError(
+            "workspace13 is too small for GEMM1 staging / GEMM2 A staging. "
+            f"Need at least ({M_total}, {min_w13_cols}), "
+            f"got {tuple(workspace13.shape)}."
+        )
+    required_workspace2_cols = max(activation_out_dim, w2_output_size)
+    if workspace2.shape[0] < M_total or workspace2.shape[1] < required_workspace2_cols:
+        raise RuntimeError(
+            "workspace2 is too small for activation / GEMM2 output. "
+            f"Need at least ({M_total}, {required_workspace2_cols}), "
+            f"got {tuple(workspace2.shape)}."
+        )
+
     expert_offsets = torch.empty((num_experts + 1), dtype=torch.int32, device=device)
     blockscale_offsets = torch.empty(
         (num_experts + 1), dtype=torch.int32, device=device
@@ -1389,27 +1409,27 @@ def fused_moe_batch_invariant_mxfp4(
     if gemm1_out.shape[-1] != w1_output_size:
         gemm1_out = gemm1_out[:, :w1_output_size].contiguous()
 
-    # Activation
-    if workspace2 is not None:
-        act_out = _resize_cache(workspace2, (M_total, activation_out_dim))
-    else:
-        act_out = torch.empty((M_total, activation_out_dim), device=device, dtype=dtype)
+    # Activation into workspace2; copy A to workspace13 so GEMM2 can write C
+    # to workspace2 without overlapping A or the modular fused_out slab.
+    act_out = _resize_cache(workspace2, (M_total, activation_out_dim))
     apply_moe_activation(
         activation=activation_kind,
         output=act_out,
         input=gemm1_out,
     )
+    gemm2_a = _resize_cache(workspace13, (M_total, activation_out_dim))
+    gemm2_a.copy_(act_out)
 
     # GEMM2: BF16 activation output x MXFP4 weights
     gemm2_out = _grouped_matmul_mxfp4_packed(
-        a_bf16=act_out,
+        a_bf16=gemm2_a,
         b_fp4=w2_weight,
         b_scale=w2_weight_scale,
         expert_offsets=expert_offsets,
         problem_sizes=problem_sizes2,
         output_dtype=dtype,
         bias=w2_bias,
-        output=workspace13,
+        output=workspace2,
     )
     if gemm2_out.shape[-1] != w2_output_size:
         gemm2_out = gemm2_out[:, :w2_output_size].contiguous()
@@ -1604,8 +1624,8 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
         expert_map: torch.Tensor | None,
         a1q_scale: torch.Tensor | None,
         a2_scale: torch.Tensor | None,
-        workspace13: torch.Tensor | None,
-        workspace2: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
