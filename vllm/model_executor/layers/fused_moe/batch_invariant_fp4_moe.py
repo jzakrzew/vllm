@@ -4,7 +4,6 @@
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -87,13 +86,13 @@ def _quantize_mxfp8_experts(
         device=input_tensor.device,
         dtype=torch.uint8,
     )
+    expert_off = expert_offsets[:num_experts]
+    block_off = blockscale_offsets[:num_experts]
     ops.mxfp8_experts_quant(
-        input_tensor=input_tensor.contiguous(),
-        problem_sizes=problem_sizes.to(dtype=torch.int32).contiguous(),
-        expert_offsets=expert_offsets[:num_experts].to(dtype=torch.int32).contiguous(),
-        blockscale_offsets=blockscale_offsets[:num_experts]
-        .to(dtype=torch.int32)
-        .contiguous(),
+        input_tensor=input_tensor,
+        problem_sizes=problem_sizes,
+        expert_offsets=expert_off,
+        blockscale_offsets=block_off,
         quant_output=quant_output,
         scale_factor=scale_output,
     )
@@ -136,36 +135,148 @@ def _prepare_mxfp4_grouped_gemm_a(
 
 
 # ---------------------------------------------------------------------------
-# Helpers used by ``fused_moe_batch_invariant_nvfp4``
+# Fused-entry validation (once per MoE call; aligned with Marlin / FlashInfer)
 # ---------------------------------------------------------------------------
 
 
-def _nvfp4_get_expert_vector(
-    tensor: torch.Tensor | None,
+def _validate_fp4_moe_shared_user_tensors(
     *,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    workspace13: torch.Tensor,
+    workspace2: torch.Tensor,
+    expert_map: torch.Tensor | None,
+) -> None:
+    """Layouts shared by NVFP4 and MXFP4 fused MoE entry points."""
+    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+    assert hidden_states.dtype in (torch.float16, torch.bfloat16), (
+        f"hidden_states must be float16 or bfloat16, got {hidden_states.dtype}"
+    )
+    assert topk_ids.is_contiguous(), "topk_ids must be contiguous"
+    assert topk_ids.dtype == torch.int32, (
+        f"topk_ids must be int32, got {topk_ids.dtype}"
+    )
+    assert topk_weights.is_contiguous(), "topk_weights must be contiguous"
+    assert topk_weights.dtype == torch.float32, (
+        f"topk_weights must be float32, got {topk_weights.dtype}"
+    )
+    assert output.is_contiguous(), "output must be contiguous"
+    assert workspace13.is_contiguous(), "workspace13 must be contiguous"
+    assert workspace2.is_contiguous(), "workspace2 must be contiguous"
+    assert w13_weight.is_contiguous(), "w13_weight must be contiguous"
+    assert w13_weight_scale.is_contiguous(), "w13_weight_scale must be contiguous"
+    assert w2_weight.is_contiguous(), "w2_weight must be contiguous"
+    assert w2_weight_scale.is_contiguous(), "w2_weight_scale must be contiguous"
+    if expert_map is not None:
+        assert expert_map.is_contiguous(), "expert_map must be contiguous"
+
+
+def _validate_fused_moe_batch_invariant_nvfp4_inputs(
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    a1_gscale: torch.Tensor | None,
+    g1_alphas: torch.Tensor | None,
+    a2_gscale: torch.Tensor | None,
+    g2_alphas: torch.Tensor | None,
+    output: torch.Tensor,
+    workspace13: torch.Tensor,
+    workspace2: torch.Tensor,
+    expert_map: torch.Tensor | None,
     num_experts: int,
-    field_name: str,
-) -> torch.Tensor:
-    """Returns a contiguous float32 per-expert vector of length ``num_experts``."""
-    if tensor is None:
-        raise RuntimeError(f"Missing required NVFP4 MoE tensor: {field_name}")
+) -> None:
+    _validate_fp4_moe_shared_user_tensors(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_weight,
+        w13_weight_scale=w13_weight_scale,
+        w2_weight=w2_weight,
+        w2_weight_scale=w2_weight_scale,
+        output=output,
+        workspace13=workspace13,
+        workspace2=workspace2,
+        expert_map=expert_map,
+    )
 
-    if tensor.ndim == 0 or tensor.numel() == 1:
-        return tensor.reshape(1).to(torch.float32).expand(num_experts).contiguous()
-
-    if tensor.shape[0] < num_experts:
-        raise RuntimeError(
-            f"NVFP4 MoE tensor '{field_name}' has {tensor.shape[0]} entries, "
-            f"but {num_experts} experts are required."
+    for name, tensor in (
+        ("a1_gscale", a1_gscale),
+        ("a2_gscale", a2_gscale),
+        ("g1_alphas", g1_alphas),
+        ("g2_alphas", g2_alphas),
+    ):
+        if tensor is None:
+            raise RuntimeError(f"Missing required NVFP4 MoE tensor: {name}")
+        assert tensor.ndim == 1, (
+            f"NVFP4 MoE tensor '{name}' must be 1-D, got shape {tuple(tensor.shape)}."
+        )
+        assert tensor.dtype == torch.float32, (
+            f"NVFP4 MoE tensor '{name}' must be float32, got {tensor.dtype}."
+        )
+        assert tensor.is_contiguous(), f"NVFP4 MoE tensor '{name}' must be contiguous."
+        assert tensor.numel() == num_experts, (
+            f"NVFP4 MoE tensor '{name}' must have {num_experts} elements, "
+            f"got {tensor.numel()}."
         )
 
-    flattened = tensor[:num_experts].reshape(num_experts, -1)
-    if flattened.shape[1] != 1:
-        raise RuntimeError(
-            f"NVFP4 MoE tensor '{field_name}' must provide one value per expert, "
-            f"got shape {tuple(tensor.shape)}."
+
+def _validate_fused_moe_batch_invariant_mxfp4_inputs(
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    workspace13: torch.Tensor,
+    workspace2: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    w13_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    num_experts: int,
+) -> None:
+    _validate_fp4_moe_shared_user_tensors(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_weight,
+        w13_weight_scale=w13_weight_scale,
+        w2_weight=w2_weight,
+        w2_weight_scale=w2_weight_scale,
+        output=output,
+        workspace13=workspace13,
+        workspace2=workspace2,
+        expert_map=expert_map,
+    )
+    if w13_bias is not None:
+        assert w13_bias.is_contiguous(), "w13_bias must be contiguous"
+        assert w13_bias.dtype == torch.float32, (
+            f"w13_bias must be float32, got {w13_bias.dtype}"
         )
-    return flattened[:, 0].to(torch.float32).contiguous()
+        assert w13_bias.shape == (num_experts, w13_weight.shape[1]), (
+            f"w13_bias must be (num_experts, w13_row_dim), got {tuple(w13_bias.shape)}"
+        )
+    if w2_bias is not None:
+        assert w2_bias.is_contiguous(), "w2_bias must be contiguous"
+        assert w2_bias.dtype == torch.float32, (
+            f"w2_bias must be float32, got {w2_bias.dtype}"
+        )
+        assert w2_bias.shape == (num_experts, w2_weight.shape[1]), (
+            f"w2_bias must be (num_experts, w2_row_dim), got {tuple(w2_bias.shape)}"
+        )
 
 
 def _nvfp4_moe_map_experts(
@@ -173,12 +284,12 @@ def _nvfp4_moe_map_experts(
 ) -> torch.Tensor:
     flat_ids = topk_ids.reshape(-1).to(torch.long)
     if expert_map.numel() == 0:
-        return torch.full_like(topk_ids, -1, dtype=torch.long)
+        return torch.full(topk_ids.shape, -1, dtype=torch.int32, device=topk_ids.device)
     valid = (flat_ids >= 0) & (flat_ids < expert_map.numel())
     clamped = flat_ids.clamp(min=0, max=max(0, expert_map.numel() - 1))
     remapped = expert_map.to(torch.long).index_select(0, clamped)
     mapped = torch.where(valid, remapped, torch.full_like(remapped, -1))
-    return mapped.view_as(topk_ids)
+    return mapped.reshape(topk_ids.shape).to(dtype=torch.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +611,7 @@ def _canonicalize_grouped_offsets(
         )
     if offsets.dtype not in (torch.int32, torch.int64):
         offsets = offsets.to(dtype=torch.int32)
-    return offsets.contiguous()
+    return offsets
 
 
 def _grouped_matmul_nvfp4_packed(
@@ -587,13 +698,6 @@ def _grouped_matmul_nvfp4_packed(
     a_scale_offsets = _canonicalize_grouped_offsets(
         a_scale_offsets, num_experts=E, name="a_scale_offsets"
     )
-    problem_sizes = problem_sizes.to(dtype=torch.int32).contiguous()
-    if not a_fp4.is_contiguous():
-        a_fp4 = a_fp4.contiguous()
-    if not a_scale.is_contiguous():
-        a_scale = a_scale.contiguous()
-    if not b_scale.is_contiguous():
-        b_scale = b_scale.contiguous()
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
@@ -717,7 +821,7 @@ def fused_moe_batch_invariant_nvfp4(
     g1_alphas: torch.Tensor | None,
     a2_gscale: torch.Tensor | None,
     g2_alphas: torch.Tensor | None,
-    activation: Any,
+    activation: MoEActivation,
     *,
     workspace13: torch.Tensor,
     workspace2: torch.Tensor,
@@ -756,16 +860,29 @@ def fused_moe_batch_invariant_nvfp4(
     assert quant_backend == "cutlass", (
         "Packed batch-invariant NVFP4 MoE requires quant_backend='cutlass'."
     )
-
-    activation_kind = (
-        activation
-        if isinstance(activation, MoEActivation)
-        else MoEActivation.from_str(str(activation))
-    )
+    activation_kind = activation
 
     num_tokens, hidden_dim = hidden_states.shape
     num_experts = w13_weight.shape[0]
     top_k = topk_ids.shape[1]
+    _validate_fused_moe_batch_invariant_nvfp4_inputs(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_weight,
+        w13_weight_scale=w13_weight_scale,
+        w2_weight=w2_weight,
+        w2_weight_scale=w2_weight_scale,
+        a1_gscale=a1_gscale,
+        g1_alphas=g1_alphas,
+        a2_gscale=a2_gscale,
+        g2_alphas=g2_alphas,
+        output=output,
+        workspace13=workspace13,
+        workspace2=workspace2,
+        expert_map=expert_map,
+        num_experts=num_experts,
+    )
     M_total = num_tokens * top_k
     if M_total == 0:
         return output
@@ -773,13 +890,12 @@ def fused_moe_batch_invariant_nvfp4(
     routed_topk_ids = topk_ids
     if expert_map is not None:
         routed_topk_ids = _nvfp4_moe_map_experts(topk_ids, expert_map)
-    routed_topk_ids = routed_topk_ids.to(torch.int32)
     # Out-of-range IDs are treated as invalid routes.
     valid_routes = (routed_topk_ids >= 0) & (routed_topk_ids < num_experts)
     routed_topk_ids = torch.where(
         valid_routes, routed_topk_ids, torch.full_like(routed_topk_ids, -1)
     )
-    routed_topk_weights = topk_weights.to(torch.float32)
+    routed_topk_weights = topk_weights
 
     if apply_router_weight_on_input:
         packed_hidden_states = hidden_states * routed_topk_weights.view(-1, 1).to(
@@ -840,21 +956,10 @@ def fused_moe_batch_invariant_nvfp4(
 
     packed_hidden_states = ops.shuffle_rows(packed_hidden_states, a_map)
 
-    def _ensure_expert_vec(t: torch.Tensor | None, name: str) -> torch.Tensor:
-        if (
-            t is not None
-            and t.ndim == 1
-            and t.dtype == torch.float32
-            and t.numel() == num_experts
-            and t.is_contiguous()
-        ):
-            return t
-        return _nvfp4_get_expert_vector(t, num_experts=num_experts, field_name=name)
-
-    a1_gscale_vec = _ensure_expert_vec(a1_gscale, "a1_gscale")
-    a2_gscale_vec = _ensure_expert_vec(a2_gscale, "a2_gscale")
-    g1_alpha_vec = _ensure_expert_vec(g1_alphas, "g1_alphas")
-    g2_alpha_vec = _ensure_expert_vec(g2_alphas, "g2_alphas")
+    a1_gscale_vec = a1_gscale
+    a2_gscale_vec = a2_gscale
+    g1_alpha_vec = g1_alphas
+    g2_alpha_vec = g2_alphas
 
     a1_fp4, a1_scale = ops.scaled_fp4_experts_quant(
         packed_hidden_states,
@@ -1011,13 +1116,6 @@ def _grouped_matmul_mxfp4_packed(
     expert_offsets = _canonicalize_grouped_offsets(
         expert_offsets, num_experts=E, name="expert_offsets"
     )
-    problem_sizes = problem_sizes.to(dtype=torch.int32).contiguous()
-    if not a_tensor.is_contiguous():
-        a_tensor = a_tensor.contiguous()
-    if not b_scale.is_contiguous():
-        b_scale = b_scale.contiguous()
-    if a_scale is not None and not a_scale.is_contiguous():
-        a_scale = a_scale.contiguous()
     if a_mode == _GroupedGemmAMode.MXFP8:
         a_scale_offsets = _canonicalize_grouped_offsets(
             a_scale_offsets, num_experts=E, name="a_scale_offsets"
@@ -1160,7 +1258,7 @@ def fused_moe_batch_invariant_mxfp4(
     w13_weight_scale: torch.Tensor,
     w2_weight: torch.Tensor,
     w2_weight_scale: torch.Tensor,
-    activation: Any,
+    activation: MoEActivation,
     *,
     workspace13: torch.Tensor,
     workspace2: torch.Tensor,
@@ -1189,16 +1287,27 @@ def fused_moe_batch_invariant_mxfp4(
     assert not apply_router_weight_on_input or topk_ids.shape[1] == 1, (
         "apply_router_weight_on_input=True is only supported for top_k == 1."
     )
-
-    activation_kind = (
-        activation
-        if isinstance(activation, MoEActivation)
-        else MoEActivation.from_str(str(activation))
-    )
+    activation_kind = activation
 
     num_tokens, hidden_dim = hidden_states.shape
     num_experts = w13_weight.shape[0]
     top_k = topk_ids.shape[1]
+    _validate_fused_moe_batch_invariant_mxfp4_inputs(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_weight,
+        w13_weight_scale=w13_weight_scale,
+        w2_weight=w2_weight,
+        w2_weight_scale=w2_weight_scale,
+        output=output,
+        workspace13=workspace13,
+        workspace2=workspace2,
+        expert_map=expert_map,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        num_experts=num_experts,
+    )
     M_total = num_tokens * top_k
 
     if M_total == 0:
@@ -1207,12 +1316,11 @@ def fused_moe_batch_invariant_mxfp4(
     routed_topk_ids = topk_ids
     if expert_map is not None:
         routed_topk_ids = _nvfp4_moe_map_experts(topk_ids, expert_map)
-    routed_topk_ids = routed_topk_ids.to(torch.int32)
     valid_routes = (routed_topk_ids >= 0) & (routed_topk_ids < num_experts)
     routed_topk_ids = torch.where(
         valid_routes, routed_topk_ids, torch.full_like(routed_topk_ids, -1)
     )
-    routed_topk_weights = topk_weights.to(torch.float32)
+    routed_topk_weights = topk_weights
 
     if apply_router_weight_on_input:
         packed_hidden_states = hidden_states * routed_topk_weights.view(-1, 1).to(
@@ -1513,20 +1621,11 @@ class BatchInvariantNvfp4Experts(_BatchInvariantFP4ExpertsBase):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._cached_scale_vecs is not None:
             return self._cached_scale_vecs
-        n = self._num_local_experts
         self._cached_scale_vecs = (
-            _nvfp4_get_expert_vector(
-                self.a1_gscale, num_experts=n, field_name="a1_gscale"
-            ),
-            _nvfp4_get_expert_vector(
-                self.a2_gscale, num_experts=n, field_name="a2_gscale"
-            ),
-            _nvfp4_get_expert_vector(
-                self.g1_alphas, num_experts=n, field_name="g1_alphas"
-            ),
-            _nvfp4_get_expert_vector(
-                self.g2_alphas, num_experts=n, field_name="g2_alphas"
-            ),
+            self.a1_gscale,
+            self.a2_gscale,
+            self.g1_alphas,
+            self.g2_alphas,
         )
         return self._cached_scale_vecs
 

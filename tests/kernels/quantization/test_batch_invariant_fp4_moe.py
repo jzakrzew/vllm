@@ -292,7 +292,7 @@ def test_batch_invariant_nvfp4_moe_batch_size_invariance(
     g1_alphas = (1.0 / w1_gs).to(torch.float32)
     g2_alphas = (1.0 / w2_gs).to(torch.float32)
 
-    topk_ids_single = torch.randint(0, e, (1, topk), device=DEVICE, dtype=torch.int64)
+    topk_ids_single = torch.randint(0, e, (1, topk), device=DEVICE, dtype=torch.int32)
     topk_ids_batch = torch.cat(
         [topk_ids_single, torch.randint(0, e, (7, topk), device=DEVICE)], dim=0
     ).to(torch.int64)
@@ -386,9 +386,9 @@ def test_batch_invariant_nvfp4_moe_ignores_invalid_sentinel_routes() -> None:
         g2_alphas,
     ) = _make_nvfp4_moe_tensors(m=m, n=n, k=k, e=e, topk=1)
 
-    valid_topk_ids = torch.randint(0, e, (m, 1), device=DEVICE, dtype=torch.int64)
+    valid_topk_ids = torch.randint(0, e, (m, 1), device=DEVICE, dtype=torch.int32)
     valid_topk_weights = torch.rand((m, 1), device=DEVICE, dtype=torch.float32)
-    invalid_topk_ids = torch.full((m, 1), -1, device=DEVICE, dtype=torch.int64)
+    invalid_topk_ids = torch.full((m, 1), -1, device=DEVICE, dtype=torch.int32)
     invalid_topk_weights = torch.rand((m, 1), device=DEVICE, dtype=torch.float32)
 
     topk_ids_with_invalid = torch.cat([valid_topk_ids, invalid_topk_ids], dim=1)
@@ -487,7 +487,9 @@ def test_batch_invariant_nvfp4_moe_expert_map_invalidation_matches_local_routes(
     invalid_global_ids = invalid_global_candidates[
         torch.randint(0, invalid_global_candidates.numel(), (m, 1), device=DEVICE)
     ]
-    topk_ids_global = torch.cat([valid_global_ids, invalid_global_ids], dim=1)
+    topk_ids_global = torch.cat([valid_global_ids, invalid_global_ids], dim=1).to(
+        torch.int32
+    )
     topk_weights_global = torch.rand((m, 2), device=DEVICE, dtype=torch.float32)
 
     w13_g, w2_g = _batch_invariant_fp4_workspaces(
@@ -529,7 +531,7 @@ def test_batch_invariant_nvfp4_moe_expert_map_invalidation_matches_local_routes(
         expert_map=expert_map,
     )
 
-    topk_ids_local = expert_map[topk_ids_global[:, :1]].to(torch.int64)
+    topk_ids_local = expert_map[topk_ids_global[:, :1]].to(torch.int32)
     assert torch.all(topk_ids_local >= 0)
     out_local_only = torch.empty_like(hidden_states)
     fused_moe_batch_invariant_nvfp4(
@@ -575,7 +577,7 @@ def test_batch_invariant_nvfp4_moe_all_invalid_routes_return_zero() -> None:
         g2_alphas,
     ) = _make_nvfp4_moe_tensors(m=m, n=n, k=k, e=e, topk=1)
 
-    topk_ids = torch.full((m, 2), -1, dtype=torch.int64, device=DEVICE)
+    topk_ids = torch.full((m, 2), -1, dtype=torch.int32, device=DEVICE)
     topk_weights = torch.rand((m, 2), dtype=torch.float32, device=DEVICE)
     w13_z, w2_z = _batch_invariant_fp4_workspaces(
         m=m,
@@ -1147,7 +1149,7 @@ def test_batch_invariant_mxfp4_moe_batch_size_invariance() -> None:
 
     w13_fp4, w13_scale, w2_fp4, w2_scale, _, _ = _make_mxfp4_moe_weights(e=e, n=n, k=k)
 
-    topk_ids_single = torch.randint(0, e, (1, topk), device=DEVICE, dtype=torch.int64)
+    topk_ids_single = torch.randint(0, e, (1, topk), device=DEVICE, dtype=torch.int32)
     topk_ids_batch = torch.cat(
         [topk_ids_single, torch.randint(0, e, (7, topk), device=DEVICE)], dim=0
     ).to(torch.int64)
@@ -1215,9 +1217,9 @@ def test_batch_invariant_mxfp4_moe_ignores_invalid_sentinel_routes() -> None:
     hidden_states = torch.randn((m, k), device=DEVICE, dtype=DTYPE) / 10
     w13_fp4, w13_scale, w2_fp4, w2_scale, _, _ = _make_mxfp4_moe_weights(e=e, n=n, k=k)
 
-    valid_topk_ids = torch.randint(0, e, (m, 1), device=DEVICE, dtype=torch.int64)
+    valid_topk_ids = torch.randint(0, e, (m, 1), device=DEVICE, dtype=torch.int32)
     valid_topk_weights = torch.rand((m, 1), device=DEVICE, dtype=torch.float32)
-    invalid_topk_ids = torch.full((m, 1), -1, device=DEVICE, dtype=torch.int64)
+    invalid_topk_ids = torch.full((m, 1), -1, device=DEVICE, dtype=torch.int32)
     invalid_topk_weights = torch.rand((m, 1), device=DEVICE, dtype=torch.float32)
 
     topk_ids_with_invalid = torch.cat([valid_topk_ids, invalid_topk_ids], dim=1)
@@ -1296,7 +1298,9 @@ def test_batch_invariant_mxfp4_moe_expert_map_invalidation_matches_local_routes(
     invalid_global_ids = invalid_global_candidates[
         torch.randint(0, invalid_global_candidates.numel(), (m, 1), device=DEVICE)
     ]
-    topk_ids_global = torch.cat([valid_global_ids, invalid_global_ids], dim=1)
+    topk_ids_global = torch.cat([valid_global_ids, invalid_global_ids], dim=1).to(
+        torch.int32
+    )
     topk_weights_global = torch.rand((m, 2), device=DEVICE, dtype=torch.float32)
 
     w13_g, w2_g = _batch_invariant_fp4_workspaces(
@@ -1334,7 +1338,7 @@ def test_batch_invariant_mxfp4_moe_expert_map_invalidation_matches_local_routes(
         expert_map=expert_map,
     )
 
-    topk_ids_local = expert_map[topk_ids_global[:, :1]].to(torch.int64)
+    topk_ids_local = expert_map[topk_ids_global[:, :1]].to(torch.int32)
     assert torch.all(topk_ids_local >= 0)
     out_local_only = torch.empty_like(hidden_states)
     fused_moe_batch_invariant_mxfp4(
@@ -1366,7 +1370,7 @@ def test_batch_invariant_mxfp4_moe_all_invalid_routes_return_zero() -> None:
     hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
     w13_fp4, w13_scale, w2_fp4, w2_scale, _, _ = _make_mxfp4_moe_weights(e=e, n=n, k=k)
 
-    topk_ids = torch.full((m, 2), -1, dtype=torch.int64, device=DEVICE)
+    topk_ids = torch.full((m, 2), -1, dtype=torch.int32, device=DEVICE)
     topk_weights = torch.rand(m, 2, dtype=torch.float32, device=DEVICE)
 
     w13_z, w2_z = _batch_invariant_fp4_workspaces(
