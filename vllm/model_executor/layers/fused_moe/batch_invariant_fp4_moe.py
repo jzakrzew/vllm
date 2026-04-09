@@ -53,9 +53,22 @@ logger = init_logger(__name__)
 
 
 class _GroupedGemmAMode(Enum):
-    NVFP4_PACKED = "e2m1"
-    BF16 = "bf16"
-    MXFP8 = "e4m3"
+    NVFP4_PACKED = 0
+    BF16 = 1
+    MXFP8 = 2
+
+
+# Plain integer constants for use inside Triton kernels, which cannot resolve
+# Python Enum attribute access at compile time.
+_A_NVFP4_PACKED = tl.constexpr(int(_GroupedGemmAMode.NVFP4_PACKED.value))
+_A_BF16 = tl.constexpr(int(_GroupedGemmAMode.BF16.value))
+_A_MXFP8 = tl.constexpr(int(_GroupedGemmAMode.MXFP8.value))
+
+_A_DOT_TYPE: dict[_GroupedGemmAMode, str] = {
+    _GroupedGemmAMode.NVFP4_PACKED: "e2m1",
+    _GroupedGemmAMode.BF16: "bf16",
+    _GroupedGemmAMode.MXFP8: "e4m3",
+}
 
 
 def _batch_invariant_mxfp4_a_mode() -> _GroupedGemmAMode:
@@ -363,6 +376,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
     A_LARGE: tl.constexpr,
     B_LARGE: tl.constexpr,
     A_MODE: tl.constexpr,
+    A_DOT_TYPE: tl.constexpr,
     B_SCALE_GROUP: tl.constexpr,
     HAS_ALPHA: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -400,7 +414,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
     k_bytes_total = K_total // 2
 
     # Global descriptors created once before the loop.
-    if A_MODE == _GroupedGemmAMode.NVFP4_PACKED:
+    if A_MODE == _A_NVFP4_PACKED:
         a_desc = tl.make_tensor_descriptor(
             a_ptr,
             shape=[M_total, k_bytes_total],
@@ -424,7 +438,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
         block_shape=[BLOCK_SIZE_N, K_BYTES],
         padding_option="zero",
     )
-    if A_MODE != _GroupedGemmAMode.BF16:
+    if A_MODE != _A_BF16:
         a_scale_desc = tl.make_tensor_descriptor(
             a_scale_ptr,
             shape=[
@@ -485,11 +499,11 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
         )
 
         expert_row_offset = tl.load(expert_offsets_ptr + expert_id).to(tl.int32)
-        if A_MODE != _GroupedGemmAMode.BF16:
+        if A_MODE != _A_BF16:
             expert_scale_offset = tl.load(a_scale_offsets_ptr + expert_id).to(tl.int32)
         if A_LARGE:
             expert_row_offset = expert_row_offset.to(tl.int64)
-            if A_MODE != _GroupedGemmAMode.BF16:
+            if A_MODE != _A_BF16:
                 expert_scale_offset = expert_scale_offset.to(tl.int64)
 
         k_bytes = K // 2
@@ -524,7 +538,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
             if B_LARGE:
                 b_n_start = b_n_start.to(tl.int64)
 
-            if A_MODE == _GroupedGemmAMode.NVFP4_PACKED:
+            if A_MODE == _A_NVFP4_PACKED:
                 a = a_desc.load([a_m_start, k_start_bytes])
                 a = tl.where(m_mask[:, None] & k_byte_mask[None, :], a, 0)
             else:
@@ -551,7 +565,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
                 TILE_SCALE_COLS=SCALE_K_TILE,
             )
 
-            if A_MODE in (_GroupedGemmAMode.NVFP4_PACKED, _GroupedGemmAMode.MXFP8):
+            if A_MODE == _A_NVFP4_PACKED or A_MODE == _A_MXFP8:  # noqa: SIM109
                 scale_tile_m = (expert_scale_offset + start_m) // 128
                 if A_LARGE:
                     scale_tile_m = scale_tile_m.to(tl.int64)
@@ -567,7 +581,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
             accumulator = tl.dot_scaled(
                 a,
                 a_scale,
-                A_MODE.value,
+                A_DOT_TYPE,
                 b,
                 b_scale,
                 "e2m1",
@@ -794,7 +808,8 @@ def _grouped_matmul_nvfp4_packed(
         NUM_SMS=NUM_SMS,
         A_LARGE=A_LARGE,
         B_LARGE=B_LARGE,
-        A_MODE=_GroupedGemmAMode.NVFP4_PACKED,
+        A_MODE=_GroupedGemmAMode.NVFP4_PACKED.value,
+        A_DOT_TYPE=_A_DOT_TYPE[_GroupedGemmAMode.NVFP4_PACKED],
         B_SCALE_GROUP=16,
         HAS_ALPHA=True,
         HAS_BIAS=False,
@@ -1235,7 +1250,8 @@ def _grouped_matmul_mxfp4_packed(
         NUM_SMS=NUM_SMS,
         A_LARGE=A_LARGE,
         B_LARGE=B_LARGE,
-        A_MODE=a_mode,
+        A_MODE=a_mode.value,
+        A_DOT_TYPE=_A_DOT_TYPE[a_mode],
         B_SCALE_GROUP=32,
         HAS_ALPHA=False,
         HAS_BIAS=has_bias,
