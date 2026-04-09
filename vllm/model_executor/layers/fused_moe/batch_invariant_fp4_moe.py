@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Batch-invariant FP4 fused MoE expert implementations (NVFP4 and MXFP4)."""
 
+from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any
 
@@ -9,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
@@ -1344,13 +1346,8 @@ def fused_moe_batch_invariant_mxfp4(
 # ---------------------------------------------------------------------------
 
 
-class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
-    """Deterministic, batch-invariant FP4 MoE expert implementation.
-
-    Supports both NVFP4 (W4A4) and MXFP4 via per-expert Triton ``tl.dot_scaled``
-    GEMMs. MXFP4 keeps BF16 activations on `sm90` and switches to MXFP8
-    activations on `sm100+`. Dispatch is based on
-    ``quant_config.weight_quant_dtype``.
+class _BatchInvariantFP4ExpertsBase(mk.FusedMoEExpertsModular, ABC):
+    """Shared batch-invariant FP4 MoE expert logic (subclasses: NVFP4 vs MXFP4).
 
     **NVFP4 and expert parallel:** EP is not supported for the NVFP4 path
     (``ep_size`` must be 1). Expert maps mark non-local experts with ``-1``;
@@ -1363,23 +1360,13 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
     with padded scale rows, so EP remains available for MXFP4.
     """
 
-    _SUPPORTED_DTYPES = {"nvfp4", "mxfp4"}
-
     def __init__(
         self,
         moe_config: mk.FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config, quant_config)
-        self._quant_dtype = quant_config.weight_quant_dtype
-        assert self._quant_dtype in self._SUPPORTED_DTYPES, (
-            f"BatchInvariantFP4Experts supports {self._SUPPORTED_DTYPES}, "
-            f"got {self._quant_dtype!r}"
-        )
         self._num_local_experts = moe_config.num_local_experts
-        self._cached_scale_vecs: (
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
-        ) = None
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -1393,17 +1380,6 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
         return True
-
-    @staticmethod
-    def _supports_quant_scheme(
-        weight_key: QuantKey | None,
-        activation_key: QuantKey | None,
-    ) -> bool:
-        return (weight_key, activation_key) in {
-            (kNvfp4Static, kNvfp4Dynamic),
-            (kMxfp4Static, None),
-            (kMxfp4Static, kMxfp8Dynamic),
-        }
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
@@ -1423,6 +1399,63 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
 
+    def supports_chunking(self) -> bool:
+        return True
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        return TopKWeightAndReduceNoOP()
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        act_out_dim = self.adjust_N_for_activation(N, activation)
+        workspace13 = (M * topk, max(N, K))
+        workspace2 = (M * topk, max(act_out_dim, K))
+        output_shape = (M, K)
+        return (workspace13, workspace2, output_shape)
+
+    @abstractmethod
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool | None,
+    ) -> None: ...
+
+    def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        raise NotImplementedError("LoRA is not supported for batch-invariant FP4 MoE")
+
+
+class BatchInvariantNvfp4Experts(_BatchInvariantFP4ExpertsBase):
+    """Batch-invariant NVFP4 (W4A4) MoE experts."""
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return (weight_key, activation_key) == (kNvfp4Static, kNvfp4Dynamic)
+
     @staticmethod
     def is_supported_config(
         cls,
@@ -1431,6 +1464,17 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[bool, str | None]:
+        # Auto backend selection lists BATCH_INVARIANT last; only use it when batch
+        # invariance is requested (env) or the user pinned moe_backend explicitly.
+        if (
+            not envs.VLLM_BATCH_INVARIANT
+            and moe_config.moe_backend != "batch_invariant"
+        ):
+            return (
+                False,
+                "NvFP4 batch-invariant MoE is not available unless explicitly enabled "
+                "using VLLM_BATCH_INVARIANT=1 or moe_backend='batch_invariant'",
+            )
         # NVFP4 + EP: expert_map maps non-local experts to -1. MoE shuffle keeps a
         # fixed (M * topk, K) buffer so CUDA graphs see stable tensor shapes; valid
         # packed rows are only expert_offsets[-1]. Padding rows must not be quantized
@@ -1452,13 +1496,17 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
         )
 
     def supports_expert_map(self) -> bool:
-        return self._quant_dtype != "nvfp4"
+        return False
 
-    def supports_chunking(self) -> bool:
-        return True
-
-    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
-        return TopKWeightAndReduceNoOP()
+    def __init__(
+        self,
+        moe_config: mk.FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        super().__init__(moe_config, quant_config)
+        self._cached_scale_vecs: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
 
     def _get_nvfp4_scale_vecs(
         self,
@@ -1482,22 +1530,86 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
         )
         return self._cached_scale_vecs
 
-    def workspace_shapes(
+    def apply(
         self,
-        M: int,
-        N: int,
-        K: int,
-        topk: int,
-        global_num_experts: int,
-        local_num_experts: int,
-        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
         activation: MoEActivation,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        act_out_dim = self.adjust_N_for_activation(N, activation)
-        workspace13 = (M * topk, max(N, K))
-        workspace2 = (M * topk, max(act_out_dim, K))
-        output_shape = (M, K)
-        return (workspace13, workspace2, output_shape)
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool | None,
+    ) -> None:
+        a1_gscale_vec, a2_gscale_vec, g1_alpha_vec, g2_alpha_vec = (
+            self._get_nvfp4_scale_vecs()
+        )
+        fused_moe_batch_invariant_nvfp4(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w13_weight=w1,
+            w13_weight_scale=self.w1_scale,
+            w2_weight=w2,
+            w2_weight_scale=self.w2_scale,
+            a1_gscale=a1_gscale_vec,
+            g1_alphas=g1_alpha_vec,
+            a2_gscale=a2_gscale_vec,
+            g2_alphas=g2_alpha_vec,
+            activation=activation,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            output=output,
+            apply_router_weight_on_input=bool(apply_router_weight_on_input),
+            expert_map=expert_map,
+        )
+
+
+class BatchInvariantMxfp4Experts(_BatchInvariantFP4ExpertsBase):
+    """Batch-invariant MXFP4 MoE experts (BF16 activations on sm90, MXFP8 on sm100+)."""
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return (weight_key, activation_key) in {
+            (kMxfp4Static, None),
+            (kMxfp4Static, kMxfp8Dynamic),
+        }
+
+    @staticmethod
+    def is_supported_config(
+        cls,
+        moe_config: mk.FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        # Auto backend selection lists BATCH_INVARIANT last; only use it when batch
+        # invariance is requested (env) or the user pinned moe_backend explicitly.
+        if (
+            not envs.VLLM_BATCH_INVARIANT
+            and moe_config.moe_backend != "batch_invariant"
+        ):
+            return (
+                False,
+                "MXFP4 batch-invariant MoE is not available unless explicitly enabled "
+                "using VLLM_BATCH_INVARIANT=1 or moe_backend='batch_invariant'",
+            )
+        return mk.FusedMoEExperts.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
+
+    def supports_expert_map(self) -> bool:
+        return True
 
     def apply(
         self,
@@ -1516,59 +1628,32 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
-    ):
-        if self._quant_dtype == "nvfp4":
-            a1_gscale_vec, a2_gscale_vec, g1_alpha_vec, g2_alpha_vec = (
-                self._get_nvfp4_scale_vecs()
+    ) -> None:
+        expected_activation_key = (
+            "mxfp8"
+            if _batch_invariant_mxfp4_a_mode() == _GroupedGemmAMode.MXFP8
+            else None
+        )
+        if self.quant_dtype != expected_activation_key:
+            raise RuntimeError(
+                "BatchInvariantMxfp4Experts expected activation quant dtype "
+                f"{expected_activation_key!r} for the current device, got "
+                f"{self.quant_dtype!r}."
             )
-            fused_moe_batch_invariant_nvfp4(
-                hidden_states=hidden_states,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                w13_weight=w1,
-                w13_weight_scale=self.w1_scale,
-                w2_weight=w2,
-                w2_weight_scale=self.w2_scale,
-                a1_gscale=a1_gscale_vec,
-                g1_alphas=g1_alpha_vec,
-                a2_gscale=a2_gscale_vec,
-                g2_alphas=g2_alpha_vec,
-                activation=activation,
-                workspace13=workspace13,
-                workspace2=workspace2,
-                output=output,
-                apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                expert_map=expert_map,
-            )
-        else:
-            expected_activation_key = (
-                "mxfp8"
-                if _batch_invariant_mxfp4_a_mode() == _GroupedGemmAMode.MXFP8
-                else None
-            )
-            if self.quant_dtype != expected_activation_key:
-                raise RuntimeError(
-                    "BatchInvariantFP4Experts expected activation quant dtype "
-                    f"{expected_activation_key!r} for the current device, got "
-                    f"{self.quant_dtype!r}."
-                )
-            fused_moe_batch_invariant_mxfp4(
-                hidden_states=hidden_states,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                w13_weight=w1,
-                w13_weight_scale=self.w1_scale,
-                w2_weight=w2,
-                w2_weight_scale=self.w2_scale,
-                activation=activation,
-                workspace13=workspace13,
-                workspace2=workspace2,
-                output=output,
-                w13_bias=self.w1_bias,
-                w2_bias=self.w2_bias,
-                apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                expert_map=expert_map,
-            )
-
-    def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        raise NotImplementedError("LoRA is not supported for batch-invariant FP4 MoE")
+        fused_moe_batch_invariant_mxfp4(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w13_weight=w1,
+            w13_weight_scale=self.w1_scale,
+            w2_weight=w2,
+            w2_weight_scale=self.w2_scale,
+            activation=activation,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            output=output,
+            w13_bias=self.w1_bias,
+            w2_bias=self.w2_bias,
+            apply_router_weight_on_input=bool(apply_router_weight_on_input),
+            expert_map=expert_map,
+        )

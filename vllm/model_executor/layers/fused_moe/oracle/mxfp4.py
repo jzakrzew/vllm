@@ -146,10 +146,10 @@ def backend_to_kernel_cls(
 
     elif backend == Mxfp4MoeBackend.BATCH_INVARIANT:
         from vllm.model_executor.layers.fused_moe.batch_invariant_fp4_moe import (
-            BatchInvariantFP4Experts,
+            BatchInvariantMxfp4Experts,
         )
 
-        return [BatchInvariantFP4Experts]
+        return [BatchInvariantMxfp4Experts]
 
     else:
         raise ValueError(f"Unknown MXFP4 MoE backend: {backend.value}")
@@ -166,6 +166,7 @@ def map_mxfp4_backend(runner_backend: str) -> Mxfp4MoeBackend:
         "marlin": Mxfp4MoeBackend.MARLIN,
         "aiter": Mxfp4MoeBackend.AITER,
         "xpu": Mxfp4MoeBackend.XPU,
+        "batch_invariant": Mxfp4MoeBackend.BATCH_INVARIANT,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -189,6 +190,7 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
         Mxfp4MoeBackend.XPU,
+        Mxfp4MoeBackend.BATCH_INVARIANT,
     ]
     return _AVAILABLE_BACKENDS
 
@@ -270,20 +272,6 @@ def select_mxfp4_moe_backend(
                 logger.info_once(_make_log_backend(backend), scope="local")
                 return backend, k_cls
         raise ValueError(_make_log_unsupported(backend, reason))
-
-    if envs.VLLM_BATCH_INVARIANT:
-        backend = Mxfp4MoeBackend.BATCH_INVARIANT
-        logger.info_once(
-            "Batch-invariant mode enabled: using '%s' MXFP4 MoE backend.",
-            backend.value,
-        )
-        return _return_or_raise(
-            backend,
-            config,
-            kMxfp4Static,
-            _backend_activation_key(backend),
-            activation_format,
-        )
 
     runner_backend = config.moe_backend
     if runner_backend != "auto":

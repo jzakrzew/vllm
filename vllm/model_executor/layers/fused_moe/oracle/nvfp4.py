@@ -122,10 +122,10 @@ def backend_to_kernel_cls(
 
     elif backend == NvFp4MoeBackend.BATCH_INVARIANT:
         from vllm.model_executor.layers.fused_moe.batch_invariant_fp4_moe import (
-            BatchInvariantFP4Experts,
+            BatchInvariantNvfp4Experts,
         )
 
-        return [BatchInvariantFP4Experts]
+        return [BatchInvariantNvfp4Experts]
     else:
         raise ValueError(f"Unknown NvFP4 MoE backend: {backend.value}")
 
@@ -158,14 +158,6 @@ def select_nvfp4_moe_backend(
     Note: Shape-specific fallbacks may still occur at runtime.
     """
 
-    if envs.VLLM_BATCH_INVARIANT:
-        backend = NvFp4MoeBackend.BATCH_INVARIANT
-        logger.info_once(
-            "Batch-invariant mode enabled: using '%s' NvFp4 MoE backend.",
-            backend.value,
-        )
-        return backend, backend_to_kernel_cls(backend)[0]
-
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = [
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
@@ -174,6 +166,7 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.VLLM_CUTLASS,
         NvFp4MoeBackend.MARLIN,
+        NvFp4MoeBackend.BATCH_INVARIANT,
     ]
 
     # NOTE(rob): this is kind of a hack. We need to peak into
