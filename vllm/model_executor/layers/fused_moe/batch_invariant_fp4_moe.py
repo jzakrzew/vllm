@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Batch-invariant FP4 fused MoE expert implementations (NVFP4 and MXFP4)."""
 
+from enum import Enum
 from typing import Any
 
 import torch
@@ -29,9 +30,16 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    swizzle_blockscale,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
+    kMxfp8Dynamic,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
@@ -41,6 +49,88 @@ from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.platform_utils import num_compute_units
 
 logger = init_logger(__name__)
+
+
+class _GroupedGemmAMode(Enum):
+    NVFP4_PACKED = "e2m1"
+    BF16 = "bf16"
+    MXFP8 = "e4m3"
+
+
+def _batch_invariant_mxfp4_a_mode() -> _GroupedGemmAMode:
+    if current_platform.has_device_capability(100):
+        return _GroupedGemmAMode.MXFP8
+    if current_platform.has_device_capability(90):
+        return _GroupedGemmAMode.BF16
+    raise RuntimeError(
+        "Batch-invariant MXFP4 MoE requires a CUDA device with compute "
+        "capability >= 9.0."
+    )
+
+
+def _quantize_mxfp8_experts(
+    input_tensor: torch.Tensor,
+    problem_sizes: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize expert-packed BF16 activations to MXFP8."""
+    num_experts = problem_sizes.shape[0]
+    quant_output = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    scale_output = torch.zeros(
+        (
+            ((input_tensor.shape[0] + 127 * num_experts + 127) // 128) * 128,
+            input_tensor.shape[1] // MXFP8_BLOCK_SIZE,
+        ),
+        device=input_tensor.device,
+        dtype=torch.uint8,
+    )
+    ops.mxfp8_experts_quant(
+        input_tensor=input_tensor.contiguous(),
+        problem_sizes=problem_sizes.to(dtype=torch.int32).contiguous(),
+        expert_offsets=expert_offsets[:num_experts].to(dtype=torch.int32).contiguous(),
+        blockscale_offsets=blockscale_offsets[:num_experts]
+        .to(dtype=torch.int32)
+        .contiguous(),
+        quant_output=quant_output,
+        scale_factor=scale_output,
+    )
+    scale_output = swizzle_blockscale(scale_output.view(torch.float8_e4m3fn)).view(
+        torch.uint8
+    )
+    return quant_output, scale_output
+
+
+def _prepare_mxfp4_grouped_gemm_a(
+    a_mode: _GroupedGemmAMode,
+    bf16_activation: torch.Tensor,
+    problem_sizes: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+    *,
+    bf16_copy_workspace: torch.Tensor | None = None,
+    bf16_copy_shape: tuple[int, int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Build grouped GEMM A tensor and optional MXFP8 scales from BF16 activations.
+
+    On ``MXFP8`` (sm100+), quantize per expert. On ``BF16`` (sm90), either use
+    ``bf16_activation`` in place (GEMM1) or copy into ``bf16_copy_workspace`` so
+    GEMM2 can write ``C`` without overlapping the modular activation buffer.
+    """
+    if a_mode == _GroupedGemmAMode.MXFP8:
+        a, a_scale = _quantize_mxfp8_experts(
+            bf16_activation,
+            problem_sizes,
+            expert_offsets,
+            blockscale_offsets,
+        )
+        return a, a_scale, blockscale_offsets
+    if bf16_copy_workspace is not None:
+        assert bf16_copy_shape is not None
+        a = _resize_cache(bf16_copy_workspace, bf16_copy_shape)
+        a.copy_(bf16_activation)
+        return a, None, None
+    return bf16_activation, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +249,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
     NUM_SMS: tl.constexpr,
     A_LARGE: tl.constexpr,
     B_LARGE: tl.constexpr,
-    A_IS_FP4: tl.constexpr,
+    A_MODE: tl.constexpr,
     B_SCALE_GROUP: tl.constexpr,
     HAS_ALPHA: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -171,9 +261,10 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
     a global tile id to ``(expert_id, local_tile_id)`` via binary search,
     then executes the same GEMM tile logic as the non-persistent kernel.
 
-    When ``A_IS_FP4=True`` (NVFP4), both A and B are packed FP4 with
-    block scales.  When ``A_IS_FP4=False`` (MXFP4 W4A16), A is BF16
-    and only B has FP4 weights with block scales.
+    ``A_MODE`` selects the A-side contract:
+    - NVFP4 packed FP4 + block scales
+    - BF16/FP16 dense activations without A scales
+    - MXFP8 dense FP8 activations with block scales
 
     B and B-scale tensors are pre-flattened by the wrapper:
     ``b_fp4`` from ``[E, N, K_packed]`` to ``[E*N, K_packed]``, and
@@ -196,7 +287,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
     k_bytes_total = K_total // 2
 
     # Global descriptors created once before the loop.
-    if A_IS_FP4:
+    if A_MODE == _GroupedGemmAMode.NVFP4_PACKED:
         a_desc = tl.make_tensor_descriptor(
             a_ptr,
             shape=[M_total, k_bytes_total],
@@ -220,7 +311,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
         block_shape=[BLOCK_SIZE_N, K_BYTES],
         padding_option="zero",
     )
-    if A_IS_FP4:
+    if A_MODE != _GroupedGemmAMode.BF16:
         a_scale_desc = tl.make_tensor_descriptor(
             a_scale_ptr,
             shape=[
@@ -281,11 +372,11 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
         )
 
         expert_row_offset = tl.load(expert_offsets_ptr + expert_id).to(tl.int32)
-        if A_IS_FP4:
+        if A_MODE != _GroupedGemmAMode.BF16:
             expert_scale_offset = tl.load(a_scale_offsets_ptr + expert_id).to(tl.int32)
         if A_LARGE:
             expert_row_offset = expert_row_offset.to(tl.int64)
-            if A_IS_FP4:
+            if A_MODE != _GroupedGemmAMode.BF16:
                 expert_scale_offset = expert_scale_offset.to(tl.int64)
 
         k_bytes = K // 2
@@ -320,7 +411,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
             if B_LARGE:
                 b_n_start = b_n_start.to(tl.int64)
 
-            if A_IS_FP4:
+            if A_MODE == _GroupedGemmAMode.NVFP4_PACKED:
                 a = a_desc.load([a_m_start, k_start_bytes])
                 a = tl.where(m_mask[:, None] & k_byte_mask[None, :], a, 0)
             else:
@@ -347,7 +438,7 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
                 TILE_SCALE_COLS=SCALE_K_TILE,
             )
 
-            if A_IS_FP4:
+            if A_MODE in (_GroupedGemmAMode.NVFP4_PACKED, _GroupedGemmAMode.MXFP8):
                 scale_tile_m = (expert_scale_offset + start_m) // 128
                 if A_LARGE:
                     scale_tile_m = scale_tile_m.to(tl.int64)
@@ -357,25 +448,18 @@ def _grouped_matmul_fp4_packed_persistent_kernel(
                     TILE_ROWS=BLOCK_SIZE_M,
                     TILE_SCALE_COLS=SCALE_K_TILE,
                 )
-                accumulator = tl.dot_scaled(
-                    a,
-                    a_scale,
-                    "e2m1",
-                    b,
-                    b_scale,
-                    "e2m1",
-                    accumulator,
-                )
             else:
-                accumulator = tl.dot_scaled(
-                    a,
-                    None,
-                    "bf16",
-                    b,
-                    b_scale,
-                    "e2m1",
-                    accumulator,
-                )
+                a_scale = None
+
+            accumulator = tl.dot_scaled(
+                a,
+                a_scale,
+                A_MODE.value,
+                b,
+                b_scale,
+                "e2m1",
+                accumulator,
+            )
 
         if HAS_ALPHA:
             accumulator *= alpha
@@ -604,7 +688,7 @@ def _grouped_matmul_nvfp4_packed(
         NUM_SMS=NUM_SMS,
         A_LARGE=A_LARGE,
         B_LARGE=B_LARGE,
-        A_IS_FP4=True,
+        A_MODE=_GroupedGemmAMode.NVFP4_PACKED,
         B_SCALE_GROUP=16,
         HAS_ALPHA=True,
         HAS_BIAS=False,
@@ -853,12 +937,12 @@ def fused_moe_batch_invariant_nvfp4(
 
 
 # ---------------------------------------------------------------------------
-# MXFP4 (W4A16) grouped GEMM wrapper
+# MXFP4 grouped GEMM wrapper
 # ---------------------------------------------------------------------------
 
 
 def _grouped_matmul_mxfp4_packed(
-    a_bf16: torch.Tensor,
+    a: torch.Tensor,
     b_fp4: torch.Tensor,
     b_scale: torch.Tensor,
     expert_offsets: torch.Tensor,
@@ -866,30 +950,57 @@ def _grouped_matmul_mxfp4_packed(
     *,
     output: torch.Tensor,
     bias: torch.Tensor | None = None,
+    a_scale: torch.Tensor | None = None,
+    a_scale_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Packed grouped MXFP4 W4A16 GEMM (BF16 activations, MXFP4 weights).
+    """Packed grouped MXFP4 GEMM with device-aware activation format.
+
+    Activation layout is inferred from ``a.dtype``: BF16/FP16 use dense
+    activations; ``float8_e4m3fn`` uses MXFP8 with ``a_scale`` /
+    ``a_scale_offsets``.
 
     Args:
-        a_bf16: [M_total, K] bfloat16 activations in expert-packed row order.
+        a: [M_total, K] activations in expert-packed row order (BF16/FP16 or
+            MXFP8 ``float8_e4m3fn``).
         b_fp4: [E, N_max, K_packed] uint8 packed FP4 expert weights.
         b_scale: [E, N_pad, K_s] swizzled weight block scales (group 32).
-        expert_offsets: [E] or [E+1] start row offsets in ``a_bf16``/output.
+        expert_offsets: [E] or [E+1] start row offsets in ``a``/output.
         problem_sizes: [E, 3] int tensor containing per-expert (M, N, K).
         bias: Optional [E, N] per-expert bias added after the GEMM.
+        a_scale: [M_scale_pad, K_scale_pad] swizzled activation scales for
+            MXFP8 ``a``; must be ``None`` for BF16/FP16.
+        a_scale_offsets: [E] or [E+1] row offsets into ``a_scale`` for each
+            expert for MXFP8; must be ``None`` for BF16/FP16.
         output: Pre-allocated output tensor (shape [>= M_total, >= N_max]).
 
     Returns:
         [M_total, N_max] tensor with grouped expert GEMM outputs.
     """
-    assert a_bf16.ndim == 2 and b_fp4.ndim == 3
-    assert a_bf16.dtype in (torch.bfloat16, torch.float16)
+    if a.dtype in (torch.bfloat16, torch.float16):
+        a_mode = _GroupedGemmAMode.BF16
+        assert a.ndim == 2
+        assert a_scale is None and a_scale_offsets is None
+        a_tensor = a
+    elif a.dtype == torch.float8_e4m3fn:
+        a_mode = _GroupedGemmAMode.MXFP8
+        assert a_scale is not None and a_scale_offsets is not None
+        assert a.ndim == 2
+        assert a_scale.ndim == 2 and a_scale.dtype == torch.uint8
+        a_tensor = a
+    else:
+        raise RuntimeError(
+            "Unsupported activation dtype for MXFP4 grouped GEMM: "
+            f"{a.dtype} (expected bfloat16, float16, or float8_e4m3fn)."
+        )
+
+    assert a_tensor.ndim == 2 and b_fp4.ndim == 3
     assert b_fp4.dtype == torch.uint8
     assert b_scale.ndim == 3
     assert problem_sizes.ndim == 2 and problem_sizes.shape[1] == 3
 
     E = b_fp4.shape[0]
     if E == 0:
-        M_logical = a_bf16.shape[0]
+        M_logical = a_tensor.shape[0]
         N_out = b_fp4.shape[1]
         return output.flatten()[: M_logical * N_out].view(M_logical, N_out)
 
@@ -899,17 +1010,23 @@ def _grouped_matmul_mxfp4_packed(
         expert_offsets, num_experts=E, name="expert_offsets"
     )
     problem_sizes = problem_sizes.to(dtype=torch.int32).contiguous()
-    if not a_bf16.is_contiguous():
-        a_bf16 = a_bf16.contiguous()
+    if not a_tensor.is_contiguous():
+        a_tensor = a_tensor.contiguous()
     if not b_scale.is_contiguous():
         b_scale = b_scale.contiguous()
+    if a_scale is not None and not a_scale.is_contiguous():
+        a_scale = a_scale.contiguous()
+    if a_mode == _GroupedGemmAMode.MXFP8:
+        a_scale_offsets = _canonicalize_grouped_offsets(
+            a_scale_offsets, num_experts=E, name="a_scale_offsets"
+        )
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 128
 
-    M_logical = a_bf16.shape[0]
-    K = a_bf16.shape[1]
+    M_logical = a_tensor.shape[0]
+    K = a_tensor.shape[1]
 
     max_tiles_m = triton.cdiv(M_logical, BLOCK_SIZE_M)
     max_tiles_n = triton.cdiv(b_fp4.shape[1], BLOCK_SIZE_N)
@@ -921,9 +1038,10 @@ def _grouped_matmul_mxfp4_packed(
     if max_tiles_per_expert == 0:
         return c_work
 
-    A_LARGE = max(a_bf16.numel(), c_work.numel()) > 2**31
+    a_scale_numel = 0 if a_scale is None else a_scale.numel()
+    A_LARGE = max(a_tensor.numel(), a_scale_numel, c_work.numel()) > 2**31
     B_LARGE = max(b_fp4.numel(), b_scale.numel()) > 2**31
-    NUM_SMS = num_compute_units(a_bf16.device.index)
+    NUM_SMS = num_compute_units(a_tensor.device.index)
     worst_case_tiles = E * max_tiles_per_expert
 
     M_per_expert = problem_sizes[:, 0].to(torch.int32).clamp(min=0)
@@ -943,58 +1061,71 @@ def _grouped_matmul_mxfp4_packed(
         )
         * valid.to(torch.int32)
     )
-    expert_tile_start = torch.zeros(E + 1, dtype=torch.int32, device=a_bf16.device)
+    expert_tile_start = torch.zeros(E + 1, dtype=torch.int32, device=a_tensor.device)
     expert_tile_start[1:] = torch.cumsum(tiles_per_expert, dim=0)
 
     b_fp4_flat = b_fp4.reshape(-1, b_fp4.shape[2])
     b_scale_flat = b_scale.reshape(-1, b_scale.shape[2])
 
     # Dummy tensors for unused A-scale and alpha kernel arguments.
-    dummy_a_scale = torch.empty(0, device=a_bf16.device, dtype=torch.uint8)
-    dummy_alpha = torch.empty(0, device=a_bf16.device, dtype=torch.float32)
-    dummy_a_scale_offsets = expert_offsets
+    if a_scale is None:
+        kernel_a_scale = torch.empty(0, device=a_tensor.device, dtype=torch.uint8)
+        kernel_a_scale_offsets = expert_offsets
+        a_scale_rows_total = 0
+        a_scale_cols_total = 0
+        stride_asm = 0
+        stride_ask = 0
+    else:
+        kernel_a_scale = a_scale
+        assert a_scale_offsets is not None
+        kernel_a_scale_offsets = a_scale_offsets
+        a_scale_rows_total = a_scale.shape[0]
+        a_scale_cols_total = a_scale.shape[1]
+        stride_asm = a_scale.stride(0)
+        stride_ask = a_scale.stride(1)
+    dummy_alpha = torch.empty(0, device=a_tensor.device, dtype=torch.float32)
 
     has_bias = bias is not None
     bias_tensor = (
         bias
         if bias is not None
-        else torch.empty(0, device=a_bf16.device, dtype=torch.float32)
+        else torch.empty(0, device=a_tensor.device, dtype=torch.float32)
     )
 
     # TMA tensor descriptors allocate host-side metadata; Triton requires an allocator.
-    set_triton_allocator(a_bf16.device)
+    set_triton_allocator(a_tensor.device)
 
     grid = (min(NUM_SMS, worst_case_tiles),)
     _grouped_matmul_fp4_packed_persistent_kernel[grid](
-        a_bf16,
-        dummy_a_scale,
+        a_tensor,
+        kernel_a_scale,
         b_fp4_flat,
         b_scale_flat,
         c_work,
         dummy_alpha,
         bias_tensor,
         expert_offsets,
-        dummy_a_scale_offsets,
+        kernel_a_scale_offsets,
         problem_sizes,
         expert_tile_start,
         E,
-        a_bf16.shape[0],
+        a_tensor.shape[0],
         b_fp4.shape[1],
         K,
-        0,  # a_scale_rows_total (unused)
+        a_scale_rows_total,
         problem_sizes.stride(0),
         problem_sizes.stride(1),
-        a_bf16.stride(0),
-        a_bf16.stride(1),
-        0,  # stride_asm (unused)
-        0,  # stride_ask (unused)
+        a_tensor.stride(0),
+        a_tensor.stride(1),
+        stride_asm,
+        stride_ask,
         b_fp4_flat.stride(0),
         b_fp4_flat.stride(1),
         b_scale_flat.stride(1),
         c_work.stride(0),
         c_work.stride(1),
         bias_tensor.stride(0) if has_bias else 0,
-        0,  # a_scale_cols_total (unused)
+        a_scale_cols_total,
         b_scale.shape[2],
         b_scale.shape[1],
         BLOCK_SIZE_M=BLOCK_SIZE_M,
@@ -1004,7 +1135,7 @@ def _grouped_matmul_mxfp4_packed(
         NUM_SMS=NUM_SMS,
         A_LARGE=A_LARGE,
         B_LARGE=B_LARGE,
-        A_IS_FP4=False,
+        A_MODE=a_mode,
         B_SCALE_GROUP=32,
         HAS_ALPHA=False,
         HAS_BIAS=has_bias,
@@ -1015,7 +1146,7 @@ def _grouped_matmul_mxfp4_packed(
 
 
 # ---------------------------------------------------------------------------
-# Standalone deterministic MXFP4 W4A16 MoE implementation
+# Standalone deterministic MXFP4 MoE implementation
 # ---------------------------------------------------------------------------
 
 
@@ -1038,13 +1169,11 @@ def fused_moe_batch_invariant_mxfp4(
     expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Deterministic MXFP4 W4A16 MoE using packed routing and grouped GEMMs.
+    Deterministic MXFP4 MoE using packed routing and grouped GEMMs.
 
-    Activations stay in BF16 throughout (no FP4 activation quantization).
-    After the activation, activations are copied from ``workspace2`` into
-    ``workspace13`` so GEMM2 can read A from ``workspace13`` and write C into
-    ``workspace2`` (avoiding overlap with ``fused_out`` in the modular kernel
-    and avoiding A/C aliasing in a single buffer).
+    On Hopper (`sm90`) the MXFP4 path keeps BF16 activations. On Blackwell
+    (`sm100+`) the same path quantizes GEMM inputs to MXFP8 while keeping
+    GEMM outputs in BF16.
     """
     assert hidden_states.ndim == 2, (
         f"Expected 2D hidden_states, got {hidden_states.shape}."
@@ -1091,6 +1220,7 @@ def fused_moe_batch_invariant_mxfp4(
         packed_hidden_states = hidden_states
 
     device = hidden_states.device
+    a_mode = _batch_invariant_mxfp4_a_mode()
     w1_output_size = w13_weight.shape[1]
     activation_out_dim = (
         w1_output_size // 2 if activation_kind.is_gated else w1_output_size
@@ -1139,39 +1269,55 @@ def fused_moe_batch_invariant_mxfp4(
 
     packed_hidden_states = ops.shuffle_rows(packed_hidden_states, a_map)
 
-    # GEMM1: BF16 activations x MXFP4 weights
+    a1, a1_scale, a_scale_offsets = _prepare_mxfp4_grouped_gemm_a(
+        a_mode,
+        packed_hidden_states,
+        problem_sizes1,
+        expert_offsets,
+        blockscale_offsets,
+    )
+
     gemm1_out = _grouped_matmul_mxfp4_packed(
-        a_bf16=packed_hidden_states,
-        b_fp4=w13_weight,
-        b_scale=w13_weight_scale,
-        expert_offsets=expert_offsets,
-        problem_sizes=problem_sizes1,
+        a1,
+        w13_weight,
+        w13_weight_scale,
+        expert_offsets,
+        problem_sizes1,
         output=workspace13,
         bias=w13_bias,
+        a_scale=a1_scale,
+        a_scale_offsets=a_scale_offsets,
     )
     if gemm1_out.shape[-1] != w1_output_size:
         gemm1_out = gemm1_out[:, :w1_output_size].contiguous()
 
-    # Activation into workspace2; copy A to workspace13 so GEMM2 can write C
-    # to workspace2 without overlapping A or the modular fused_out slab.
+    # Activation always writes BF16 into workspace2.
     act_out = _resize_cache(workspace2, (M_total, activation_out_dim))
     apply_moe_activation(
         activation=activation_kind,
         output=act_out,
         input=gemm1_out,
     )
-    gemm2_a = _resize_cache(workspace13, (M_total, activation_out_dim))
-    gemm2_a.copy_(act_out)
+    gemm2_a, gemm2_a_scale, gemm2_a_scale_offsets = _prepare_mxfp4_grouped_gemm_a(
+        a_mode,
+        act_out,
+        problem_sizes2,
+        expert_offsets,
+        blockscale_offsets,
+        bf16_copy_workspace=workspace13,
+        bf16_copy_shape=(M_total, activation_out_dim),
+    )
 
-    # GEMM2: BF16 activation output x MXFP4 weights
     gemm2_out = _grouped_matmul_mxfp4_packed(
-        a_bf16=gemm2_a,
-        b_fp4=w2_weight,
-        b_scale=w2_weight_scale,
-        expert_offsets=expert_offsets,
-        problem_sizes=problem_sizes2,
+        gemm2_a,
+        w2_weight,
+        w2_weight_scale,
+        expert_offsets,
+        problem_sizes2,
         output=workspace2,
         bias=w2_bias,
+        a_scale=gemm2_a_scale,
+        a_scale_offsets=gemm2_a_scale_offsets,
     )
     if gemm2_out.shape[-1] != w2_output_size:
         gemm2_out = gemm2_out[:, :w2_output_size].contiguous()
@@ -1201,9 +1347,10 @@ def fused_moe_batch_invariant_mxfp4(
 class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
     """Deterministic, batch-invariant FP4 MoE expert implementation.
 
-    Supports both NVFP4 (W4A4) and MXFP4 (W4A16) via per-expert Triton
-    ``tl.dot_scaled`` GEMMs.  Dispatches to the appropriate wrapper based
-    on ``quant_config.weight_quant_dtype``.
+    Supports both NVFP4 (W4A4) and MXFP4 via per-expert Triton ``tl.dot_scaled``
+    GEMMs. MXFP4 keeps BF16 activations on `sm90` and switches to MXFP8
+    activations on `sm100+`. Dispatch is based on
+    ``quant_config.weight_quant_dtype``.
 
     **NVFP4 and expert parallel:** EP is not supported for the NVFP4 path
     (``ep_size`` must be 1). Expert maps mark non-local experts with ``-1``;
@@ -1212,7 +1359,8 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
     The libtorch/stable NVFP4 expert quant kernels
     (``torch.ops._C.scaled_fp4_experts_quant`` / ``nvfp4_experts_quant.cu``) are
     tightly coupled to that layout. MXFP4 uses BF16 activations and does not use
-    those kernels, so EP remains available for MXFP4.
+    those kernels on `sm90`; on `sm100+`, MXFP4 uses MXFP8 expert quantization
+    with padded scale rows, so EP remains available for MXFP4.
     """
 
     _SUPPORTED_DTYPES = {"nvfp4", "mxfp4"}
@@ -1240,7 +1388,7 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
-        return p.is_cuda() and p.has_device_capability(100)
+        return p.is_cuda() and p.has_device_capability(90)
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -1254,6 +1402,7 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
         return (weight_key, activation_key) in {
             (kNvfp4Static, kNvfp4Dynamic),
             (kMxfp4Static, None),
+            (kMxfp4Static, kMxfp8Dynamic),
         }
 
     @staticmethod
@@ -1392,6 +1541,17 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
                 expert_map=expert_map,
             )
         else:
+            expected_activation_key = (
+                "mxfp8"
+                if _batch_invariant_mxfp4_a_mode() == _GroupedGemmAMode.MXFP8
+                else None
+            )
+            if self.quant_dtype != expected_activation_key:
+                raise RuntimeError(
+                    "BatchInvariantFP4Experts expected activation quant dtype "
+                    f"{expected_activation_key!r} for the current device, got "
+                    f"{self.quant_dtype!r}."
+                )
             fused_moe_batch_invariant_mxfp4(
                 hidden_states=hidden_states,
                 topk_ids=topk_ids,
@@ -1412,7 +1572,3 @@ class BatchInvariantFP4Experts(mk.FusedMoEExpertsModular):
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for batch-invariant FP4 MoE")
-
-
-# Backward-compatible alias for existing imports.
-BatchInvariantNvfp4Experts = BatchInvariantFP4Experts

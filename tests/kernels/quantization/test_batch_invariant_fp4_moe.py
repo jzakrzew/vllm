@@ -15,6 +15,7 @@ from vllm.model_executor.layers.fused_moe.activation import (
 from vllm.model_executor.layers.fused_moe.batch_invariant_fp4_moe import (
     _grouped_matmul_mxfp4_packed,
     _grouped_matmul_nvfp4_packed,
+    _quantize_mxfp8_experts,
     fused_moe_batch_invariant_mxfp4,
     fused_moe_batch_invariant_nvfp4,
 )
@@ -22,6 +23,10 @@ from vllm.model_executor.layers.fused_moe.config import nvfp4_moe_quant_config
 from vllm.model_executor.layers.fused_moe.cutlass_moe import CutlassExpertsFp4
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoDPEPModular,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    dequant_mxfp8_to_bf16,
+    mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     pad_nvfp4_activation_for_cutlass,
@@ -32,9 +37,18 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.torch_utils import set_random_seed
 
-if not current_platform.has_device_capability(100):
+HAS_SM90 = current_platform.has_device_capability(90)
+HAS_SM100 = current_platform.has_device_capability(100)
+REQUIRES_SM100 = pytest.mark.skipif(
+    not HAS_SM100,
+    reason="Batch-invariant NVFP4 and MXFP8-activation "
+    "coverage requires Blackwell (sm100+).",
+)
+USES_MXFP8_ACTIVATIONS = HAS_SM100
+
+if not HAS_SM90:
     pytest.skip(
-        reason="Batch-invariant NVFP4 MoE requires Blackwell (sm100+) support.",
+        reason="Batch-invariant FP4 MoE requires Hopper or newer (sm90+).",
         allow_module_level=True,
     )
 
@@ -48,6 +62,13 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda:0"
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0
+
+
+def _maybe_quantize_mxfp8_reference(x: torch.Tensor) -> torch.Tensor:
+    if not USES_MXFP8_ACTIVATIONS:
+        return x
+    x_q, x_scale = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=False)
+    return dequant_mxfp8_to_bf16(x_q, x_scale).to(x.dtype)
 
 
 def _batch_invariant_fp4_workspaces(
@@ -136,6 +157,7 @@ def _make_nvfp4_moe_tensors(
     )
 
 
+@REQUIRES_SM100
 @pytest.mark.parametrize(
     "topk,apply_router_weight_on_input",
     [
@@ -229,6 +251,7 @@ def test_batch_invariant_nvfp4_moe_matches_cutlass(
         torch.testing.assert_close(fallback_out, cutlass_out, atol=1e-1, rtol=1e-1)
 
 
+@REQUIRES_SM100
 @pytest.mark.parametrize(
     "topk,apply_router_weight_on_input",
     [
@@ -344,6 +367,7 @@ def test_batch_invariant_nvfp4_moe_batch_size_invariance(
 @pytest.mark.skip(
     reason="NVFP4 MoE expert parallelism not supported; test fails until then.",
 )
+@REQUIRES_SM100
 @torch.inference_mode()
 def test_batch_invariant_nvfp4_moe_ignores_invalid_sentinel_routes() -> None:
     set_random_seed(23)
@@ -426,6 +450,7 @@ def test_batch_invariant_nvfp4_moe_ignores_invalid_sentinel_routes() -> None:
 @pytest.mark.skip(
     reason="NVFP4 MoE expert parallelism not supported; test fails until then.",
 )
+@REQUIRES_SM100
 @torch.inference_mode()
 def test_batch_invariant_nvfp4_moe_expert_map_invalidation_matches_local_routes() -> (
     None
@@ -531,6 +556,7 @@ def test_batch_invariant_nvfp4_moe_expert_map_invalidation_matches_local_routes(
     )
 
 
+@REQUIRES_SM100
 @torch.inference_mode()
 def test_batch_invariant_nvfp4_moe_all_invalid_routes_return_zero() -> None:
     set_random_seed(31)
@@ -582,6 +608,7 @@ def test_batch_invariant_nvfp4_moe_all_invalid_routes_return_zero() -> None:
     torch.testing.assert_close(out, torch.zeros_like(out), atol=0.0, rtol=0.0)
 
 
+@REQUIRES_SM100
 @torch.inference_mode()
 def test_grouped_matmul_nvfp4_packed_matches_cutlass_reference() -> None:
     set_random_seed(17)
@@ -872,7 +899,7 @@ def _reference_fused_moe_mxfp4_dequant(
     w13_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Slow BF16 reference: dequantize MXFP4 weights, then MoE forward in PyTorch."""
+    """Reference MXFP4 MoE with BF16 or MXFP8-quantized activations."""
     device = hidden_states.device
     dtype = hidden_states.dtype
     m, hidden_dim = hidden_states.shape
@@ -913,6 +940,7 @@ def _reference_fused_moe_mxfp4_dequant(
             x = hidden_states[i : i + 1]
             if apply_router_weight_on_input:
                 x = x * w
+            x = _maybe_quantize_mxfp8_reference(x)
             gemm1_out = x @ w13_deq[eid].T
             if w13_bias is not None:
                 gemm1_out = gemm1_out + w13_bias[eid : eid + 1].to(dtype)
@@ -922,6 +950,7 @@ def _reference_fused_moe_mxfp4_dequant(
                 act_dim = gemm1_out.shape[-1]
             act_buf = torch.empty(1, act_dim, device=device, dtype=dtype)
             apply_moe_activation(act_kind, act_buf, gemm1_out)
+            act_buf = _maybe_quantize_mxfp8_reference(act_buf)
             y = act_buf @ w2_deq[eid].T
             if w2_bias is not None:
                 y = y + w2_bias[eid : eid + 1].to(dtype)
@@ -956,7 +985,7 @@ def test_batch_invariant_mxfp4_moe_matches_dequant_reference(
     topk: int,
     apply_router_weight_on_input: bool,
 ) -> None:
-    """``fused_moe_batch_invariant_mxfp4`` matches a BF16 MoE with dequant weights."""
+    """``fused_moe_batch_invariant_mxfp4`` matches the device-aware reference."""
     set_random_seed(42)
 
     hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
@@ -1548,7 +1577,7 @@ def test_grouped_matmul_mxfp4_packed_matches_reference(
     N: int,
     K: int,
 ) -> None:
-    """_grouped_matmul_mxfp4_packed must match a per-expert BF16 dequant reference."""
+    """_grouped_matmul_mxfp4_packed must match the device-aware reference."""
     set_random_seed(60)
 
     # Filter out zero-M experts for weight generation but keep them in
@@ -1584,6 +1613,14 @@ def test_grouped_matmul_mxfp4_packed_matches_reference(
         expert_offsets.append(row_offset)
         row_offset += rows
     expert_offsets_t = torch.tensor(expert_offsets, dtype=torch.int32, device=DEVICE)
+    blockscale_offsets = []
+    scale_row_offset = 0
+    for rows in per_expert_rows:
+        blockscale_offsets.append(scale_row_offset)
+        scale_row_offset += ((rows + 127) // 128) * 128
+    blockscale_offsets_t = torch.tensor(
+        blockscale_offsets, dtype=torch.int32, device=DEVICE
+    )
     problem_sizes_t = torch.tensor(
         [[rows, N, K] for rows in per_expert_rows],
         dtype=torch.int32,
@@ -1591,21 +1628,40 @@ def test_grouped_matmul_mxfp4_packed_matches_reference(
     )
 
     packed_out = torch.empty((row_offset, b_fp4_t.shape[1]), device=DEVICE, dtype=DTYPE)
-    _grouped_matmul_mxfp4_packed(
-        a_bf16=a_bf16,
-        b_fp4=b_fp4_t,
-        b_scale=b_scale_t,
-        expert_offsets=expert_offsets_t,
-        problem_sizes=problem_sizes_t,
-        output=packed_out,
-    )
+    if USES_MXFP8_ACTIVATIONS:
+        a_fp8, a_scale = _quantize_mxfp8_experts(
+            a_bf16,
+            problem_sizes_t,
+            expert_offsets_t,
+            blockscale_offsets_t,
+        )
+        _grouped_matmul_mxfp4_packed(
+            a_fp8,
+            b_fp4_t,
+            b_scale_t,
+            expert_offsets_t,
+            problem_sizes_t,
+            output=packed_out,
+            a_scale=a_scale,
+            a_scale_offsets=blockscale_offsets_t,
+        )
+    else:
+        _grouped_matmul_mxfp4_packed(
+            a_bf16,
+            b_fp4_t,
+            b_scale_t,
+            expert_offsets_t,
+            problem_sizes_t,
+            output=packed_out,
+        )
 
     ref_outputs = []
     for i, rows in enumerate(per_expert_rows):
         if rows == 0:
             continue
         w_deq = _dequant_mxfp4(packed_b_fp4[i], packed_b_scale[i]).to(DTYPE)
-        ref = xs[i] @ w_deq.T
+        x_ref = _maybe_quantize_mxfp8_reference(xs[i])
+        ref = x_ref @ w_deq.T
         ref_outputs.append(ref)
 
     if packed_out.shape[1] != N:
@@ -1646,7 +1702,7 @@ def test_batch_invariant_mxfp4_moe_with_bias(
     apply_router_weight_on_input: bool,
 ) -> None:
     """``fused_moe_batch_invariant_mxfp4`` with non-zero expert biases
-    must match a BF16 dequant reference that also applies the biases."""
+    must match the device-aware reference that also applies the biases."""
     set_random_seed(42)
 
     hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10

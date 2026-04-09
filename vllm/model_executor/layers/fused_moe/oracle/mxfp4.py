@@ -198,6 +198,9 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     if backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+    ) or (
+        backend == Mxfp4MoeBackend.BATCH_INVARIANT
+        and current_platform.has_device_capability(100)
     ):
         return kMxfp8Dynamic
     return None
@@ -210,14 +213,6 @@ def select_mxfp4_moe_backend(
     Select the primary MXFP4 MoE backend.
     Note: Shape-specific fallbacks may still occur at runtime.
     """
-    if envs.VLLM_BATCH_INVARIANT:
-        backend = Mxfp4MoeBackend.BATCH_INVARIANT
-        logger.info_once(
-            "Batch-invariant mode enabled: using '%s' MXFP4 MoE backend.",
-            backend.value,
-        )
-        return backend, backend_to_kernel_cls(backend)[0]
-
     triton_kernels_supported = has_triton_kernels() and (
         9,
         0,
@@ -275,6 +270,20 @@ def select_mxfp4_moe_backend(
                 logger.info_once(_make_log_backend(backend), scope="local")
                 return backend, k_cls
         raise ValueError(_make_log_unsupported(backend, reason))
+
+    if envs.VLLM_BATCH_INVARIANT:
+        backend = Mxfp4MoeBackend.BATCH_INVARIANT
+        logger.info_once(
+            "Batch-invariant mode enabled: using '%s' MXFP4 MoE backend.",
+            backend.value,
+        )
+        return _return_or_raise(
+            backend,
+            config,
+            kMxfp4Static,
+            _backend_activation_key(backend),
+            activation_format,
+        )
 
     runner_backend = config.moe_backend
     if runner_backend != "auto":
@@ -844,6 +853,20 @@ def make_mxfp4_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.BATCH_INVARIANT:
+        if current_platform.has_device_capability(100):
+            return mxfp4_mxfp8_moe_quant_config(
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+            )
+        return mxfp4_w4a16_moe_quant_config(
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+        )
     elif mxfp4_backend in (
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
@@ -852,7 +875,6 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.AITER,
-        Mxfp4MoeBackend.BATCH_INVARIANT,
     ):
         return mxfp4_w4a16_moe_quant_config(
             w1_bias=w1_bias,

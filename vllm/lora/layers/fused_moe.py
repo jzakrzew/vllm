@@ -155,7 +155,19 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 ),
             )
 
-        if quant_config.use_mxfp4_w4a16:
+        if envs.VLLM_BATCH_INVARIANT and quant_config.weight_quant_dtype in {
+            "mxfp4",
+            "nvfp4",
+        }:
+            from vllm.model_executor.layers.fused_moe.batch_invariant_fp4_moe import (
+                BatchInvariantFP4Experts,
+            )
+
+            assert isinstance(
+                m_fused_moe_fn.impl.fused_experts,
+                BatchInvariantFP4Experts,
+            )
+        elif quant_config.use_mxfp4_w4a16:
             assert isinstance(
                 m_fused_moe_fn.impl.fused_experts,
                 (MarlinExperts, UnfusedOAITritonExperts),
