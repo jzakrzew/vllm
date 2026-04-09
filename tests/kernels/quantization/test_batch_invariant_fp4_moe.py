@@ -169,6 +169,7 @@ def _make_nvfp4_moe_tensors(
 )
 @torch.inference_mode()
 def test_batch_invariant_nvfp4_moe_matches_cutlass(
+    workspace_init,
     topk: int,
     apply_router_weight_on_input: bool,
 ) -> None:
@@ -294,8 +295,12 @@ def test_batch_invariant_nvfp4_moe_batch_size_invariance(
 
     topk_ids_single = torch.randint(0, e, (1, topk), device=DEVICE, dtype=torch.int32)
     topk_ids_batch = torch.cat(
-        [topk_ids_single, torch.randint(0, e, (7, topk), device=DEVICE)], dim=0
-    ).to(torch.int64)
+        [
+            topk_ids_single,
+            torch.randint(0, e, (7, topk), device=DEVICE, dtype=torch.int32),
+        ],
+        dim=0,
+    )
 
     topk_weights_single = torch.rand((1, topk), device=DEVICE, dtype=torch.float32)
     topk_weights_single /= topk_weights_single.sum(dim=-1, keepdim=True)
@@ -1151,8 +1156,12 @@ def test_batch_invariant_mxfp4_moe_batch_size_invariance() -> None:
 
     topk_ids_single = torch.randint(0, e, (1, topk), device=DEVICE, dtype=torch.int32)
     topk_ids_batch = torch.cat(
-        [topk_ids_single, torch.randint(0, e, (7, topk), device=DEVICE)], dim=0
-    ).to(torch.int64)
+        [
+            topk_ids_single,
+            torch.randint(0, e, (7, topk), device=DEVICE, dtype=torch.int32),
+        ],
+        dim=0,
+    )
     topk_weights_single = torch.rand(1, topk, device=DEVICE, dtype=torch.float32)
     topk_weights_single /= topk_weights_single.sum(dim=-1, keepdim=True)
     topk_weights_batch = torch.rand(8, topk, device=DEVICE, dtype=torch.float32)
