@@ -61,6 +61,8 @@ class Mxfp4MoeBackend(Enum):
     TRITON_UNFUSED = "TRITON_UNFUSED"
     # XPU
     XPU = "XPU"
+    # Batch-invariant Triton path
+    BATCH_INVARIANT = "BATCH_INVARIANT"
 
 
 # Backends that share the same TRTLLM weight format
@@ -142,6 +144,13 @@ def backend_to_kernel_cls(
 
         return [XPUExpertsMXFp4]
 
+    elif backend == Mxfp4MoeBackend.BATCH_INVARIANT:
+        from vllm.model_executor.layers.fused_moe.batch_invariant_fp4_moe import (
+            BatchInvariantMxfp4Experts,
+        )
+
+        return [BatchInvariantMxfp4Experts]
+
     else:
         raise ValueError(f"Unknown MXFP4 MoE backend: {backend.value}")
 
@@ -153,6 +162,7 @@ def map_mxfp4_backend(runner_backend: str) -> Mxfp4MoeBackend:
         "flashinfer_trtllm_afp8": Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         "flashinfer_cutlass": Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         "flashinfer_cutlass_afp8": Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+        "batch_invariant": Mxfp4MoeBackend.BATCH_INVARIANT,
         "triton": Mxfp4MoeBackend.TRITON,
         "marlin": Mxfp4MoeBackend.MARLIN,
         "aiter": Mxfp4MoeBackend.AITER,
@@ -189,6 +199,7 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     if backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+        Mxfp4MoeBackend.BATCH_INVARIANT,
     ):
         return kMxfp8Dynamic
     return None
@@ -258,6 +269,15 @@ def select_mxfp4_moe_backend(
                 logger.info_once(_make_log_backend(backend), scope="local")
                 return backend, k_cls
         raise ValueError(_make_log_unsupported(backend, reason))
+
+    if envs.VLLM_BATCH_INVARIANT:
+        return _return_or_raise(
+            Mxfp4MoeBackend.BATCH_INVARIANT,
+            config,
+            kMxfp4Static,
+            kMxfp8Dynamic,
+            activation_format,
+        )
 
     runner_backend = config.moe_backend
     if runner_backend != "auto":
@@ -752,6 +772,38 @@ def convert_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.BATCH_INVARIANT:
+        from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+            swizzle_blockscale,
+        )
+
+        w13_w = w13_weight.data
+        gate_w, up_w = w13_w[:, ::2, :], w13_w[:, 1::2, :]
+        w13_weight = torch.cat([gate_w, up_w], dim=1).contiguous()
+
+        w13_s = w13_weight_scale.data
+        gate_s, up_s = w13_s[:, ::2, :], w13_s[:, 1::2, :]
+        w13_scale_deinterleaved = torch.cat([gate_s, up_s], dim=1).contiguous()
+
+        if w13_bias is not None:
+            w13_b = w13_bias.data
+            gate_b, up_b = w13_b[:, ::2], w13_b[:, 1::2]
+            w13_bias = torch.cat([gate_b, up_b], dim=1).contiguous()
+
+        w13_scale_swizzled = swizzle_blockscale(
+            w13_scale_deinterleaved.view(torch.float8_e4m3fn)
+        ).view(torch.uint8)
+        w2_scale_swizzled = swizzle_blockscale(
+            w2_weight_scale.data.view(torch.float8_e4m3fn)
+        ).view(torch.uint8)
+        return (
+            w13_weight,
+            w2_weight,
+            w13_scale_swizzled,
+            w2_scale_swizzled,
+            w13_bias,
+            w2_bias,
+        )
     elif mxfp4_backend == Mxfp4MoeBackend.XPU:
         # No additional transformation needed for XPU backend
         return (
@@ -780,6 +832,7 @@ def make_mxfp4_moe_quant_config(
     if mxfp4_backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+        Mxfp4MoeBackend.BATCH_INVARIANT,
     ):
         return mxfp4_mxfp8_moe_quant_config(
             w1_bias=w1_bias,

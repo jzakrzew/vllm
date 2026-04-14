@@ -10,17 +10,23 @@ from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
+    apply_moe_activation,
 )
 from vllm.model_executor.layers.fused_moe.batch_invariant_fp4_moe import (
     NvFP4MoEWorkspace,
     _grouped_matmul_nvfp4_packed,
     _map_extra_rows,
+    fused_moe_batch_invariant_mxfp4,
     fused_moe_batch_invariant_nvfp4,
 )
 from vllm.model_executor.layers.fused_moe.config import nvfp4_moe_quant_config
 from vllm.model_executor.layers.fused_moe.cutlass_moe import CutlassExpertsFp4
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoDPEPModular,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    dequant_mxfp8_to_bf16,
+    mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     pad_nvfp4_activation_for_cutlass,
@@ -549,3 +555,325 @@ def test_grouped_matmul_nvfp4_packed_matches_cutlass_reference() -> None:
 
     ref_cat = torch.cat(ref_outputs, dim=0)
     torch.testing.assert_close(packed_out, ref_cat, atol=1e-1, rtol=1e-1)
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 (W4A8) tests
+# ---------------------------------------------------------------------------
+
+MXFP4_BLOCK = 32
+FP4_LOOKUP = torch.tensor(
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+    dtype=torch.float32,
+)
+
+
+def _maybe_quantize_mxfp8_reference(x: torch.Tensor) -> torch.Tensor:
+    x_q, x_scale = mxfp8_e4m3_quantize(x, is_sf_swizzled_layout=False)
+    return dequant_mxfp8_to_bf16(x_q, x_scale).to(x.dtype)
+
+
+def _quantize_mxfp4_block(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Elementwise FP4 e2m1 quantize with e8m0fnu block scales (group=32)."""
+    n, k = w_bf16.shape
+    assert k % MXFP4_BLOCK == 0
+    w = w_bf16.float().reshape(n, k // MXFP4_BLOCK, MXFP4_BLOCK)
+    amax = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+
+    log2_amax = torch.log2(amax / 6.0).clamp(min=-127)
+    exponent = torch.floor(log2_amax).to(torch.int32) + 127
+    exponent = exponent.clamp(0, 254)
+    scale_f32 = torch.pow(2.0, (exponent - 127).float())
+
+    w_scaled = w / scale_f32
+    lookup = FP4_LOOKUP.to(w.device)
+    w_flat = w_scaled.reshape(-1, 1)
+    dists = (w_flat - lookup.unsqueeze(0)).abs()
+    indices = dists.argmin(dim=-1).reshape(n, k // MXFP4_BLOCK, MXFP4_BLOCK)
+    indices = indices.to(torch.uint8).reshape(n, k // 2, 2)
+    packed = (indices[..., 0] & 0x0F) | ((indices[..., 1] & 0x0F) << 4)
+    w_scale = exponent.squeeze(-1).to(torch.uint8).reshape(n, k // MXFP4_BLOCK)
+    return packed, w_scale
+
+
+def _dequant_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize MXFP4 packed weights back to float32 for reference."""
+    n = packed.shape[0]
+    k_half = packed.shape[1]
+    unpacked = torch.zeros(n, k_half * 2, dtype=torch.int32, device=packed.device)
+    p = packed.to(torch.int32)
+    unpacked[:, 0::2] = p & 0x0F
+    unpacked[:, 1::2] = (p >> 4) & 0x0F
+    lookup = FP4_LOOKUP.to(packed.device)
+    w_float = lookup[unpacked.long()]
+    scale_f32 = (
+        torch.pow(2.0, (scale.to(torch.int32) - 127).float())
+        .unsqueeze(-1)
+        .expand(n, -1, MXFP4_BLOCK)
+        .reshape(n, k_half * 2)
+    )
+    return w_float * scale_f32
+
+
+def _interleave_gate_up(t: torch.Tensor) -> torch.Tensor:
+    """Interleave the gate and up halves along dim 1."""
+    half = t.shape[1] // 2
+    gate, up = t[:, :half], t[:, half:]
+    paired = torch.stack([gate, up], dim=2)
+    return paired.reshape(t.shape[0], t.shape[1], *t.shape[2:]).contiguous()
+
+
+def _make_mxfp4_moe_weights(
+    *, e: int, n: int, k: int, interleaved: bool = False
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Create MXFP4 MoE weight tensors with swizzled scales."""
+    w13_list, w13_scale_list = [], []
+    w2_list, w2_scale_list = [], []
+    for _ in range(e):
+        w1_bf16 = torch.randn(n, k, device=DEVICE, dtype=DTYPE) / 10
+        w3_bf16 = torch.randn(n, k, device=DEVICE, dtype=DTYPE) / 10
+        w13_bf16 = torch.cat([w1_bf16, w3_bf16], dim=0)
+        w13_q, w13_s = _quantize_mxfp4_block(w13_bf16)
+        w13_list.append(w13_q)
+        w13_scale_list.append(w13_s)
+
+        w2_bf16 = torch.randn(k, n, device=DEVICE, dtype=DTYPE) / 10
+        w2_q, w2_s = _quantize_mxfp4_block(w2_bf16)
+        w2_list.append(w2_q)
+        w2_scale_list.append(w2_s)
+
+    w13_fp4 = torch.stack(w13_list)
+    w13_scale_raw = torch.stack(w13_scale_list)
+    w2_fp4 = torch.stack(w2_list)
+    w2_scale_raw = torch.stack(w2_scale_list)
+
+    if interleaved:
+        return (
+            _interleave_gate_up(w13_fp4),
+            _interleave_gate_up(w13_scale_raw),
+            w2_fp4,
+            w2_scale_raw,
+            w13_scale_raw,
+            w2_scale_raw,
+        )
+
+    w13_scale = swizzle_blockscale(w13_scale_raw.view(torch.float8_e4m3fn)).view(
+        torch.uint8
+    )
+    w2_scale = swizzle_blockscale(w2_scale_raw.view(torch.float8_e4m3fn)).view(
+        torch.uint8
+    )
+    return w13_fp4, w13_scale, w2_fp4, w2_scale, w13_scale_raw, w2_scale_raw
+
+
+def _reference_fused_moe_mxfp4_dequant(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13_fp4: torch.Tensor,
+    w13_scale_raw: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_scale_raw: torch.Tensor,
+    activation: MoEActivation,
+    *,
+    apply_router_weight_on_input: bool = False,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference MXFP4 MoE with dequantized weights and MXFP8-quantized acts."""
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+    m, hidden_dim = hidden_states.shape
+    num_experts = w13_fp4.shape[0]
+    top_k = topk_ids.shape[1]
+
+    w13_deq = [
+        _dequant_mxfp4(w13_fp4[eid], w13_scale_raw[eid]).to(dtype)
+        for eid in range(num_experts)
+    ]
+    w2_deq = [
+        _dequant_mxfp4(w2_fp4[eid], w2_scale_raw[eid]).to(dtype)
+        for eid in range(num_experts)
+    ]
+
+    routed = topk_ids.to(torch.long)
+    valid_routes = (routed >= 0) & (routed < num_experts)
+    routed = torch.where(valid_routes, routed, torch.full_like(routed, -1))
+    router_weights = topk_weights.to(torch.float32)
+
+    out = torch.zeros(m, hidden_dim, device=device, dtype=dtype)
+    for i in range(m):
+        acc = torch.zeros(1, hidden_dim, device=device, dtype=dtype)
+        for j in range(top_k):
+            expert_id = int(routed[i, j].item())
+            if expert_id < 0:
+                continue
+            weight = router_weights[i, j].to(dtype)
+            x = hidden_states[i : i + 1]
+            if apply_router_weight_on_input:
+                x = x * weight
+            x = _maybe_quantize_mxfp8_reference(x)
+            gemm1_out = x @ w13_deq[expert_id].T
+            if w13_bias is not None:
+                gemm1_out = gemm1_out + w13_bias[expert_id : expert_id + 1].to(dtype)
+            act_dim = (
+                gemm1_out.shape[-1] // 2 if activation.is_gated else gemm1_out.shape[-1]
+            )
+            act_buf = torch.empty(1, act_dim, device=device, dtype=dtype)
+            apply_moe_activation(activation, act_buf, gemm1_out)
+            act_buf = _maybe_quantize_mxfp8_reference(act_buf)
+            y = act_buf @ w2_deq[expert_id].T
+            if w2_bias is not None:
+                y = y + w2_bias[expert_id : expert_id + 1].to(dtype)
+            acc = acc + y if apply_router_weight_on_input else acc + y * weight
+        out[i] = acc[0]
+    return out
+
+
+@pytest.mark.parametrize("topk,apply_router_weight_on_input", BATCH_INVARIANT_CASES)
+@torch.inference_mode()
+def test_batch_invariant_mxfp4_moe_matches_dequant_reference(
+    topk: int,
+    apply_router_weight_on_input: bool,
+) -> None:
+    """`fused_moe_batch_invariant_mxfp4` matches the dequantized reference."""
+    set_random_seed(42)
+    m, e, n, k = 32, 8, 128, 256
+
+    hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
+    score = torch.randn(m, e, device=DEVICE, dtype=DTYPE)
+    topk_weights, topk_ids, _ = fused_topk(
+        hidden_states, score, topk, renormalize=False
+    )
+
+    (
+        w13_fp4,
+        w13_scale,
+        w2_fp4,
+        w2_scale,
+        w13_scale_raw,
+        w2_scale_raw,
+    ) = _make_mxfp4_moe_weights(e=e, n=n, k=k)
+
+    workspace13, workspace2 = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=topk,
+        w1_row_dim=w13_fp4.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
+    out = torch.empty_like(hidden_states)
+    fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_fp4,
+        w13_weight_scale=w13_scale,
+        w2_weight=w2_fp4,
+        w2_weight_scale=w2_scale,
+        activation=MoEActivation.SILU,
+        workspace13=workspace13,
+        workspace2=workspace2,
+        output=out,
+        workspace=_make_nvfp4_workspace(e),
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    ref = _reference_fused_moe_mxfp4_dequant(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_fp4=w13_fp4,
+        w13_scale_raw=w13_scale_raw,
+        w2_fp4=w2_fp4,
+        w2_scale_raw=w2_scale_raw,
+        activation=MoEActivation.SILU,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@torch.inference_mode()
+def test_batch_invariant_mxfp4_moe_interleaved_checkpoint_format() -> None:
+    """The batch-invariant MXFP4 convert path de-interleaves and swizzles w13."""
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        convert_to_mxfp4_moe_kernel_format,
+    )
+
+    set_random_seed(99)
+    m, e, n, k = 32, 8, 128, 256
+    topk = 2
+
+    hidden_states = torch.randn(m, k, device=DEVICE, dtype=DTYPE) / 10
+    score = torch.randn(m, e, device=DEVICE, dtype=DTYPE)
+    topk_weights, topk_ids, _ = fused_topk(
+        hidden_states, score, topk, renormalize=False
+    )
+
+    (
+        w13_fp4_interleaved,
+        w13_scale_interleaved,
+        w2_fp4,
+        w2_scale,
+        w13_scale_raw,
+        w2_scale_raw,
+    ) = _make_mxfp4_moe_weights(e=e, n=n, k=k, interleaved=True)
+
+    (w13_fp4_conv, w2_conv, w13_scale_conv, w2_scale_conv, _, _) = (
+        convert_to_mxfp4_moe_kernel_format(
+            mxfp4_backend=Mxfp4MoeBackend.BATCH_INVARIANT,
+            layer=None,  # type: ignore[arg-type]
+            w13_weight=w13_fp4_interleaved,
+            w2_weight=w2_fp4,
+            w13_weight_scale=w13_scale_interleaved,
+            w2_weight_scale=w2_scale,
+        )
+    )
+
+    workspace13, workspace2 = _batch_invariant_fp4_workspaces(
+        m=m,
+        topk=topk,
+        w1_row_dim=w13_fp4_conv.shape[1],
+        hidden_dim=k,
+        activation=MoEActivation.SILU,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+    out = torch.empty_like(hidden_states)
+    fused_moe_batch_invariant_mxfp4(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_weight=w13_fp4_conv,
+        w13_weight_scale=w13_scale_conv,
+        w2_weight=w2_conv,
+        w2_weight_scale=w2_scale_conv,
+        activation=MoEActivation.SILU,
+        workspace13=workspace13,
+        workspace2=workspace2,
+        output=out,
+        workspace=_make_nvfp4_workspace(e),
+    )
+    ref = _reference_fused_moe_mxfp4_dequant(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13_fp4=torch.cat(
+            [w13_fp4_interleaved[:, ::2, :], w13_fp4_interleaved[:, 1::2, :]], dim=1
+        ),
+        w13_scale_raw=w13_scale_raw,
+        w2_fp4=w2_fp4,
+        w2_scale_raw=w2_scale_raw,
+        activation=MoEActivation.SILU,
+    )
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
