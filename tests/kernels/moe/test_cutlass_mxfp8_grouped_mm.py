@@ -3,7 +3,7 @@
 # Adapted from SGLang:
 # https://github.com/sgl-project/sglang/blob/ded068a76e00878881d52d5bfb791e0f60d7311b/sgl-kernel/tests/test_es_fp8_blockwise_moe.py
 
-"""Tests for SM100 CUTLASS MXFP8 grouped MoE kernels."""
+"""Tests for SM100/SM120 CUTLASS MXFP8 grouped MoE kernels."""
 
 import random
 
@@ -31,10 +31,12 @@ def calc_diff(x, y):
     return 1 - sim
 
 
-def is_sm100_supported() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+def is_mxfp8_grouped_mm_supported() -> bool:
+    if not current_platform.is_cuda():
+        return False
+    return current_platform.is_device_capability_family(
         100
-    )
+    ) or current_platform.is_device_capability(120)
 
 
 def compute_ref_output(
@@ -144,10 +146,10 @@ def compute_kernel_output(
 
 
 @pytest.mark.skipif(
-    not is_sm100_supported(),
+    not is_mxfp8_grouped_mm_supported(),
     reason=(
         "cutlass_mxfp8_grouped_mm and mxfp8_experts_quant "
-        "are only supported on CUDA SM100"
+        "are only supported on CUDA SM100 and SM120 (12.0)"
     ),
 )
 @pytest.mark.parametrize("num_experts", [8, 16, 32, 64])

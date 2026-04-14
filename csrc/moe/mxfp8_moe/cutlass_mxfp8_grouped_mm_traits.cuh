@@ -32,17 +32,32 @@ namespace expert_specialization {
 
 using namespace cute;
 
-// Different configs for 1SM and 2SM MMA kernel
+// SM100: runtime cluster shape allows multicast (cluster > 1).
 struct MMA1SMConfig {
   using MmaTileShape = Shape<_128, _128, _128>;
   using KernelSchedule =
       cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf8f6f4Sm100;
   using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+  using ClusterShape = Shape<int32_t, int32_t, _1>;
   const static dim3 preferred_cluster;
   const static dim3 fallback_cluster;
 };
 const dim3 MMA1SMConfig::preferred_cluster(1, 4, 1);
 const dim3 MMA1SMConfig::fallback_cluster(1, 2, 1);
+
+// SM120: static 1×1×1 cluster disables multicast at compile time so ptxas
+// does not emit unsupported multicast TMA instructions.
+struct MMA1SMConfigNoMulticast {
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using KernelSchedule =
+      cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf8f6f4Sm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+  using ClusterShape = Shape<_1, _1, _1>;
+  const static dim3 preferred_cluster;
+  const static dim3 fallback_cluster;
+};
+const dim3 MMA1SMConfigNoMulticast::preferred_cluster(1, 1, 1);
+const dim3 MMA1SMConfigNoMulticast::fallback_cluster(1, 1, 1);
 
 template <typename _MMAConfig, typename OutputDtype>
 struct CutlassMxfp8GroupedMmGemmTraits {
@@ -83,8 +98,7 @@ struct CutlassMxfp8GroupedMmGemmTraits {
   using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
   using StageCountType = cutlass::gemm::collective::StageCountAuto;
 
-  // Runtime Cluster Shape
-  using ClusterShape = Shape<int32_t, int32_t, _1>;
+  using ClusterShape = typename MMAConfig::ClusterShape;
 
   // Define Epilogue
   using CollectiveEpilogue =

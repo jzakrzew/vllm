@@ -166,14 +166,27 @@ void cutlass_mxfp8_grouped_mm_dispatch_out_dtype(
   torch::Tensor layout_sfa = torch::empty({num_experts, 5}, options_int32);
   torch::Tensor layout_sfb = torch::empty({num_experts, 5}, options_int32);
 
-  using GemmTraits = CutlassMxfp8GroupedMmGemmTraits<MMA1SMConfig, OutType>;
-  cutlass_mxfp8_grouped_mm_pre_compute<GemmTraits>(
-      a_ptrs, b_ptrs, sfa_ptrs, sfb_ptrs, d_ptrs, stride_a, stride_b, stride_d,
-      layout_sfa, layout_sfb, a, b, sfa, sfb, d, problem_sizes, expert_offsets,
-      blockscale_offsets, stream);
-  cutlass_mxfp8_grouped_mm<GemmTraits>(
-      a_ptrs, b_ptrs, sfa_ptrs, sfb_ptrs, d_ptrs, stride_a, stride_b, stride_d,
-      layout_sfa, layout_sfb, problem_sizes, stream);
+  const cudaDeviceProp* props = at::cuda::getCurrentDeviceProperties();
+  if (props->major == 12) {
+    using GemmTraits =
+        CutlassMxfp8GroupedMmGemmTraits<MMA1SMConfigNoMulticast, OutType>;
+    cutlass_mxfp8_grouped_mm_pre_compute<GemmTraits>(
+        a_ptrs, b_ptrs, sfa_ptrs, sfb_ptrs, d_ptrs, stride_a, stride_b,
+        stride_d, layout_sfa, layout_sfb, a, b, sfa, sfb, d, problem_sizes,
+        expert_offsets, blockscale_offsets, stream);
+    cutlass_mxfp8_grouped_mm<GemmTraits>(
+        a_ptrs, b_ptrs, sfa_ptrs, sfb_ptrs, d_ptrs, stride_a, stride_b,
+        stride_d, layout_sfa, layout_sfb, problem_sizes, stream);
+  } else {
+    using GemmTraits = CutlassMxfp8GroupedMmGemmTraits<MMA1SMConfig, OutType>;
+    cutlass_mxfp8_grouped_mm_pre_compute<GemmTraits>(
+        a_ptrs, b_ptrs, sfa_ptrs, sfb_ptrs, d_ptrs, stride_a, stride_b,
+        stride_d, layout_sfa, layout_sfb, a, b, sfa, sfb, d, problem_sizes,
+        expert_offsets, blockscale_offsets, stream);
+    cutlass_mxfp8_grouped_mm<GemmTraits>(
+        a_ptrs, b_ptrs, sfa_ptrs, sfb_ptrs, d_ptrs, stride_a, stride_b,
+        stride_d, layout_sfa, layout_sfb, problem_sizes, stream);
+  }
 }
 
 }  // namespace expert_specialization
