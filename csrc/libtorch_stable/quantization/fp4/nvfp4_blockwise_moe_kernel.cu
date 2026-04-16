@@ -616,16 +616,10 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
     const torch::stable::Tensor& problem_sizes,
     const torch::stable::Tensor& expert_offsets,
     const torch::stable::Tensor& sf_offsets, int M, int N, int K,
-    bool batch_invariant) {
-  if (batch_invariant) {
-    using BatchInvariantSchedule = cutlass::gemm::
-        KernelPtrArrayTmaWarpSpecializedCooperativeBlockScaledSm120<3>;
-    run_fp4_blockwise_scaled_group_mm_sm120_impl<BatchInvariantSchedule>(
-        output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K);
-    return;
-  }
-
+    bool /*batch_invariant*/) {
+  // CUTLASS requires KernelScheduleAuto for SM120 NVFP4 grouped blockscaled
+  // GEMMs. The instantiated kernel still resolves to a cooperative ptr-array
+  // schedule, which is enforced by the static_assert in the implementation.
   run_fp4_blockwise_scaled_group_mm_sm120_impl<
       cutlass::gemm::collective::KernelScheduleAuto>(
       output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
