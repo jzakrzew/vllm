@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -619,6 +620,7 @@ def run_cutlass_moe_fp4(
         problem_sizes1,
         expert_offsets[:-1],
         blockscale_offsets[:-1],
+        batch_invariant=envs.VLLM_BATCH_INVARIANT,
     )
     del rep_a_fp4, rep_a_blockscale
     if activation == MoEActivation.SILU:
@@ -644,6 +646,7 @@ def run_cutlass_moe_fp4(
         problem_sizes2,
         expert_offsets[:-1],
         blockscale_offsets[:-1],
+        batch_invariant=envs.VLLM_BATCH_INVARIANT,
     )
     del int_fp4, int_blockscale
 
@@ -719,6 +722,10 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
         # CutlassExpertsFp4 does not support expert map, which is
         # needed for STANDARD activation format kernels in EP mode.
         return moe_parallel_config.ep_size == 1
+
+    @staticmethod
+    def _supports_batch_invariance() -> bool:
+        return True
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:

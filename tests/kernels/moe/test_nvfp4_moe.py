@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import make_dummy_moe_config, make_test_weights
 from tests.kernels.quantization.nvfp4_utils import (
@@ -287,6 +288,131 @@ def test_cutlass_fp4_moe_swiglustep(
         )
 
         torch.testing.assert_close(torch_output, cutlass_output, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.SWIGLUSTEP])
+@torch.inference_mode()
+def test_cutlass_fp4_moe_batch_invariant(
+    activation: MoEActivation,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_init,
+):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+
+    set_random_seed(7)
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        m = 9
+        n = 1024
+        k = 1024
+        e = 64
+        topk = 4
+        dtype = torch.bfloat16
+        target_idx = 3
+
+        hidden_states = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+        target_hidden_state = hidden_states[target_idx : target_idx + 1].clone()
+
+        (_, w1_q, w1_blockscale, w1_gs), (_, w2_q, w2_blockscale, w2_gs) = (
+            make_test_weights(
+                e,
+                n,
+                k,
+                in_dtype=dtype,
+                quant_dtype="nvfp4",
+                block_shape=None,
+                per_out_ch_quant=False,
+            )
+        )
+
+        score = torch.full((m, e), -32.0, device="cuda", dtype=dtype)
+        preferred_experts = torch.tensor([3, 7, 11, 19], device="cuda")
+        score[:, preferred_experts] = torch.tensor(
+            [12.0, 8.0, 4.0, 1.0], device="cuda", dtype=dtype
+        )
+        score += 0.01 * torch.randn_like(score)
+        target_score = score[target_idx : target_idx + 1].clone()
+
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states, score, topk, renormalize=False
+        )
+        target_topk_weights, target_topk_ids, _ = fused_topk(
+            target_hidden_state, target_score, topk, renormalize=False
+        )
+
+        a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
+        a2_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
+
+        assert w1_gs is not None
+        assert w2_gs is not None
+        assert w1_blockscale is not None
+        assert w2_blockscale is not None
+
+        quant_config = nvfp4_moe_quant_config(
+            g1_alphas=(1 / w1_gs),
+            g2_alphas=(1 / w2_gs),
+            a1_gscale=a1_gs,
+            a2_gscale=a2_gs,
+            w1_scale=w1_blockscale,
+            w2_scale=w2_blockscale,
+        )
+
+        kernel = mk.FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe=make_dummy_moe_config(),
+                quant_config=quant_config,
+                allow_new_interface=True,
+                use_monolithic=False,
+            ),
+            CutlassExpertsFp4(
+                moe_config=make_dummy_moe_config(),
+                quant_config=quant_config,
+            ),
+            inplace=False,
+        )
+
+        captured_batch_invariant: list[bool] = []
+        real_cutlass_fp4_moe_mm = ops.cutlass_fp4_moe_mm
+
+        def capture_cutlass_fp4_moe_mm(*args, **kwargs):
+            captured_batch_invariant.append(kwargs.get("batch_invariant", False))
+            return real_cutlass_fp4_moe_mm(*args, **kwargs)
+
+        monkeypatch.setattr(ops, "cutlass_fp4_moe_mm", capture_cutlass_fp4_moe_mm)
+
+        batch_output = kernel.apply(
+            hidden_states=hidden_states,
+            w1=w1_q,
+            w2=w2_q,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            global_num_experts=e,
+            activation=activation,
+            apply_router_weight_on_input=False,
+            expert_map=None,
+        )
+        target_output = kernel.apply(
+            hidden_states=target_hidden_state,
+            w1=w1_q,
+            w2=w2_q,
+            topk_weights=target_topk_weights,
+            topk_ids=target_topk_ids,
+            global_num_experts=e,
+            activation=activation,
+            apply_router_weight_on_input=False,
+            expert_map=None,
+        )
+
+        assert captured_batch_invariant == [True, True, True, True]
+        assert CutlassExpertsFp4._supports_batch_invariance()
+        torch.testing.assert_close(
+            batch_output[target_idx : target_idx + 1],
+            target_output,
+            atol=0,
+            rtol=0,
+        )
 
 
 if __name__ == "__main__":

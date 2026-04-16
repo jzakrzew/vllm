@@ -205,7 +205,8 @@ void run_fp4_blockwise_scaled_group_mm_sm100(
     const torch::stable::Tensor& alphas,
     const torch::stable::Tensor& problem_sizes,
     const torch::stable::Tensor& expert_offsets,
-    const torch::stable::Tensor& sf_offsets, int M, int N, int K) {
+    const torch::stable::Tensor& sf_offsets, int M, int N, int K,
+    bool /*batch_invariant*/) {
   using ProblemShape =
       cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
   using ElementType = cutlass::float_e2m1_t;
@@ -403,7 +404,8 @@ void run_fp4_blockwise_scaled_group_mm_sm100(
   STD_TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
-void run_fp4_blockwise_scaled_group_mm_sm120(
+template <typename BuilderScheduleTag>
+void run_fp4_blockwise_scaled_group_mm_sm120_impl(
     torch::stable::Tensor& output, const torch::stable::Tensor& a,
     const torch::stable::Tensor& b, const torch::stable::Tensor& a_blockscale,
     const torch::stable::Tensor& b_blockscales,
@@ -460,13 +462,20 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
           LayoutB*, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+          BuilderScheduleTag>::CollectiveOp;
 
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
                                            CollectiveEpilogue>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  static_assert(
+      cute::is_base_of_v<
+          cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative,
+          typename Gemm::GemmKernel::CollectiveMainloop::DispatchPolicy::
+              Schedule>,
+      "CUTLASS FP4 grouped GEMM requires a cooperative ptr-array schedule for "
+      "batch-invariant execution");
   using StrideA = typename Gemm::GemmKernel::InternalStrideA;
   using StrideB = typename Gemm::GemmKernel::InternalStrideB;
   using StrideC = typename Gemm::GemmKernel::InternalStrideC;
@@ -599,6 +608,30 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
   STD_TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
+void run_fp4_blockwise_scaled_group_mm_sm120(
+    torch::stable::Tensor& output, const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b, const torch::stable::Tensor& a_blockscale,
+    const torch::stable::Tensor& b_blockscales,
+    const torch::stable::Tensor& alphas,
+    const torch::stable::Tensor& problem_sizes,
+    const torch::stable::Tensor& expert_offsets,
+    const torch::stable::Tensor& sf_offsets, int M, int N, int K,
+    bool batch_invariant) {
+  if (batch_invariant) {
+    using BatchInvariantSchedule = cutlass::gemm::
+        KernelPtrArrayTmaWarpSpecializedCooperativeBlockScaledSm120<3>;
+    run_fp4_blockwise_scaled_group_mm_sm120_impl<BatchInvariantSchedule>(
+        output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
+        expert_offsets, sf_offsets, M, N, K);
+    return;
+  }
+
+  run_fp4_blockwise_scaled_group_mm_sm120_impl<
+      cutlass::gemm::collective::KernelScheduleAuto>(
+      output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
+      expert_offsets, sf_offsets, M, N, K);
+}
+
 template <typename OutType>
 void run_fp4_blockwise_scaled_group_mm(
     torch::stable::Tensor& output, const torch::stable::Tensor& a,
@@ -607,13 +640,14 @@ void run_fp4_blockwise_scaled_group_mm(
     const torch::stable::Tensor& alphas,
     const torch::stable::Tensor& problem_sizes,
     const torch::stable::Tensor& expert_offsets,
-    const torch::stable::Tensor& sf_offsets, int M, int N, int K) {
+    const torch::stable::Tensor& sf_offsets, int M, int N, int K,
+    bool batch_invariant) {
   int32_t version_num = get_sm_version_num();
 #if defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120
   if (version_num >= 120 && version_num < 130) {
     run_fp4_blockwise_scaled_group_mm_sm120(
         output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K);
+        expert_offsets, sf_offsets, M, N, K, batch_invariant);
     return;
   }
 #endif
@@ -621,7 +655,7 @@ void run_fp4_blockwise_scaled_group_mm(
   if (version_num >= 100 && version_num < 120) {
     run_fp4_blockwise_scaled_group_mm_sm100<OutType>(
         output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K);
+        expert_offsets, sf_offsets, M, N, K, batch_invariant);
     return;
   }
 #endif
@@ -657,7 +691,8 @@ void cutlass_fp4_group_mm(torch::stable::Tensor& output,
                           const torch::stable::Tensor& alphas,
                           const torch::stable::Tensor& problem_sizes,
                           const torch::stable::Tensor& expert_offsets,
-                          const torch::stable::Tensor& sf_offsets) {
+                          const torch::stable::Tensor& sf_offsets,
+                          bool batch_invariant) {
 #if (defined ENABLE_NVFP4_SM100 && ENABLE_NVFP4_SM100) || \
     (defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120)
   // Input validation
@@ -695,7 +730,7 @@ void cutlass_fp4_group_mm(torch::stable::Tensor& output,
   if (output.scalar_type() == torch::headeronly::ScalarType::BFloat16) {
     run_fp4_blockwise_scaled_group_mm<cutlass::bfloat16_t>(
         output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K);
+        expert_offsets, sf_offsets, M, N, K, batch_invariant);
   } else {
   #if defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120
     int32_t version_num = get_sm_version_num();
@@ -707,7 +742,7 @@ void cutlass_fp4_group_mm(torch::stable::Tensor& output,
   #endif
     run_fp4_blockwise_scaled_group_mm<cutlass::half_t>(
         output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K);
+        expert_offsets, sf_offsets, M, N, K, batch_invariant);
   }
 #else
   STD_TORCH_CHECK_NOT_IMPLEMENTED(

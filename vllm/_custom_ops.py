@@ -1123,6 +1123,7 @@ def cutlass_fp4_moe_mm(
     problem_sizes: torch.Tensor,
     expert_offsets: torch.Tensor,
     sf_offsets: torch.Tensor,
+    batch_invariant: bool = False,
 ):
     """
     An FP4 Blockscaled Group Gemm that takes in  a_tensors, b_tensors and runs
@@ -1150,6 +1151,7 @@ def cutlass_fp4_moe_mm(
         problem_sizes,
         expert_offsets,
         sf_offsets,
+        batch_invariant,
     )
 
 

@@ -114,7 +114,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "cutlass_fp4_group_mm(Tensor! out, Tensor a, Tensor b,"
       " Tensor a_blockscale, Tensor b_blockscales, Tensor alphas,"
-      " Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets) -> ()");
+      " Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets,"
+      " bool batch_invariant=False) -> ()");
 
   // Compute NVFP4 block quantized tensor.
   ops.def(
