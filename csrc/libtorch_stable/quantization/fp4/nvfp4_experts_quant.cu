@@ -50,18 +50,21 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
   // Precompute SF layout parameter (constant for entire kernel).
   int32_t const numKTiles = (numCols + 63) / 64;
+  int32_t const numPaddedColsPerRow =
+      numKTiles * (64 / CVT_FP4_ELTS_PER_THREAD);
 
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+  int outColsPerRow = numCols / 8;
   // When fusing SiLU+Mul, input has gate || up layout (doubled width)
   int inColsPerRow = FUSE_SILU_MUL ? colsPerRow * 2 : colsPerRow;
 
-  // Each global thread processes one element
-  for (int globalIdx = tid; globalIdx < numRows * colsPerRow;
+  // Visit the padded K-tail too so every logically used SF byte is written.
+  for (int globalIdx = tid; globalIdx < numRows * numPaddedColsPerRow;
        globalIdx += gridDim.x * blockDim.x) {
-    // Calculate which row and column this global thread should process
-    int rowIdx = globalIdx / colsPerRow;
-    int colIdx = globalIdx % colsPerRow;
+    int rowIdx = globalIdx / numPaddedColsPerRow;
+    int colIdx = globalIdx % numPaddedColsPerRow;
+    bool valid = colIdx < colsPerRow;
 
     // Find index within the experts using different strategies based on expert
     // count
@@ -111,20 +114,16 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
     // Load input and optionally apply fused SiLU+Mul
     int64_t inOffset = rowIdx * inColsPerRow + colIdx;
-    PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
     PackedVec quant_input;
     if constexpr (FUSE_SILU_MUL) {
-      PackedVec in_vec_up =
-          reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
+      PackedVec in_vec;
+      PackedVec in_vec_up;
+      load_nvfp4_quant_packed_vec(in_vec, in, inOffset, valid);
+      load_nvfp4_quant_packed_vec(in_vec_up, in, inOffset + colsPerRow, valid);
       quant_input = compute_silu_mul(in_vec, in_vec_up);
     } else {
-      quant_input = in_vec;
+      load_nvfp4_quant_packed_vec(quant_input, in, inOffset, valid);
     }
-
-    // Get the output tensor offset.
-    // Same as inOffset because 8 elements are packed into one uint32_t.
-    int64_t outOffset = rowIdx * colsPerRow + colIdx;
-    auto& out_pos = out[outOffset];
 
     // Get the global scaling factor, which will be applied to the SF.
     // Note SFScale is the same as next GEMM's alpha, which is
@@ -139,8 +138,12 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
                                            CVT_FP4_NUM_THREADS_PER_SF>(
             rowIdx_in_expert, colIdx, numKTiles, SFout_in_expert);
 
-    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
-        quant_input, SFScaleVal, sf_out);
+    auto out_val =
+        cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+            quant_input, SFScaleVal, sf_out);
+
+    store_nvfp4_quant_output(out, rowIdx, colIdx, outColsPerRow, out_val,
+                             valid);
   }
 }
 
@@ -162,6 +165,8 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
 
   // Precompute SF layout parameter (constant for entire kernel).
   int32_t const numKTiles = (numCols + 63) / 64;
+  int32_t const numPaddedColsPerRow =
+      numKTiles * (64 / CVT_FP4_ELTS_PER_THREAD);
 
   extern __shared__ uint32_t shared_input_offsets[];
 
@@ -186,15 +191,16 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
 
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+  int outColsPerRow = numCols / 8;
   // When fusing SiLU+Mul, input has gate || up layout (doubled width)
   int inColsPerRow = FUSE_SILU_MUL ? colsPerRow * 2 : colsPerRow;
 
-  // Each global thread processes one element
-  for (int globalIdx = tid; globalIdx < numRows * colsPerRow;
+  // Visit the padded K-tail too so every logically used SF byte is written.
+  for (int globalIdx = tid; globalIdx < numRows * numPaddedColsPerRow;
        globalIdx += gridDim.x * blockDim.x) {
-    // Calculate which row and column this global thread should process
-    int rowIdx = globalIdx / colsPerRow;
-    int colIdx = globalIdx % colsPerRow;
+    int rowIdx = globalIdx / numPaddedColsPerRow;
+    int colIdx = globalIdx % numPaddedColsPerRow;
+    bool valid = colIdx < colsPerRow;
 
     // Find expert using binary search for better performance with large m_topk
     int rowIdx_in_expert = 0;
@@ -222,18 +228,16 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
 
     // Load input and optionally apply fused SiLU+Mul
     int64_t inOffset = rowIdx * inColsPerRow + colIdx;
-    PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
     PackedVec quant_input;
     if constexpr (FUSE_SILU_MUL) {
-      PackedVec in_vec_up =
-          reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
+      PackedVec in_vec;
+      PackedVec in_vec_up;
+      load_nvfp4_quant_packed_vec(in_vec, in, inOffset, valid);
+      load_nvfp4_quant_packed_vec(in_vec_up, in, inOffset + colsPerRow, valid);
       quant_input = compute_silu_mul(in_vec, in_vec_up);
     } else {
-      quant_input = in_vec;
+      load_nvfp4_quant_packed_vec(quant_input, in, inOffset, valid);
     }
-
-    int64_t outOffset = rowIdx * colsPerRow + colIdx;
-    auto& out_pos = out[outOffset];
 
     float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
 
@@ -245,8 +249,12 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
                                            CVT_FP4_NUM_THREADS_PER_SF>(
             rowIdx_in_expert, colIdx, numKTiles, SFout_in_expert);
 
-    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
-        quant_input, SFScaleVal, sf_out);
+    auto out_val =
+        cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+            quant_input, SFScaleVal, sf_out);
+
+    store_nvfp4_quant_output(out, rowIdx, colIdx, outColsPerRow, out_val,
+                             valid);
   }
 }
 
@@ -259,8 +267,9 @@ void quant_impl(void* output, void* output_scale, void* input,
       get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
 
   // Grid, Block size.
-  // Each thread converts 8 values.
-  int const workSizePerRow = k / ELTS_PER_THREAD;
+  // Each thread converts one packed FP4 vector and also covers padded scale
+  // tail columns so logically used SF bytes are fully materialized.
+  int const workSizePerRow = ((k + 63) / 64) * (64 / ELTS_PER_THREAD);
   int const totalWorkSize = m_topk * workSizePerRow;
   dim3 block(std::min(workSizePerRow, 512));
   // Get number of blocks per SM

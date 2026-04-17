@@ -115,6 +115,44 @@ struct u32x2 {
 
 using fp4_packed_t = std::conditional_t<CVT_FP4_PACK16, u32x2, uint32_t>;
 
+// Predicated .cg load of one PackedVec column slice (shared by NVFP4 quant
+// kernels). vec_row_offset indexes packed vectors along the logical K dim.
+template <class Type>
+__device__ __forceinline__ void load_nvfp4_quant_packed_vec(
+    PackedVec<Type, CVT_FP4_PACK16>& dst, Type const* in,
+    int64_t vec_row_offset, bool valid) {
+  auto const* u32_in = reinterpret_cast<const uint32_t*>(in);
+  if constexpr (CVT_FP4_PACK16) {
+    ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(dst),
+                     &u32_in[vec_row_offset * 8], valid);
+  } else {
+    ld128_cg_or_zero(reinterpret_cast<uint4&>(dst), &u32_in[vec_row_offset * 4],
+                     valid);
+  }
+}
+
+// Write quantized FP4 to global output; no-op when !valid.
+__device__ __forceinline__ void store_nvfp4_quant_output(
+    uint32_t* out, int64_t rowIdx, int64_t colIdx, int64_t out_cols_per_row,
+    u32x2 const& out_val, bool valid) {
+  if (!valid) {
+    return;
+  }
+  int64_t const outOffset = rowIdx * out_cols_per_row + colIdx * 2;
+  uint64_t const packed64 = (uint64_t(out_val.hi) << 32) | uint64_t(out_val.lo);
+  reinterpret_cast<uint64_t*>(out)[outOffset >> 1] = packed64;
+}
+
+__device__ __forceinline__ void store_nvfp4_quant_output(
+    uint32_t* out, int64_t rowIdx, int64_t colIdx, int64_t out_cols_per_row,
+    uint32_t out_val, bool valid) {
+  if (!valid) {
+    return;
+  }
+  int64_t const outOffset = rowIdx * out_cols_per_row + colIdx;
+  out[outOffset] = out_val;
+}
+
 __device__ __forceinline__ u32x2 fp32_vec16_to_e2m1(float2 (&array)[8]) {
   u32x2 out;
   asm volatile(
