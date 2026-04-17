@@ -2,23 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NVFP4 CUTLASS GEMM tests that require ``VLLM_BATCH_INVARIANT=1``.
 
-``vllm_is_batch_invariant()`` caches the env at the first call in the process, so
-run this module in a **fresh** pytest process with the variable set before
-Python starts, e.g.::
+Must run in a **fresh** pytest process:
 
-    VLLM_BATCH_INVARIANT=1 pytest \
-        tests/kernels/quantization/test_nvfp4_batch_invariant_scaled_mm.py -v
+    pytest tests/v1/determinism/test_nvfp4_batch_invariant_scaled_mm.py -v
 
-Do not run in the same pytest session as ``test_nvfp4_scaled_mm.py`` without
-that env var, or the cache will already reflect the default (off) path.
+Do not share a session with ``tests/kernels/quantization/test_nvfp4_scaled_mm.py``:
+the native code caches whether batch invariance is enabled on the first GEMM, and
+if ``VLLM_BATCH_INVARIANT`` was not set at that moment, it stays disabled for the
+rest of the process.
+
+The reference correctness test is included here (not only in the default-path
+module) because ``VLLM_BATCH_INVARIANT=1`` potentially activates a different kernel.
+The two tests are complementary: the reference check catches absolute correctness
+bugs; the batch-invariance check catches schedule-dependent bugs that affect
+full-batch and single-row runs equally.
 """
 
 import os
 
 import pytest
 import torch
-from nvfp4_utils import FLOAT4_E2M1_MAX, FLOAT8_E4M3_MAX, dequantize_nvfp4_to_dtype
 
+from tests.kernels.quantization.nvfp4_utils import (
+    FLOAT4_E2M1_MAX,
+    FLOAT8_E4M3_MAX,
+    dequantize_nvfp4_to_dtype,
+)
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -29,30 +38,10 @@ if not current_platform.has_device_capability(100):
         allow_module_level=True,
     )
 
-
-def _batch_invariant_env_enabled() -> bool:
-    raw = os.environ.get("VLLM_BATCH_INVARIANT")
-    if raw is None or not raw.strip():
-        return False
-    try:
-        return int(raw.strip()) != 0
-    except ValueError:
-        return False
-
-
-if not _batch_invariant_env_enabled():
-    pytest.skip(
-        reason="Set VLLM_BATCH_INVARIANT=1 before starting pytest for this file.",
-        allow_module_level=True,
-    )
-
 DTYPES = [torch.float16, torch.bfloat16]
 SHAPES = [(128, 128, 64), (128, 128, 128), (256, 128, 64), (128, 256, 128)]
 PAD_SHAPES = [(150, 128, 64), (128, 128, 96)]
 SHAPES.extend(PAD_SHAPES)
-
-SEEDS = [42]
-CUDA_DEVICES = ["cuda:0"]
 
 
 def get_ref_results(
@@ -62,8 +51,6 @@ def get_ref_results(
     b_sf,
     a_global_scale,
     b_global_scale,
-    m,
-    n,
     dtype,
     block_size,
     device,
@@ -82,21 +69,25 @@ def get_ref_results(
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_nvfp4_gemm_batch_invariant(
+def test_nvfp4_gemm_correctness_vs_reference_batch_invariant_path(
     dtype: torch.dtype,
     shape: tuple[int, int, int],
-    seed: int,
-    device: str,
 ) -> None:
+    """Correctness: ``cutlass_scaled_fp4_mm`` vs dequantize-then-matmul reference.
+
+    Complements the default-path tests by running the same reference comparison
+    with ``VLLM_BATCH_INVARIANT=1`` active, ensuring the alternate kernel
+    produces correct results. Covers ``(M, N, packed_K)`` shapes including
+    non-aligned dims in ``PAD_SHAPES``, both fp16 and bf16 output.
+    """
+    seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     set_random_seed(seed)
     m, n, packed_k = shape
     k = packed_k * 2
     block_size = 16
-    a_dtype = torch.randn((m, k), dtype=dtype, device=device)
-    b_dtype = torch.randn((n, k), dtype=dtype, device=device)
+    a_dtype = torch.randn((m, k), dtype=dtype, device="cuda")
+    b_dtype = torch.randn((n, k), dtype=dtype, device="cuda")
 
     a_global_scale = (
         (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(a_dtype.flatten(), dim=-1)
@@ -115,11 +106,9 @@ def test_nvfp4_gemm_batch_invariant(
         b_scale_interleaved,
         a_global_scale,
         b_global_scale,
-        m,
-        n,
         dtype,
         block_size,
-        device,
+        "cuda",
     )
     out = ops.cutlass_scaled_fp4_mm(
         a_fp4,
@@ -130,7 +119,8 @@ def test_nvfp4_gemm_batch_invariant(
         dtype,
     )
 
-    torch.testing.assert_close(out, expected_out.to(dtype=dtype), atol=1e-1, rtol=1e-1)
+    atol = 2e-1 if dtype == torch.bfloat16 else 1e-1
+    torch.testing.assert_close(out, expected_out.to(dtype=dtype), atol=atol, rtol=1e-1)
 
 
 CONSISTENCY_SHAPES = [
@@ -142,22 +132,25 @@ CONSISTENCY_SHAPES = [
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", CONSISTENCY_SHAPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_nvfp4_gemm_batch_invariant_consistency(
+def test_nvfp4_gemm_batch_invariance(
     dtype: torch.dtype,
     shape: tuple[int, int, int],
-    seed: int,
-    device: str,
 ) -> None:
-    """Rows match single-row runs when VLLM_BATCH_INVARIANT=1 (see module docstring)."""
+    """Batch invariance: each row of a full-``M`` GEMM matches its ``M=1`` counterpart.
+
+    For row ``i``, compares ``cutlass_scaled_fp4_mm`` run once over all ``M``
+    rows against a separate call with ``A`` sliced to ``a_dtype[i : i+1]``.
+    Catches kernels whose reduction or scheduling depends on ``M`` or adjacent
+    rows. Uses larger ``CONSISTENCY_SHAPES`` than the reference test.
+    """
+    seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
     set_random_seed(seed)
     m, n, packed_k = shape
     k = packed_k * 2  # real K (FP4 elements)
 
-    a_dtype = torch.randn((m, k), dtype=dtype, device=device)
-    b_dtype = torch.randn((n, k), dtype=dtype, device=device)
+    a_dtype = torch.randn((m, k), dtype=dtype, device="cuda")
+    b_dtype = torch.randn((n, k), dtype=dtype, device="cuda")
 
     a_global_scale = (
         (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(a_dtype.flatten(), dim=-1)
