@@ -71,21 +71,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
                           numCols / CVT_FP4_ELTS_PER_THREAD + colIdx;
 
       bool valid = (rowIdx < numRows) && (elem_idx < numCols);
-      if constexpr (CVT_FP4_PACK16) {
-        ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 8],
-                         valid);
-        ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec2),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset2 * 8],
-                         valid);
-      } else {
-        ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 4],
-                         valid);
-        ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec2),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset2 * 4],
-                         valid);
-      }
+      load_nvfp4_quant_packed_vec(in_vec, in, inOffset, valid);
+      load_nvfp4_quant_packed_vec(in_vec2, in, inOffset2, valid);
 
       // Compute silu and mul
       PackedVec out_silu_mul = compute_silu_mul<Type>(in_vec, in_vec2);
@@ -99,18 +86,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
           cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
               out_silu_mul, SFScaleVal, sf_out);
 
-      if (valid) {
-        if constexpr (CVT_FP4_PACK16) {
-          int64_t outOffset = rowIdx * (numCols / 8) + colIdx * 2;
-          uint64_t packed64 =
-              (uint64_t(out_val.hi) << 32) | uint64_t(out_val.lo);
-          reinterpret_cast<uint64_t*>(out)[outOffset >> 1] = packed64;
-        } else {
-          int64_t outOffset =
-              rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
-          out[outOffset] = out_val;
-        }
-      }
+      store_nvfp4_quant_output(out, rowIdx, colIdx, numCols / 8, out_val,
+                               valid);
     }
   }
 }

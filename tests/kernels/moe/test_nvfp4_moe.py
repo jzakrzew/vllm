@@ -14,6 +14,7 @@ from tests.kernels.quantization.nvfp4_utils import (
 from tests.kernels.utils import torch_moe
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -44,6 +45,24 @@ MNK_FACTORS = [
     (224, 1024, 1024),
     (224, 1024, 1536),
 ]
+
+
+def _global_scale(x: torch.Tensor) -> torch.Tensor:
+    return (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.abs(x).max().to(torch.float32)
+
+
+def _swizzled_sf_byte_offsets(
+    m_indices: torch.Tensor, k_indices: torch.Tensor, num_k_tiles: int
+) -> torch.Tensor:
+    # Mirror of cvt_quant_to_fp4_get_sf_out_offset: byte offset of the SF for
+    # logical (mIdx, kIdx) in the swizzled [numMTiles, numKTiles, 32, 4, 4]
+    # layout used by the fp4 kernels.
+    m_tile = m_indices // 128
+    outer_m = m_indices % 32
+    inner_m = (m_indices // 32) % 4
+    k_tile = k_indices // 4
+    inner_k = k_indices % 4
+    return (m_tile * num_k_tiles + k_tile) * 512 + outer_m * 16 + inner_m * 4 + inner_k
 
 
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
@@ -160,6 +179,122 @@ def test_cutlass_fp4_moe_no_graph(
         torch_output = torch_moe(a_in_dtype, w1_d, w2_d, score, topk)
 
         torch.testing.assert_close(torch_output, cutlass_output, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("fuse_silu_mul", [False, True], ids=["scaled", "silu_mul"])
+@torch.inference_mode()
+def test_cutlass_fp4_experts_quant_overwrites_padded_scale_k_tail(
+    fuse_silu_mul: bool,
+    default_vllm_config: VllmConfig,
+) -> None:
+    # The SF tensor is stored in the swizzled [numMTiles, numKTiles, 32, 4, 4]
+    # layout with each expert's slab rounded up to 128 rows (needed for the
+    # swizzle tile granularity and TMA 128-byte alignment in the downstream
+    # CUTLASS grouped GEMM). Two distinct "padding" axes exist:
+    #
+    #   * K-tail  (kIdx in [scales_k, padded_scales_k)): these bytes ARE read
+    #     by the MMA on the final partial K-tile when k is not a multiple of
+    #     64, so the fused quant kernel MUST zero them.
+    #
+    #   * M-tail  (mIdx >= rows within an expert's 128-rounded slab): the
+    #     grouped GEMM builds its per-expert LayoutSFA from the UNPADDED m in
+    #     `problem_sizes`, so CUTLASS never issues loads for those rows. The
+    #     padded M rows are storage-only and intentionally left untouched by
+    #     the fused kernel.
+    #
+    # Therefore this test (a) pre-fills `output_scales` with a non-zero
+    # pattern to catch missing K-tail zeroing, (b) compares SF bytes against
+    # the reference op only at swizzled offsets for logical (mIdx, kIdx), and
+    # (c) verifies the K-tail bytes for logical rows are zero.
+    set_random_seed(23)
+
+    per_expert_rows = [17, 131, 64, 5]
+    k = 1504
+    dtype = torch.bfloat16
+
+    expected_outputs = []
+    expected_scales = []
+    expert_offsets = [0]
+    blockscale_offsets = [0]
+    row_offset = 0
+    scale_row_offset = 0
+    input_gscales = []
+    expert_inputs = []
+
+    for rows in per_expert_rows:
+        expert_input = torch.randn(
+            (rows, 2 * k if fuse_silu_mul else k), device="cuda", dtype=dtype
+        )
+        reference_input = (
+            SiluAndMul().forward_native(expert_input) if fuse_silu_mul else expert_input
+        )
+        expert_gscale = _global_scale(reference_input)
+        expert_fp4, expert_scales = ops.scaled_fp4_quant(
+            reference_input, expert_gscale, is_sf_swizzled_layout=True
+        )
+
+        expert_inputs.append(expert_input)
+        input_gscales.append(expert_gscale)
+        expected_outputs.append(expert_fp4)
+        expected_scales.append(expert_scales.clone())
+
+        row_offset += rows
+        scale_row_offset += ((rows + 127) // 128) * 128
+        expert_offsets.append(row_offset)
+        blockscale_offsets.append(scale_row_offset)
+
+    scales_k = k // 16
+    padded_scales_k = ((scales_k + 3) // 4) * 4
+    num_k_tiles = (k + 63) // 64
+    assert padded_scales_k == num_k_tiles * 4
+    output = torch.empty((row_offset, k // 2), device="cuda", dtype=torch.uint8)
+    # Pre-fill with a non-zero pattern so we can detect positions the kernel
+    # fails to overwrite (e.g. the K-tail that used to rely on torch.zeros).
+    output_scales = torch.full(
+        (blockscale_offsets[-1], padded_scales_k // 4),
+        0x7F7F7F7F,
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    quant_op = (
+        torch.ops._C.silu_and_mul_scaled_fp4_experts_quant
+        if fuse_silu_mul
+        else torch.ops._C.scaled_fp4_experts_quant
+    )
+    quant_op(
+        output,
+        output_scales,
+        torch.cat(expert_inputs, dim=0),
+        torch.stack(input_gscales).to(torch.float32),
+        torch.tensor(expert_offsets, dtype=torch.int32, device="cuda"),
+        torch.tensor(blockscale_offsets, dtype=torch.int32, device="cuda"),
+    )
+
+    torch.testing.assert_close(
+        output, torch.cat(expected_outputs, dim=0), atol=0.0, rtol=0.0
+    )
+
+    actual_bytes = output_scales.view(torch.uint8)
+    for expert_id, rows in enumerate(per_expert_rows):
+        start = blockscale_offsets[expert_id]
+        block_rows = ((rows + 127) // 128) * 128
+        actual_block = actual_bytes[start : start + block_rows].contiguous().view(-1)
+        expected_block = expected_scales[expert_id].view(torch.uint8).reshape(-1)
+
+        m_idx = torch.arange(rows, device="cuda", dtype=torch.int64).view(-1, 1)
+
+        # Logical SF bytes must match the reference op byte-for-byte.
+        logical_k = torch.arange(scales_k, device="cuda", dtype=torch.int64).view(1, -1)
+        logical_off = _swizzled_sf_byte_offsets(m_idx, logical_k, num_k_tiles).flatten()
+        assert torch.equal(actual_block[logical_off], expected_block[logical_off])
+
+        # K-tail bytes for logical rows must be zeroed by the kernel.
+        tail_k = torch.arange(
+            scales_k, padded_scales_k, device="cuda", dtype=torch.int64
+        ).view(1, -1)
+        tail_off = _swizzled_sf_byte_offsets(m_idx, tail_k, num_k_tiles).flatten()
+        assert torch.count_nonzero(actual_block[tail_off]).item() == 0
 
 
 # step3.5-flash uses swiglustep activation (clipped SwiGLU with limit=7.0)

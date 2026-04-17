@@ -70,15 +70,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
       // If we are outside valid rows OR outside valid columns -> Use Zeros
       bool valid = (rowIdx < numRows) && (elem_idx < numCols);
-      if constexpr (CVT_FP4_PACK16) {
-        ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 8],
-                         valid);
-      } else {
-        ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 4],
-                         valid);
-      }
+      load_nvfp4_quant_packed_vec(in_vec, in, inOffset, valid);
 
       auto sf_out =
           cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
@@ -91,16 +83,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
       // We do NOT write output for padding because the 'out' tensor is not
       // padded.
-      if (valid) {
-        if constexpr (CVT_FP4_PACK16) {
-          int64_t outOffset = rowIdx * (numCols / 8) + colIdx * 2;
-          uint64_t packed64 =
-              (uint64_t(out_val.hi) << 32) | uint64_t(out_val.lo);
-          reinterpret_cast<uint64_t*>(out)[outOffset >> 1] = packed64;
-        } else {
-          out[inOffset] = out_val;
-        }
-      }
+      store_nvfp4_quant_output(out, rowIdx, colIdx, numCols / 8, out_val,
+                               valid);
     }
   }
 }
@@ -138,15 +122,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
       // If we are outside valid rows OR outside valid columns -> Use Zeros
       bool valid = (rowIdx < numRows) && (elem_idx < numCols);
-      if constexpr (CVT_FP4_PACK16) {
-        ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 8],
-                         valid);
-      } else {
-        ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 4],
-                         valid);
-      }
+      load_nvfp4_quant_packed_vec(in_vec, in, inOffset, valid);
 
       auto sf_out =
           sf_out_rowmajor_u8<uint32_t>(rowIdx, colIdx, sf_n_unpadded, SFout);
@@ -157,16 +133,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
       // We do NOT write output for padding because the 'out' tensor is not
       // padded.
-      if (valid) {
-        if constexpr (CVT_FP4_PACK16) {
-          int64_t outOffset = rowIdx * (numCols / 8) + colIdx * 2;
-          uint64_t packed64 =
-              (uint64_t(out_val.hi) << 32) | uint64_t(out_val.lo);
-          reinterpret_cast<uint64_t*>(out)[outOffset >> 1] = packed64;
-        } else {
-          out[inOffset] = out_val;
-        }
-      }
+      store_nvfp4_quant_output(out, rowIdx, colIdx, numCols / 8, out_val,
+                               valid);
     }
   }
 }
