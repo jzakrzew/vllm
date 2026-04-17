@@ -270,24 +270,27 @@ void quant_impl(void* output, void* output_scale, void* input,
                      multiProcessorCount * numBlocksPerSM));
   while (grid.x <= multiProcessorCount && block.x > 64) {
     grid.x *= 2;
-    block.x = (block.x + 1) / 2;
+    constexpr int THREADS_PER_SF =
+        CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+    int next_block = (static_cast<int>(block.x) + 1) / 2;
+    next_block =
+        ((next_block + THREADS_PER_SF - 1) / THREADS_PER_SF) * THREADS_PER_SF;
+    // PACK=8 quantization uses two neighboring threads per scale vector
+    // (via shfl_xor(..., 1)), so block.x must stay even to preserve
+    // colIdx parity across block boundaries. Odd block sizes make singleton
+    // sub-batches quantize differently from the full batch for non-square K.
+    block.x = static_cast<unsigned int>(
+        next_block < THREADS_PER_SF ? THREADS_PER_SF : next_block);
   }
 
   int const blockRepeat =
       (totalWorkSize + block.x * grid.x - 1) / (block.x * grid.x);
-  if (blockRepeat > 1) {
-    size_t shared_mem_size = (n_experts + 1) * sizeof(uint32_t);
-    if (n_experts >= 4) {
-      cvt_fp16_to_fp4<T, FUSE_SILU_MUL, false, false>
-          <<<grid, block, shared_mem_size, stream>>>(
-              m_topk, k, reinterpret_cast<T*>(input),
-              reinterpret_cast<float*>(input_global_scale),
-              reinterpret_cast<uint32_t*>(output),
-              reinterpret_cast<uint32_t*>(output_scale),
-              reinterpret_cast<uint32_t*>(input_offset_by_experts),
-              reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-              n_experts);
-    } else {
+  bool const experts_divisible_by_4 = (n_experts % 4) == 0;
+  bool const experts_divisible_by_16 = (n_experts % 16) == 0;
+
+  if (n_experts < 4) {
+    if (blockRepeat > 1) {
+      size_t shared_mem_size = (n_experts + 1) * sizeof(uint32_t);
       cvt_fp16_to_fp4<T, FUSE_SILU_MUL, false, true>
           <<<grid, block, shared_mem_size, stream>>>(
               m_topk, k, reinterpret_cast<T*>(input),
@@ -297,18 +300,6 @@ void quant_impl(void* output, void* output_scale, void* input,
               reinterpret_cast<uint32_t*>(input_offset_by_experts),
               reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
               n_experts);
-    }
-  } else {
-    if (n_experts >= 16) {
-      cvt_fp16_to_fp4<T, FUSE_SILU_MUL, false, false>
-          <<<grid, block, 0, stream>>>(
-              m_topk, k, reinterpret_cast<T*>(input),
-              reinterpret_cast<float*>(input_global_scale),
-              reinterpret_cast<uint32_t*>(output),
-              reinterpret_cast<uint32_t*>(output_scale),
-              reinterpret_cast<uint32_t*>(input_offset_by_experts),
-              reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-              n_experts, /* bool low_latency */ true);
     } else {
       cvt_fp16_to_fp4<T, FUSE_SILU_MUL, false, true>
           <<<grid, block, 0, stream>>>(
@@ -320,7 +311,40 @@ void quant_impl(void* output, void* output_scale, void* input,
               reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
               n_experts, /* bool low_latency */ true);
     }
+    return;
   }
+
+  if (!experts_divisible_by_4) {
+    STD_TORCH_CHECK(
+        false,
+        "NVFP4 expert quantization requires num_experts divisible by 4. "
+        "The low-latency path additionally requires divisibility by 16. "
+        "Observed num_experts=",
+        n_experts);
+  }
+
+  if (blockRepeat <= 1 && experts_divisible_by_16) {
+    cvt_fp16_to_fp4<T, FUSE_SILU_MUL, false, false><<<grid, block, 0, stream>>>(
+        m_topk, k, reinterpret_cast<T*>(input),
+        reinterpret_cast<float*>(input_global_scale),
+        reinterpret_cast<uint32_t*>(output),
+        reinterpret_cast<uint32_t*>(output_scale),
+        reinterpret_cast<uint32_t*>(input_offset_by_experts),
+        reinterpret_cast<uint32_t*>(output_scale_offset_by_experts), n_experts,
+        /* bool low_latency */ true);
+    return;
+  }
+
+  size_t shared_mem_size = (n_experts + 1) * sizeof(uint32_t);
+  cvt_fp16_to_fp4<T, FUSE_SILU_MUL, false, false>
+      <<<grid, block, shared_mem_size, stream>>>(
+          m_topk, k, reinterpret_cast<T*>(input),
+          reinterpret_cast<float*>(input_global_scale),
+          reinterpret_cast<uint32_t*>(output),
+          reinterpret_cast<uint32_t*>(output_scale),
+          reinterpret_cast<uint32_t*>(input_offset_by_experts),
+          reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
+          n_experts);
 }
 
 }  // namespace vllm
