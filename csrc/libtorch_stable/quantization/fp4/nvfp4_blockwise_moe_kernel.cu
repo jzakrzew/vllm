@@ -205,8 +205,7 @@ void run_fp4_blockwise_scaled_group_mm_sm100(
     const torch::stable::Tensor& alphas,
     const torch::stable::Tensor& problem_sizes,
     const torch::stable::Tensor& expert_offsets,
-    const torch::stable::Tensor& sf_offsets, int M, int N, int K,
-    bool /*batch_invariant*/) {
+    const torch::stable::Tensor& sf_offsets, int M, int N, int K) {
   using ProblemShape =
       cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
   using ElementType = cutlass::float_e2m1_t;
@@ -626,8 +625,7 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
     const torch::stable::Tensor& alphas,
     const torch::stable::Tensor& problem_sizes,
     const torch::stable::Tensor& expert_offsets,
-    const torch::stable::Tensor& sf_offsets, int M, int N, int K,
-    bool /*batch_invariant*/) {
+    const torch::stable::Tensor& sf_offsets, int M, int N, int K) {
   // CUTLASS requires KernelScheduleAuto for SM120 NVFP4 grouped blockscaled
   // GEMMs. The instantiated kernel still resolves to a cooperative ptr-array
   // schedule, which is enforced by the static_assert in the implementation.
@@ -645,14 +643,13 @@ void run_fp4_blockwise_scaled_group_mm(
     const torch::stable::Tensor& alphas,
     const torch::stable::Tensor& problem_sizes,
     const torch::stable::Tensor& expert_offsets,
-    const torch::stable::Tensor& sf_offsets, int M, int N, int K,
-    bool batch_invariant) {
+    const torch::stable::Tensor& sf_offsets, int M, int N, int K) {
   int32_t version_num = get_sm_version_num();
 #if defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120
   if (version_num >= 120 && version_num < 130) {
     run_fp4_blockwise_scaled_group_mm_sm120(
         output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K, batch_invariant);
+        expert_offsets, sf_offsets, M, N, K);
     return;
   }
 #endif
@@ -660,7 +657,7 @@ void run_fp4_blockwise_scaled_group_mm(
   if (version_num >= 100 && version_num < 120) {
     run_fp4_blockwise_scaled_group_mm_sm100<OutType>(
         output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K, batch_invariant);
+        expert_offsets, sf_offsets, M, N, K);
     return;
   }
 #endif
@@ -696,8 +693,7 @@ void cutlass_fp4_group_mm(torch::stable::Tensor& output,
                           const torch::stable::Tensor& alphas,
                           const torch::stable::Tensor& problem_sizes,
                           const torch::stable::Tensor& expert_offsets,
-                          const torch::stable::Tensor& sf_offsets,
-                          bool batch_invariant) {
+                          const torch::stable::Tensor& sf_offsets) {
 #if (defined ENABLE_NVFP4_SM100 && ENABLE_NVFP4_SM100) || \
     (defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120)
   // Input validation
@@ -735,7 +731,7 @@ void cutlass_fp4_group_mm(torch::stable::Tensor& output,
   if (output.scalar_type() == torch::headeronly::ScalarType::BFloat16) {
     run_fp4_blockwise_scaled_group_mm<cutlass::bfloat16_t>(
         output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K, batch_invariant);
+        expert_offsets, sf_offsets, M, N, K);
   } else {
   #if defined ENABLE_NVFP4_SM120 && ENABLE_NVFP4_SM120
     int32_t version_num = get_sm_version_num();
@@ -747,7 +743,7 @@ void cutlass_fp4_group_mm(torch::stable::Tensor& output,
   #endif
     run_fp4_blockwise_scaled_group_mm<cutlass::half_t>(
         output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K, batch_invariant);
+        expert_offsets, sf_offsets, M, N, K);
   }
 #else
   STD_TORCH_CHECK_NOT_IMPLEMENTED(

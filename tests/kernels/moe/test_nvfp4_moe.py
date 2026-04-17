@@ -373,15 +373,6 @@ def test_cutlass_fp4_moe_batch_invariant(
             inplace=False,
         )
 
-        captured_batch_invariant: list[bool] = []
-        real_cutlass_fp4_moe_mm = ops.cutlass_fp4_moe_mm
-
-        def capture_cutlass_fp4_moe_mm(*args, **kwargs):
-            captured_batch_invariant.append(kwargs.get("batch_invariant", False))
-            return real_cutlass_fp4_moe_mm(*args, **kwargs)
-
-        monkeypatch.setattr(ops, "cutlass_fp4_moe_mm", capture_cutlass_fp4_moe_mm)
-
         batch_output = kernel.apply(
             hidden_states=hidden_states,
             w1=w1_q,
@@ -405,7 +396,6 @@ def test_cutlass_fp4_moe_batch_invariant(
             expert_map=None,
         )
 
-        assert captured_batch_invariant == [True, True, True, True]
         assert CutlassExpertsFp4._supports_batch_invariance()
         torch.testing.assert_close(
             batch_output[target_idx : target_idx + 1],

@@ -4,7 +4,6 @@
 
 import torch
 
-import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -620,7 +619,6 @@ def run_cutlass_moe_fp4(
         problem_sizes1,
         expert_offsets[:-1],
         blockscale_offsets[:-1],
-        batch_invariant=envs.VLLM_BATCH_INVARIANT,
     )
     del rep_a_fp4, rep_a_blockscale
     if activation == MoEActivation.SILU:
@@ -646,7 +644,6 @@ def run_cutlass_moe_fp4(
         problem_sizes2,
         expert_offsets[:-1],
         blockscale_offsets[:-1],
-        batch_invariant=envs.VLLM_BATCH_INVARIANT,
     )
     del int_fp4, int_blockscale
 

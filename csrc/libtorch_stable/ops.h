@@ -103,8 +103,7 @@ void cutlass_fp4_group_mm(torch::stable::Tensor& output,
                           const torch::stable::Tensor& alphas,
                           const torch::stable::Tensor& problem_sizes,
                           const torch::stable::Tensor& expert_offsets,
-                          const torch::stable::Tensor& sf_offsets,
-                          bool batch_invariant);
+                          const torch::stable::Tensor& sf_offsets);
 
 std::tuple<torch::stable::Tensor, torch::stable::Tensor> scaled_fp4_quant_func(
     torch::stable::Tensor const& input,
