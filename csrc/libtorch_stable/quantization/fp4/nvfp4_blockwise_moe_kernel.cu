@@ -61,6 +61,7 @@ __global__ void __get_group_gemm_starts(
     ElementAccumulator* alphas_base_as_int, const int32_t* expert_offsets,
     const int32_t* sf_offsets, const int32_t* problem_sizes_as_shapes,
     int64_t* a_strides, int64_t* b_strides, int64_t* c_strides,
+    const int64_t a_scales_row_stride, const int64_t b_scales_expert_stride,
     const int64_t a_stride_val, const int64_t b_stride_val,
     const int64_t c_stride_val, const int K, const int N) {
   int64_t expert_id = threadIdx.x;
@@ -72,7 +73,6 @@ __global__ void __get_group_gemm_starts(
   int64_t expert_offset = static_cast<int64_t>(expert_offsets[expert_id]);
   int64_t sf_offset = static_cast<int64_t>(sf_offsets[expert_id]);
   // size for block in block scale.
-  int64_t group_size = 16;
   int64_t m = static_cast<int64_t>(problem_sizes_as_shapes[expert_id * 3]);
   int64_t n = static_cast<int64_t>(problem_sizes_as_shapes[expert_id * 3 + 1]);
   int64_t k = static_cast<int64_t>(problem_sizes_as_shapes[expert_id * 3 + 2]);
@@ -80,7 +80,6 @@ __global__ void __get_group_gemm_starts(
          "unexpected problem sizes");
 
   int64_t half_k = static_cast<int64_t>(k / 2);
-  int64_t group_k = static_cast<int64_t>(k / group_size);
   // Shape of A as uint8/byte = [M, K // 2]
   // Shape of B as uint8/byte = [E, N, K // 2]
   a_offsets[expert_id] = a_base_as_int + expert_offset * half_k;
@@ -88,15 +87,17 @@ __global__ void __get_group_gemm_starts(
   b_offsets[expert_id] = b_base_as_int + expert_id * n * half_k;
   // Shape of C = [M, N]
   out_offsets[expert_id] = out_base_as_int + expert_offset * n;
-  // Shape of a_scale = [sum(sf_sizes), K // group_size]
-  a_scales_offsets[expert_id] = a_scales_base_as_int + sf_offset * group_k;
+  // Scale tensors are swizzled/padded in memory, so expert starts must use the
+  // actual storage strides rather than the logical K/group_size width.
+  a_scales_offsets[expert_id] =
+      a_scales_base_as_int + sf_offset * a_scales_row_stride;
 
   assert((reinterpret_cast<uintptr_t>(a_scales_offsets[expert_id]) % 128) ==
              0 &&
          "TMA requires 128-byte alignment");
 
-  // Shape of B scale = [E, N, K // group_size]
-  b_scales_offsets[expert_id] = b_scales_base_as_int + expert_id * n * group_k;
+  b_scales_offsets[expert_id] =
+      b_scales_base_as_int + expert_id * b_scales_expert_stride;
   assert((reinterpret_cast<uintptr_t>(b_scales_offsets[expert_id]) % 128) ==
              0 &&
          "TMA requires 128-byte alignment");
@@ -143,8 +144,9 @@ __global__ void __get_group_gemm_starts(
             static_cast<int32_t*>(problem_sizes.data_ptr()),                  \
             static_cast<int64_t*>(a_strides.data_ptr()),                      \
             static_cast<int64_t*>(b_strides.data_ptr()),                      \
-            static_cast<int64_t*>(c_strides.data_ptr()), a_stride_val,        \
-            b_stride_val, c_stride_val, K, N);                                \
+            static_cast<int64_t*>(c_strides.data_ptr()), a_scales.stride(0),  \
+            b_scales.stride(0), a_stride_val, b_stride_val, c_stride_val, K,  \
+            N);                                                               \
   }
 
 template <typename LayoutSFA, typename LayoutSFB, typename ScaleConfig>

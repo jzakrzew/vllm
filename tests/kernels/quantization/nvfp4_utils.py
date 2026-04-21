@@ -20,7 +20,8 @@ def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
     tmp = torch.reshape(a_sf_swizzled, (1, m_tiles, k_tiles, 32, 4, 4))
     tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
     out = tmp.reshape(m_tiles * 128, k_tiles * f // block_size)
-    return out[0:m, 0:k]
+    num_k_blocks = (k + block_size - 1) // block_size
+    return out[0:m, 0:num_k_blocks]
 
 
 def convert_swizzled_8x4_layout_to_linear(
@@ -32,7 +33,8 @@ def convert_swizzled_8x4_layout_to_linear(
     tmp = torch.reshape(a_sf_swizzled, (1, m_tiles, k_tiles, 8, 4))
     tmp = torch.permute(tmp, (0, 1, 3, 2, 4))
     out = tmp.reshape(m_tiles * 8, k_tiles * f // block_size)
-    return out[0:m, 0:k]
+    num_k_blocks = (k + block_size - 1) // block_size
+    return out[0:m, 0:num_k_blocks]
 
 
 def dequantize_nvfp4_to_dtype(
