@@ -1291,6 +1291,8 @@ def _extract_priorities(body: list, priorities: dict[str, list[str]], prefix: st
 # Column type alias for readability
 TableColumn = tuple[str, Callable[[dict[str, Any]], str]]
 
+FLASHINFER_ENCODER_ONLY_NOTE_MARKER = "§"
+
 # Shared column definitions -- order here matches the output table order
 _COL_BACKEND: TableColumn = ("Backend", lambda b: f"`{b['name']}`")
 _COL_VERSION: TableColumn = ("Version", lambda b: b.get("version", ""))
@@ -1312,8 +1314,19 @@ _COL_MM_PREFIX: TableColumn = (
     lambda b: bool_to_emoji(b["supports_mm_prefix"]),
 )
 _COL_DCP: TableColumn = ("DCP", lambda b: bool_to_emoji(b["supports_dcp"]))
-_COL_ATTN_TYPES: TableColumn = ("Attention Types", lambda b: b["attn_types"])
+_COL_ATTN_TYPES: TableColumn = (
+    "Attention Types",
+    lambda b: format_attention_types(b),
+)
 _COL_COMPUTE_CAP: TableColumn = ("Compute Cap.", lambda b: b["compute_capability"])
+
+
+def format_attention_types(backend: dict[str, Any]) -> str:
+    """Format supported attention types with generated caveat markers."""
+    attn_types = backend["attn_types"]
+    if backend["name"] == "FLASHINFER" and "Encoder Only" in attn_types:
+        return f"{attn_types}{FLASHINFER_ENCODER_ONLY_NOTE_MARKER}"
+    return attn_types
 
 
 def add_literal_quotes(value: str) -> str:
@@ -1715,6 +1728,15 @@ def generate_docs() -> str:
         footnotes.append(
             "> **†** FlashInfer uses TRTLLM attention on Blackwell (SM100), which "
             "supports sinks. Disable via `--attention-config.use_trtllm_attention=0`."
+        )
+    if any(
+        backend["name"] == "FLASHINFER" and "Encoder Only" in backend["attn_types"]
+        for backend in non_mla_backends
+    ):
+        footnotes.append(
+            f"> **{FLASHINFER_ENCODER_ONLY_NOTE_MARKER}** FlashInfer supports "
+            "encoder-only dense attention, but not encoder-only sliding-window "
+            "attention."
         )
     if fa_features:
         footnotes.append(
