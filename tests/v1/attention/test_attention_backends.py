@@ -324,6 +324,7 @@ def _test_backend_correctness(
     atol: float = 1e-2,
     rtol: float = 1e-2,
     tensor_parallel_size: int = 1,
+    model_dtype: str | torch.dtype = "auto",
 ):
     """
     Test that all backends produce similar outputs to a reference implementation
@@ -368,6 +369,7 @@ def _test_backend_correctness(
         model_name=model,
         tensor_parallel_size=1,  # Always use TP=1 to avoid multi-GPU requirements
         max_model_len=max(batch_spec.seq_lens),
+        dtype=model_dtype,
         block_size=block_size,
         num_gpu_blocks=8192,
         hf_config_override=hf_config_override,
@@ -748,6 +750,51 @@ def test_sliding_window_encoder_backend_correctness(
         causal=False,
         attn_type=AttentionType.ENCODER_ONLY,
         tensor_parallel_size=tensor_parallel_size,
+    )
+
+
+ENCODER_ONLY_BACKENDS_TO_TEST = []
+
+if AttentionBackendEnum.FLASHINFER in BACKENDS_TO_TEST:
+    ENCODER_ONLY_BACKENDS_TO_TEST.append(AttentionBackendEnum.FLASHINFER)
+
+
+@pytest.mark.parametrize(
+    "batch_spec_name",
+    [
+        "small_encoder_prefill",
+        "medium_encoder_prefill",
+    ],
+)
+@pytest.mark.parametrize("model", ["meta-llama/Meta-Llama-3-8B"])
+@pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])
+def test_encoder_only_backend_correctness(
+    default_vllm_config,
+    batch_spec_name: str,
+    model: str,
+    model_dtype: torch.dtype,
+):
+    """Test encoder-only dense bidirectional attention."""
+
+    def bidirectional_mask_mod(
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+        *,
+        context_len: int,
+    ):
+        return q_idx >= 0  # Always True
+
+    batch_spec = BATCH_SPECS[batch_spec_name]
+    _test_backend_correctness(
+        batch_spec,
+        model,
+        ENCODER_ONLY_BACKENDS_TO_TEST,
+        bidirectional_mask_mod,
+        causal=False,
+        attn_type=AttentionType.ENCODER_ONLY,
+        model_dtype=model_dtype,
     )
 
 

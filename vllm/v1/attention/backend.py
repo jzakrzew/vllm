@@ -289,6 +289,7 @@ class AttentionBackend(ABC):
         use_non_causal: bool = False,
         use_batch_invariant: bool = False,
         use_kv_connector: bool = False,
+        sliding_window: int | None = None,
     ) -> list[str]:
         invalid_reasons = []
         if not cls.supports_head_size(head_size):
