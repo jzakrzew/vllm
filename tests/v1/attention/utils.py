@@ -18,6 +18,11 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.model import ModelDType
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import (
+    is_quantized_kv_cache,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.attention.backend import (
     AttentionImpl,
     AttentionMetadataBuilder,
@@ -162,13 +167,25 @@ def create_standard_kv_cache_spec(
     cache), and a FullAttentionSpec otherwise.
     """
     if attn_type == AttentionType.ENCODER_ONLY:
+        dtype = vllm_config.model_config.dtype
+        encoder_attention_dtype = getattr(
+            vllm_config.model_config, "encoder_attention_dtype", "auto"
+        )
+        if encoder_attention_dtype != "auto":
+            dtype = (
+                current_platform.fp8_dtype()
+                if is_quantized_kv_cache(encoder_attention_dtype)
+                else kv_cache_dtype_str_to_dtype(
+                    encoder_attention_dtype, vllm_config.model_config
+                )
+            )
         return EncoderOnlyAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=vllm_config.model_config.get_num_kv_heads(
                 vllm_config.parallel_config
             ),
             head_size=vllm_config.model_config.get_head_size(),
-            dtype=vllm_config.model_config.dtype,
+            dtype=dtype,
         )
     return FullAttentionSpec(
         block_size=vllm_config.cache_config.block_size,

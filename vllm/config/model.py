@@ -85,6 +85,7 @@ ConvertType = Literal["none", "embed", "classify"]
 ConvertOption = Literal["auto", ConvertType]
 TokenizerMode = Literal["auto", "hf", "slow", "mistral", "deepseek_v32", "deepseek_v4"]
 ModelDType = Literal["auto", "half", "float16", "bfloat16", "float", "float32"]
+EncoderAttentionDType = Literal["auto", "fp8", "fp8_e4m3"]
 LogprobsMode = Literal[
     "raw_logits", "raw_logprobs", "processed_logits", "processed_logprobs"
 ]
@@ -315,6 +316,12 @@ class ModelConfig:
     """
     override_attention_dtype: str | None = None
     """Override dtype for attention"""
+    encoder_attention_dtype: EncoderAttentionDType = "auto"
+    """Data type for encoder attention computation:
+
+    - "auto" will use the model data type.
+    - "fp8" and "fp8_e4m3" enable FP8 encoder attention where supported.
+    """
     logits_processors: list[str | type[LogitsProcessor]] | None = None
     """One or more logits processors' fully-qualified class names or class
     definitions"""

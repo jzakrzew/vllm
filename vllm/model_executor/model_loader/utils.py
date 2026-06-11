@@ -99,7 +99,12 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
+    from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
+
     for _, module in model.named_modules():
+        if isinstance(module, (StageMissingLayer, PPMissingLayer)):
+            continue
+
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             # When quant methods need to process weights after loading

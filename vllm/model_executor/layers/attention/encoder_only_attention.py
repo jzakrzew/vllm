@@ -7,7 +7,10 @@ import torch
 
 from vllm.config import CacheConfig
 from vllm.config.vllm import VllmConfig
-from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import (
+    Attention,
+    _get_selector_kv_cache_dtype,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
@@ -72,7 +75,7 @@ class EncoderOnlyAttention(Attention):
         underlying_attn_backend = get_attn_backend(
             head_size,
             dtype,
-            kv_cache_dtype,
+            _get_selector_kv_cache_dtype(AttentionType.ENCODER_ONLY, kv_cache_dtype),
             attn_type=AttentionType.ENCODER_ONLY,
         )
 

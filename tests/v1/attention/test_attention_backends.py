@@ -18,6 +18,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import ModelConfig
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
@@ -29,6 +30,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import (
     set_kv_cache_layout,
 )
+from vllm.v1.attention.selector import AttentionSelectorConfig
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 BACKENDS_TO_TEST = [
@@ -224,6 +226,8 @@ def run_attention_backend(
     kv_cache: torch.Tensor,
     attn_type: AttentionType = AttentionType.DECODER,
     sliding_window: int | None = None,
+    kv_cache_dtype: str = "auto",
+    encoder_attention_dtype: str | None = None,
 ) -> torch.Tensor:
     """Run attention computation using the specified backend's AttentionImpl."""
 
@@ -283,6 +287,11 @@ def run_attention_backend(
     )
     head_size = vllm_config.model_config.get_head_size()
     scale = 1.0 / (head_size**0.5)
+    effective_kv_cache_dtype = (
+        encoder_attention_dtype
+        if encoder_attention_dtype is not None
+        else kv_cache_dtype
+    )
     impl = impl_cls(
         num_heads=num_heads,
         head_size=head_size,
@@ -291,7 +300,7 @@ def run_attention_backend(
         alibi_slopes=None,
         sliding_window=sliding_window,
         attn_type=attn_type,
-        kv_cache_dtype="auto",
+        kv_cache_dtype=effective_kv_cache_dtype,
     )
 
     # Create mock layer and output buffer
@@ -325,6 +334,9 @@ def _test_backend_correctness(
     rtol: float = 1e-2,
     tensor_parallel_size: int = 1,
     model_dtype: str | torch.dtype = "auto",
+    kv_cache_dtype: str = "auto",
+    encoder_attention_dtype: str | None = None,
+    input_scale: float = 1.0,
 ):
     """
     Test that all backends produce similar outputs to a reference implementation
@@ -374,6 +386,9 @@ def _test_backend_correctness(
         num_gpu_blocks=8192,
         hf_config_override=hf_config_override,
     )
+    vllm_config.cache_config.cache_dtype = kv_cache_dtype
+    if encoder_attention_dtype is not None:
+        vllm_config.model_config.encoder_attention_dtype = encoder_attention_dtype
     device = torch.device(f"{DEVICE_TYPE}:0")
 
     kv_cache_spec = create_standard_kv_cache_spec(vllm_config, attn_type)
@@ -405,9 +420,18 @@ def _test_backend_correctness(
         context_len = s_len - q_len
 
         # Generate Q, K, V for the whole sequence to be used in SDPA
-        q = torch.randn(q_len, num_q_heads, head_size, dtype=dtype, device=device)
-        k_full = torch.randn(s_len, num_kv_heads, head_size, dtype=dtype, device=device)
-        v_full = torch.randn(s_len, num_kv_heads, head_size, dtype=dtype, device=device)
+        q = (
+            torch.randn(q_len, num_q_heads, head_size, dtype=dtype, device=device)
+            * input_scale
+        )
+        k_full = (
+            torch.randn(s_len, num_kv_heads, head_size, dtype=dtype, device=device)
+            * input_scale
+        )
+        v_full = (
+            torch.randn(s_len, num_kv_heads, head_size, dtype=dtype, device=device)
+            * input_scale
+        )
 
         # SDPA expects (N, H, L, D), so unsqueeze batch and permute
         q_sdpa_in = q.unsqueeze(0).transpose(1, 2)
@@ -523,6 +547,8 @@ def _test_backend_correctness(
                 kv_cache_for_backend,
                 sliding_window=sliding_window,
                 attn_type=attn_type,
+                kv_cache_dtype=kv_cache_dtype,
+                encoder_attention_dtype=encoder_attention_dtype,
             )
         finally:
             if reset_kv_cache_layout:
@@ -796,6 +822,76 @@ def test_encoder_only_backend_correctness(
         attn_type=AttentionType.ENCODER_ONLY,
         model_dtype=model_dtype,
     )
+
+
+@pytest.mark.parametrize("encoder_attention_dtype", ["fp8", "fp8_e4m3"])
+def test_flash_attention_encoder_only_fp8_backend_correctness(
+    default_vllm_config,
+    encoder_attention_dtype: str,
+):
+    """Test FlashAttention encoder-only FP8 against an SDPA reference."""
+    if not current_platform.is_cuda() or not torch.cuda.is_available():
+        pytest.skip("FlashAttention FP8 encoder-only test requires CUDA")
+    if not current_platform.has_device_capability(90):
+        pytest.skip("FlashAttention FP8 encoder-only test requires SM90")
+
+    from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+
+    if get_flash_attn_version(head_size=128) != 3:
+        pytest.skip("FlashAttention FP8 encoder-only test requires FA3")
+
+    def bidirectional_mask_mod(
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+        *,
+        context_len: int,
+    ):
+        return q_idx >= 0  # Always True
+
+    _test_backend_correctness(
+        BatchSpec(seq_lens=[32, 64], query_lens=[32, 64]),
+        "meta-llama/Meta-Llama-3-8B",
+        [AttentionBackendEnum.FLASH_ATTN],
+        bidirectional_mask_mod,
+        causal=False,
+        attn_type=AttentionType.ENCODER_ONLY,
+        model_dtype=torch.float16,
+        kv_cache_dtype="auto",
+        encoder_attention_dtype=encoder_attention_dtype,
+        input_scale=0.25,
+        atol=2e-1,
+        rtol=2e-1,
+    )
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+    reason="FlashInfer is not available",
+)
+def test_flashinfer_rejects_encoder_only_sliding_window_selection():
+    backend = AttentionBackendEnum.FLASHINFER.get_class()
+
+    attn_selector_config = AttentionSelectorConfig(
+        head_size=128,
+        dtype=torch.float16,
+        kv_cache_dtype="auto",
+        block_size=16,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        use_per_head_quant_scales=False,
+        attn_type=AttentionType.ENCODER_ONLY,
+        sliding_window=2048,
+    )
+    invalid_reasons = backend.validate_configuration(
+        device_capability=DeviceCapability(10, 0),
+        **attn_selector_config._asdict(),
+    )
+
+    assert "encoder-only sliding-window attention not supported" in invalid_reasons
 
 
 NON_CAUSAL_BACKENDS_TO_TEST = [

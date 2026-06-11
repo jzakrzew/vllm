@@ -7375,11 +7375,21 @@ class GPUModelRunner(
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         for layer_name, attn_module in attn_layers.items():
             if attn_module.attn_type == AttentionType.ENCODER_ONLY:
+                encoder_attention_dtype = getattr(
+                    attn_module, "encoder_attention_dtype", attn_module.kv_cache_dtype
+                )
+                spec_dtype = (
+                    current_platform.fp8_dtype()
+                    if is_quantized_kv_cache(encoder_attention_dtype)
+                    else kv_cache_dtype_str_to_dtype(
+                        encoder_attention_dtype, self.model_config
+                    )
+                )
                 attn_spec: AttentionSpec = EncoderOnlyAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=attn_module.num_kv_heads,
                     head_size=attn_module.head_size,
-                    dtype=self.kv_cache_dtype,
+                    dtype=spec_dtype,
                 )
                 encoder_only_attn_specs[attn_spec].append(layer_name)
                 self.runner_only_attn_layers.add(layer_name)

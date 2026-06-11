@@ -10,6 +10,8 @@ import numpy as np
 import torch
 
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
@@ -695,6 +697,55 @@ class FlashAttentionImpl(AttentionImpl):
         if vllm_config is not None and self.dcp_world_size > 1:
             self._dcp_dtype = vllm_config.model_config.dtype
 
+        self._encoder_fp8_per_tensor_quant: QuantFP8 | None = None
+        self._encoder_fp8_quant_by_group_width: dict[int, QuantFP8] = {}
+
+    def _get_encoder_fp8_quant(self, group_width: int | None) -> QuantFP8:
+        if group_width is None:
+            if self._encoder_fp8_per_tensor_quant is None:
+                self._encoder_fp8_per_tensor_quant = QuantFP8(
+                    static=True,
+                    group_shape=GroupShape.PER_TENSOR,
+                )
+            return self._encoder_fp8_per_tensor_quant
+
+        quant = self._encoder_fp8_quant_by_group_width.get(group_width)
+        if quant is None:
+            quant = QuantFP8(
+                static=True,
+                group_shape=GroupShape(-1, group_width),
+            )
+            self._encoder_fp8_quant_by_group_width[group_width] = quant
+        return quant
+
+    def _quantize_encoder_fp8_activation(
+        self,
+        tensor: torch.Tensor,
+        scale: torch.Tensor,
+        group_width: int,
+        name: str,
+    ) -> torch.Tensor:
+        if tensor.dtype == current_platform.fp8_dtype():
+            return tensor
+
+        if scale.numel() == 1:
+            quant = self._get_encoder_fp8_quant(None)
+        else:
+            hidden_size = tensor.shape[-2] * tensor.shape[-1]
+            expected_scales = hidden_size // group_width
+            if scale.numel() != expected_scales:
+                raise ValueError(
+                    f"{name} FP8 scale has {scale.numel()} elements, "
+                    f"expected 1 or {expected_scales} for tensor shape "
+                    f"{tuple(tensor.shape)} and group_width={group_width}."
+                )
+            quant = self._get_encoder_fp8_quant(group_width)
+
+        tensor_shape = tensor.shape
+        tensor_2d = tensor.reshape(-1, tensor_shape[-2] * tensor_shape[-1])
+        quantized, _ = quant(tensor_2d, scale)
+        return quantized.reshape(tensor_shape)
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -1049,10 +1100,33 @@ class FlashAttentionImpl(AttentionImpl):
             "FlashAttention version not detected."
         )
 
-        # For encoder attention, process FP8 quantization if needed
         if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError(
-                "quantization is not supported for encoder attention"
+            if (
+                self.vllm_flash_attn_version != 3
+                or not current_platform.is_device_capability_family(90)
+            ):
+                raise NotImplementedError(
+                    "FP8 encoder attention is only supported with "
+                    "FlashAttention 3 on SM90 GPUs."
+                )
+
+            query = self._quantize_encoder_fp8_activation(
+                query,
+                layer._q_scale,  # type: ignore[attr-defined]
+                self.head_size * self.num_queries_per_kv,
+                "query",
+            )
+            key = self._quantize_encoder_fp8_activation(
+                key,
+                layer._k_scale,  # type: ignore[attr-defined]
+                self.head_size,
+                "key",
+            )
+            value = self._quantize_encoder_fp8_activation(
+                value,
+                layer._v_scale,  # type: ignore[attr-defined]
+                self.head_size,
+                "value",
             )
 
         # Use encoder-specific metadata for sequence information

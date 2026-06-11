@@ -51,6 +51,31 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _get_effective_encoder_attention_dtype(
+    vllm_config: VllmConfig,
+    attn_type: str,
+    kv_cache_dtype: str,
+) -> str:
+    model_config = vllm_config.model_config
+    encoder_attention_dtype = (
+        getattr(model_config, "encoder_attention_dtype", "auto")
+        if model_config is not None
+        else "auto"
+    )
+    if (
+        attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY)
+        and encoder_attention_dtype != "auto"
+    ):
+        return encoder_attention_dtype
+    return kv_cache_dtype
+
+
+def _get_selector_kv_cache_dtype(attn_type: str, kv_cache_dtype: str) -> str:
+    if attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
+        return "auto"
+    return kv_cache_dtype
+
+
 def validate_kv_sharing_target(
     current_layer_name, target_layer_name, static_forward_context
 ):
@@ -277,6 +302,9 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_cache_dtype, vllm_config.model_config
         )
         self.kv_cache_dtype = kv_cache_dtype
+        self.encoder_attention_dtype = _get_effective_encoder_attention_dtype(
+            vllm_config, attn_type, kv_cache_dtype
+        )
         self.calculate_kv_scales = calculate_kv_scales
         if num_kv_heads is None:
             num_kv_heads = num_heads
@@ -304,7 +332,7 @@ class Attention(nn.Module, AttentionLayerBase):
             self.attn_backend = get_attn_backend(
                 head_size,
                 dtype,
-                kv_cache_dtype,
+                _get_selector_kv_cache_dtype(attn_type, kv_cache_dtype),
                 use_mla=False,
                 has_sink=self.has_sink,
                 use_mm_prefix=self.use_mm_prefix,
@@ -377,7 +405,7 @@ class Attention(nn.Module, AttentionLayerBase):
             num_kv_heads,
             alibi_slopes,
             sliding_window,
-            kv_cache_dtype,
+            self.encoder_attention_dtype,
             logits_soft_cap,
             attn_type,
             kv_sharing_target_layer_name,
