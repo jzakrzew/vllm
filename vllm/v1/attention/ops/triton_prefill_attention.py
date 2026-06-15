@@ -39,6 +39,9 @@ def _fwd_kernel(
     K,
     V,
     sm_scale,
+    q_scale,
+    k_scale,
+    v_scale,
     B_Start_Loc,
     B_Seqlen,
     Out,
@@ -58,12 +61,26 @@ def _fwd_kernel(
     SLIDING_WINDOW_Q: tl.constexpr,
     SLIDING_WINDOW_K: tl.constexpr,
     Lk: tl.constexpr,
+    USE_FP8_DESCALE: tl.constexpr,
+    Q_SCALE_PER_KV_HEAD: tl.constexpr,
+    K_SCALE_PER_KV_HEAD: tl.constexpr,
+    V_SCALE_PER_KV_HEAD: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     start_m = tl.program_id(2)
 
     cur_kv_head = cur_head // kv_group_num
+    score_scale = sm_scale
+    value_scale = 1.0
+    if USE_FP8_DESCALE:
+        q_scale_idx = cur_kv_head if Q_SCALE_PER_KV_HEAD else 0
+        k_scale_idx = cur_kv_head if K_SCALE_PER_KV_HEAD else 0
+        v_scale_idx = cur_kv_head if V_SCALE_PER_KV_HEAD else 0
+        score_scale = (
+            sm_scale * tl.load(q_scale + q_scale_idx) * tl.load(k_scale + k_scale_idx)
+        )
+        value_scale = tl.load(v_scale + v_scale_idx)
 
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
@@ -143,7 +160,7 @@ def _fwd_kernel(
         )
 
         qk = tl.dot(q, k)
-        qk = tl.where(mask, qk * sm_scale, -1.0e8)
+        qk = tl.where(mask, qk * score_scale, -1.0e8)
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk -= m_ij[:, None]
         p = tl.math.exp2(qk)
@@ -166,6 +183,8 @@ def _fwd_kernel(
         m_i = m_ij
 
     acc = acc / l_i[:, None]
+    if USE_FP8_DESCALE:
+        acc *= value_scale
     off_o = (
         (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs
         + cur_head * stride_oh
@@ -200,6 +219,9 @@ def context_attention_fwd(
     softmax_scale: float | None = None,
     sliding_window_q: int | None = None,
     sliding_window_k: int | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ):
     """
     q, k, v: [b * s, head, head_dim]
@@ -208,6 +230,25 @@ def context_attention_fwd(
     out: [b * s, head, head_dim]
     """
     BLOCK = get_block_size(q.dtype)
+    fp8_dtype = current_platform.fp8_dtype()
+    fp8_inputs = q.dtype == fp8_dtype or k.dtype == fp8_dtype or v.dtype == fp8_dtype
+    if fp8_inputs:
+        if q.dtype != fp8_dtype or k.dtype != fp8_dtype or v.dtype != fp8_dtype:
+            raise ValueError(
+                "FP8 context attention requires q, k, and v to all use "
+                f"{fp8_dtype}. Got q={q.dtype}, k={k.dtype}, v={v.dtype}."
+            )
+        if q_scale is None or k_scale is None or v_scale is None:
+            raise ValueError(
+                "FP8 context attention requires q_scale, k_scale, and v_scale."
+            )
+        q_scale = q_scale.reshape(-1)
+        k_scale = k_scale.reshape(-1)
+        v_scale = v_scale.reshape(-1)
+    else:
+        q_scale = q
+        k_scale = k
+        v_scale = v
 
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 
@@ -217,6 +258,26 @@ def context_attention_fwd(
 
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
+    num_kv_heads = k.shape[1]
+
+    q_scale_per_kv_head = fp8_inputs and q_scale.numel() != 1
+    k_scale_per_kv_head = fp8_inputs and k_scale.numel() != 1
+    v_scale_per_kv_head = fp8_inputs and v_scale.numel() != 1
+    if q_scale_per_kv_head and q_scale.numel() != num_kv_heads:
+        raise ValueError(
+            f"FP8 q_scale must have 1 or {num_kv_heads} elements, "
+            f"got {q_scale.numel()}."
+        )
+    if k_scale_per_kv_head and k_scale.numel() != num_kv_heads:
+        raise ValueError(
+            f"FP8 k_scale must have 1 or {num_kv_heads} elements, "
+            f"got {k_scale.numel()}."
+        )
+    if v_scale_per_kv_head and v_scale.numel() != num_kv_heads:
+        raise ValueError(
+            f"FP8 v_scale must have 1 or {num_kv_heads} elements, "
+            f"got {v_scale.numel()}."
+        )
 
     grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
     num_warps = 4 if Lk <= 64 else 8
@@ -229,6 +290,9 @@ def context_attention_fwd(
         k,
         v,
         sm_scale,
+        q_scale,
+        k_scale,
+        v_scale,
         b_start_loc,
         b_seq_len,
         o,
@@ -247,6 +311,10 @@ def context_attention_fwd(
         IS_CAUSAL=is_causal,
         SLIDING_WINDOW_Q=sliding_window_q,
         SLIDING_WINDOW_K=sliding_window_k,
+        USE_FP8_DESCALE=fp8_inputs,
+        Q_SCALE_PER_KV_HEAD=q_scale_per_kv_head,
+        K_SCALE_PER_KV_HEAD=k_scale_per_kv_head,
+        V_SCALE_PER_KV_HEAD=v_scale_per_kv_head,
         num_warps=num_warps,
         num_stages=1,
         Lk=Lk,

@@ -12,7 +12,9 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
     QuantKey,
     kFp8StaticTensorSym,
 )
@@ -371,6 +373,8 @@ class TritonAttentionImpl(AttentionImpl):
     # Per-token-head quant: scale views carved from inline head padding.
     _k_scale_cache: torch.Tensor | None = None
     _v_scale_cache: torch.Tensor | None = None
+    _encoder_fp8_per_tensor_quant: QuantFP8 | None = None
+    _encoder_fp8_quant_by_group_width: dict[int, QuantFP8]
 
     def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
         """Extract per-head scale views from the padded head dimension.
@@ -423,6 +427,67 @@ class TritonAttentionImpl(AttentionImpl):
             storage_offset=v_base_f32 + scale_off_f32,
         )
         self._v_scale_cache.fill_(1.0)
+
+    def _get_encoder_fp8_quant(self, group_width: int | None) -> QuantFP8:
+        if group_width is None:
+            assert self._encoder_fp8_per_tensor_quant is not None
+            return self._encoder_fp8_per_tensor_quant
+
+        try:
+            return self._encoder_fp8_quant_by_group_width[group_width]
+        except KeyError as err:
+            raise ValueError(
+                f"Unexpected FP8 encoder quantization group width {group_width}."
+            ) from err
+
+    def _init_encoder_fp8_quant(self) -> None:
+        self._encoder_fp8_per_tensor_quant = None
+        self._encoder_fp8_quant_by_group_width = {}
+        if self.attn_type not in (
+            AttentionType.ENCODER,
+            AttentionType.ENCODER_ONLY,
+        ) or self.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+            return
+
+        self._encoder_fp8_per_tensor_quant = QuantFP8(
+            static=True,
+            group_shape=GroupShape.PER_TENSOR,
+        )
+        group_widths = (self.head_size, self.head_size * self.num_queries_per_kv)
+        for group_width in dict.fromkeys(group_widths):
+            self._encoder_fp8_quant_by_group_width[group_width] = QuantFP8(
+                static=True,
+                group_shape=GroupShape(-1, group_width),
+            )
+
+    def _quantize_encoder_fp8_activation(
+        self,
+        tensor: torch.Tensor,
+        scale: torch.Tensor,
+        group_width: int,
+        name: str,
+    ) -> torch.Tensor:
+        if tensor.dtype == self.fp8_dtype:
+            return tensor
+
+        scale = scale.reshape(-1)
+        if scale.numel() == 1:
+            quant = self._get_encoder_fp8_quant(None)
+        else:
+            hidden_size = tensor.shape[-2] * tensor.shape[-1]
+            expected_scales = hidden_size // group_width
+            if scale.numel() != expected_scales:
+                raise ValueError(
+                    f"{name} FP8 scale has {scale.numel()} elements, "
+                    f"expected 1 or {expected_scales} for tensor shape "
+                    f"{tuple(tensor.shape)} and group_width={group_width}."
+                )
+            quant = self._get_encoder_fp8_quant(group_width)
+
+        tensor_shape = tensor.shape
+        tensor_2d = tensor.reshape(-1, tensor_shape[-2] * tensor_shape[-1])
+        quantized, _ = quant(tensor_2d, scale)
+        return quantized.reshape(tensor_shape)
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return quant_key == kFp8StaticTensorSym
@@ -481,6 +546,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        self._init_encoder_fp8_quant()
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel Xe2/Xe3).  The dead branch
@@ -664,11 +730,35 @@ class TritonAttentionImpl(AttentionImpl):
             attn_metadata: Encoder attention metadata
             layer: The attention layer
         """
-        # Quantized KV cache is not supported for encoder attention.
         if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError(
-                "quantized KV cache is not supported for encoder attention"
+            if self.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+                raise NotImplementedError(
+                    "Triton encoder attention only supports fp8/fp8_e4m3 "
+                    f"quantization, got {self.kv_cache_dtype}."
+                )
+            query = self._quantize_encoder_fp8_activation(
+                query,
+                layer._q_scale,  # type: ignore[attr-defined]
+                self.head_size * self.num_queries_per_kv,
+                "query",
             )
+            key = self._quantize_encoder_fp8_activation(
+                key,
+                layer._k_scale,  # type: ignore[attr-defined]
+                self.head_size,
+                "key",
+            )
+            value = self._quantize_encoder_fp8_activation(
+                value,
+                layer._v_scale,  # type: ignore[attr-defined]
+                self.head_size,
+                "value",
+            )
+            q_scale = layer._q_scale  # type: ignore[attr-defined]
+            k_scale = layer._k_scale  # type: ignore[attr-defined]
+            v_scale = layer._v_scale  # type: ignore[attr-defined]
+        else:
+            q_scale = k_scale = v_scale = None
 
         # Use encoder-specific metadata for sequence information
         query_start_loc = attn_metadata.query_start_loc
@@ -688,6 +778,9 @@ class TritonAttentionImpl(AttentionImpl):
             softmax_scale=self.scale,
             sliding_window_q=self.sliding_window[0],
             sliding_window_k=self.sliding_window[1],
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
         return output
 

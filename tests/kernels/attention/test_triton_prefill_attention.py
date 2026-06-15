@@ -75,6 +75,22 @@ def ref_masked_attention(
     return output
 
 
+def quantize_fp8_by_group(
+    tensor: torch.Tensor,
+    scale: torch.Tensor,
+    group_width: int,
+) -> torch.Tensor:
+    fp8_dtype = current_platform.fp8_dtype()
+    tensor_shape = tensor.shape
+    tensor_2d = tensor.reshape(tensor_shape[0], -1)
+    if scale.numel() == 1:
+        return (tensor_2d / scale).to(fp8_dtype).reshape(tensor_shape)
+
+    quantized = tensor_2d.reshape(tensor_shape[0], scale.numel(), group_width)
+    quantized = (quantized / scale.view(1, -1, 1)).to(fp8_dtype)
+    return quantized.reshape(tensor_shape)
+
+
 @pytest.mark.parametrize("B", [5])
 @pytest.mark.parametrize("max_seq_len", [1024])
 @pytest.mark.parametrize("H_Q", [32])
@@ -151,6 +167,84 @@ def test_context_attention(
 
     # Compare outputs
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("scale_per_kv_head", [False, True])
+def test_context_attention_fp8(scale_per_kv_head: bool):
+    """Test context attention with FP8 direct Q/K/V inputs."""
+    if not current_platform.is_cuda() or not torch.cuda.is_available():
+        pytest.skip("FP8 Triton context attention test requires CUDA")
+    if not current_platform.has_device_capability(90):
+        pytest.skip("FP8 Triton context attention test requires SM90")
+
+    torch.manual_seed(42)
+
+    B = 2
+    max_seq_len = 64
+    H_Q = 4
+    H_KV = 2
+    D = 64
+    dtype = torch.float16
+
+    seq_lens = torch.tensor([32, 64], dtype=torch.int32, device=DEVICE_TYPE)
+    total_tokens = seq_lens.sum().item()
+    b_start_loc = torch.zeros(B, dtype=torch.int32, device=DEVICE_TYPE)
+    b_start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+
+    q = torch.randn(total_tokens, H_Q, D, dtype=dtype, device=DEVICE_TYPE) * 0.25
+    k = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=DEVICE_TYPE) * 0.25
+    v = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=DEVICE_TYPE) * 0.25
+    if scale_per_kv_head:
+        q_scale = torch.tensor(
+            [0.03125, 0.0625], dtype=torch.float32, device=DEVICE_TYPE
+        )
+        k_scale = torch.tensor(
+            [0.03125, 0.0625], dtype=torch.float32, device=DEVICE_TYPE
+        )
+        v_scale = torch.tensor(
+            [0.03125, 0.0625], dtype=torch.float32, device=DEVICE_TYPE
+        )
+    else:
+        q_scale = torch.tensor(0.03125, dtype=torch.float32, device=DEVICE_TYPE)
+        k_scale = torch.tensor(0.03125, dtype=torch.float32, device=DEVICE_TYPE)
+        v_scale = torch.tensor(0.03125, dtype=torch.float32, device=DEVICE_TYPE)
+
+    q_fp8 = quantize_fp8_by_group(q, q_scale, D * (H_Q // H_KV))
+    k_fp8 = quantize_fp8_by_group(k, k_scale, D)
+    v_fp8 = quantize_fp8_by_group(v, v_scale, D)
+    o = torch.empty_like(q)
+
+    context_attention_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        o,
+        b_start_loc,
+        seq_lens,
+        max_seq_len,
+        is_causal=False,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+    o_ref = torch.zeros_like(q)
+    for i in range(B):
+        start = b_start_loc[i].item()
+        end = start + seq_lens[i].item()
+
+        q_seq = q[start:end]
+        k_seq = k[start:end].repeat_interleave(H_Q // H_KV, dim=1)
+        v_seq = v[start:end].repeat_interleave(H_Q // H_KV, dim=1)
+
+        o_ref[start:end] = ref_masked_attention(
+            q_seq,
+            k_seq,
+            v_seq,
+            is_causal=False,
+        )
+
+    torch.testing.assert_close(o, o_ref, rtol=2e-1, atol=2e-1)
 
 
 @pytest.mark.parametrize("B", [4])
