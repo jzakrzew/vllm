@@ -28,6 +28,8 @@ def create_encoder_only_attention_backend(
 ) -> type[AttentionBackend]:
     prefix = "EncoderOnlyAttention_"
     underlying_builder = underlying_attn_backend.get_builder_cls()
+    if hasattr(underlying_builder, "get_encoder_builder_cls"):
+        underlying_builder = underlying_builder.get_encoder_builder_cls()
 
     class EncoderOnlyAttentionBuilder(underlying_builder):  # type: ignore
         def build(

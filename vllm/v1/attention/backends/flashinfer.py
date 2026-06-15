@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import numpy as np
 import torch
@@ -28,7 +28,9 @@ from vllm.config import (
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
     QuantKey,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
@@ -38,6 +40,7 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
     can_use_trtllm_attention,
+    is_flashinfer_cudnn_fp8_prefill_attn_supported,
     use_trtllm_attention,
 )
 from vllm.utils.math_utils import cdiv
@@ -85,6 +88,22 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
+
+# FlashInfer backends that require the full plan() path on every call.
+_ENCODER_FULL_PLAN_BACKENDS = frozenset({"cudnn", "cute-dsl", "cutlass"})
+
+
+def _get_flashinfer_encoder_fp8_backend() -> str | None:
+    if is_flashinfer_cudnn_fp8_prefill_attn_supported():
+        return "cudnn"
+    return None
+
+
+def _encoder_cudagraph_mode_enabled(cudagraph_mode: CUDAGraphMode) -> bool:
+    separate_routine = getattr(cudagraph_mode, "separate_routine", None)
+    if callable(separate_routine) and separate_routine():
+        return cudagraph_mode.mixed_mode() == CUDAGraphMode.FULL
+    return cudagraph_mode == CUDAGraphMode.FULL
 
 
 def _get_trtllm_gen_workspace_buffer():
@@ -497,13 +516,6 @@ class FIDecode:
 
 
 @dataclass
-class FIEncoderPrefill:
-    """Metadata for encoder-only self-attention without KV cache."""
-
-    wrapper: BatchPrefillWithRaggedKVCacheWrapper
-
-
-@dataclass
 class TRTLLMPrefill:
     """Metadata for the TRTLLM prefill pathway."""
 
@@ -578,12 +590,6 @@ class FlashInferMetadata:
     Will be `None` if `num_decode_tokens == 0`.
     """
 
-    encoder_prefill: FIEncoderPrefill | None
-    """
-    Holds the metadata for encoder-only self-attention.
-    Will be `None` for decoder attention.
-    """
-
     # --- Special Case: Cascade Attention ---
 
     use_cascade: bool
@@ -595,7 +601,18 @@ class FlashInferMetadata:
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
 
-class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+@dataclass
+class _FlashInferEncoderOnlyMetadata:
+    """Metadata for encoder-only self-attention without KV cache."""
+
+    num_actual_tokens: int
+    q_data_type: torch.dtype
+    prefill_wrapper: BatchPrefillWithRaggedKVCacheWrapper
+
+
+class _FlashInferMetadataBuilderBase(
+    AttentionMetadataBuilder[FlashInferMetadata | _FlashInferEncoderOnlyMetadata]
+):
     reorder_batch_threshold: int = 1
 
     def __init__(
@@ -606,15 +623,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._init_common(vllm_config, layer_names)
+
+    def _should_check_kv_cache_model_dtype_match(self) -> bool:
+        return True
+
+    def _init_common(
+        self,
+        vllm_config: VllmConfig,
+        layer_names: list[str],
+    ) -> None:
         self.cache_config = vllm_config.cache_config
         self.model_config = vllm_config.model_config
         self.attention_config = vllm_config.attention_config
         self._workspace_buffer = None
-        self._prefill_wrapper: (
-            BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
-        ) = None  # Wrapper for prefill/append
-        self._decode_wrapper = None  # Wrapper for decode (general shape)
-        self._encoder_prefill_wrapper = None  # Wrapper for encoder-only attention
 
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
@@ -626,32 +648,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.disable_split_kv = False
 
         self.compilation_config = vllm_config.compilation_config
-        max_num_pages_per_req = cdiv(
-            self.model_config.max_model_len, self.kv_cache_spec.block_size
-        )
-        max_num_reqs = vllm_config.scheduler_config.max_num_seqs
-        max_num_pages = max_num_reqs * max_num_pages_per_req
-        speculative_config = vllm_config.speculative_config
-        num_spec_tokens = (
-            speculative_config.num_speculative_tokens
-            if speculative_config is not None
-            else 0
-        )
-        self.enable_cuda_graph = (
-            self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-        )
-        if self.enable_cuda_graph:
-            # For full cudagraph capture, one `decode_wrapper` for each batch
-            # size is needed for FlashInfer.
-            self._decode_wrappers_cudagraph: dict[
-                int, BatchDecodeWithPagedKVCacheWrapper
-            ] = {}
-            self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
-            if self.compilation_config.max_cudagraph_capture_size is not None:
-                self._decode_cudagraph_max_bs = min(
-                    self._decode_cudagraph_max_bs,
-                    self.compilation_config.max_cudagraph_capture_size,
-                )
+        self._max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self._cudagraph_max_bs = 0
+
         try:
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
@@ -671,7 +670,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.num_qo_heads = self.model_config.get_num_attention_heads(
             self.vllm_config.parallel_config
         )
-
         self.num_kv_heads = self.kv_cache_spec.num_kv_heads
         self.head_dim = self.kv_cache_spec.head_size
         self.page_size = self.kv_cache_spec.block_size
@@ -699,7 +697,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             self.cache_dtype = "auto"
             self.is_kvcache_nvfp4 = False
-            assert self.kv_cache_spec.dtype == self.model_config.dtype
+            if self._should_check_kv_cache_model_dtype_match():
+                assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
 
         # Use model dtype as q dtype when TRTLLM attn is not supported, or
@@ -727,8 +726,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.use_trtllm_decode_attention = can_use_trtllm
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=can_use_trtllm)
 
-        self._cascade_wrapper = None  # Wrapper for cascade attention
-
         # Global hyperparameters shared by all attention layers
         # TODO: discard this for trtllm-gen backend
         self.global_hyperparameters = infer_global_hyperparameters(
@@ -751,12 +748,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.pin_memory = (
             not vllm_config.use_v2_model_runner and is_pin_memory_available()
         )
-        self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
-        self.paged_kv_indptr_cpu_buffer = torch.zeros_like(
-            self.paged_kv_indptr.cpu, pin_memory=self.pin_memory
-        )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
-        self.paged_kv_indices = self._make_buffer(max_num_pages)
-        self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
+
+    def _init_cudagraph_max_bs(self) -> None:
+        if self.compilation_config.max_cudagraph_capture_size is not None:
+            self._cudagraph_max_bs = min(
+                self._cudagraph_max_bs,
+                self.compilation_config.max_cudagraph_capture_size,
+            )
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype = torch.int32
@@ -772,7 +770,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     @override  # type: ignore[misc]
     @classmethod
     def get_cudagraph_support(
-        cls: type["FlashInferMetadataBuilder"],
+        cls: type["_FlashInferMetadataBuilderBase"],
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
@@ -824,6 +822,210 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def set_workspace_buffer(self, workspace_buffer: torch.Tensor):
         self._workspace_buffer = workspace_buffer
 
+
+class _FlashInferEncoderOnlyMetadataBuilder(_FlashInferMetadataBuilderBase):
+    def _should_check_kv_cache_model_dtype_match(self) -> bool:
+        return False
+
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._encoder_prefill_wrapper = None
+        self._encoder_prefill_wrapper_backend: str | None = None
+
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        self.enable_cuda_graph = _encoder_cudagraph_mode_enabled(cudagraph_mode)
+        if self.enable_cuda_graph:
+            self._encoder_wrappers_cudagraph: dict[
+                int, BatchPrefillWithRaggedKVCacheWrapper
+            ] = {}
+            self._cudagraph_max_bs = self._max_num_reqs
+            self._init_cudagraph_max_bs()
+            self.encoder_qo_indptr = self._make_buffer(self._max_num_reqs + 1)
+            self.encoder_kv_indptr = self._make_buffer(self._max_num_reqs + 1)
+
+    def _get_encoder_prefill_wrapper(
+        self,
+        num_reqs: int,
+        use_cudagraph: bool = False,
+        backend: str = "auto",
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        if use_cudagraph:
+            prefill_wrapper = self._encoder_wrappers_cudagraph.get(num_reqs)
+        else:
+            prefill_wrapper = self._encoder_prefill_wrapper
+
+        if prefill_wrapper is None or (
+            not use_cudagraph and self._encoder_prefill_wrapper_backend != backend
+        ):
+            if use_cudagraph:
+                qo_indptr_buf = self.encoder_qo_indptr.gpu[: num_reqs + 1]
+                kv_indptr_buf = self.encoder_kv_indptr.gpu[: num_reqs + 1]
+            else:
+                qo_indptr_buf = None
+                kv_indptr_buf = None
+            prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+                self._get_workspace_buffer(),
+                use_cuda_graph=use_cudagraph,
+                qo_indptr_buf=qo_indptr_buf,
+                kv_indptr_buf=kv_indptr_buf,
+                backend=backend,
+            )
+            if use_cudagraph:
+                self._encoder_wrappers_cudagraph[num_reqs] = prefill_wrapper
+            else:
+                self._encoder_prefill_wrapper = prefill_wrapper
+                self._encoder_prefill_wrapper_backend = backend
+        return prefill_wrapper
+
+    def _build_encoder_metadata(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> _FlashInferEncoderOnlyMetadata:
+        assert common_prefix_len == 0, (
+            "FlashInfer encoder-only attention does not use cascade attention"
+        )
+
+        num_reqs = common_attn_metadata.num_reqs
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        max_seq_len = common_attn_metadata.max_seq_len
+        seq_lens = common_attn_metadata.seq_lens
+        qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
+
+        encoder_attention_dtype = self.kv_cache_spec.dtype
+        encoder_uses_fp8 = encoder_attention_dtype == FP8_DTYPE
+        if encoder_uses_fp8:
+            prefill_backend = _get_flashinfer_encoder_fp8_backend()
+            if prefill_backend is None:
+                raise NotImplementedError(
+                    "FlashInfer FP8 encoder-only attention requires "
+                    "FlashInfer cuDNN FP8 attention support."
+                )
+        else:
+            prefill_backend = "auto"
+
+        assert self.global_hyperparameters.has_same_all_params, (
+            "FlashInfer backend currently only supports models in which "
+            "all layers share the same values for the following "
+            "hyperparameters: `window_left`, `logits_soft_cap`, "
+            "`sm_scale`."
+        )
+        if self.window_left != -1:
+            raise NotImplementedError(
+                "FlashInfer encoder-only attention does not support "
+                "sliding-window attention. Use disable_sliding_window=True "
+                "or select another attention backend."
+            )
+
+        use_cudagraph = self.enable_cuda_graph and num_reqs <= self._cudagraph_max_bs
+        prefill_wrapper = self._get_encoder_prefill_wrapper(
+            num_reqs,
+            use_cudagraph=use_cudagraph,
+            backend=prefill_backend,
+        )
+
+        plan_kwargs: dict = {}
+        qo_plan_indptr = qo_indptr_cpu
+        kv_plan_indptr = qo_indptr_cpu
+        if prefill_backend == "cudnn":
+            qo_element_stride = self.num_qo_heads * self.head_dim
+            kv_element_stride = self.num_kv_heads * self.head_dim
+            qo_plan_indptr = (qo_indptr_cpu * qo_element_stride).view(-1, 1, 1, 1)
+            kv_plan_indptr = (qo_indptr_cpu * kv_element_stride).view(-1, 1, 1, 1)
+            plan_kwargs = {
+                "seq_lens": seq_lens,
+                "seq_lens_q": seq_lens,
+                "max_token_per_sequence": max_seq_len,
+                "max_sequence_kv": max_seq_len,
+                "v_indptr": kv_plan_indptr,
+                "o_indptr": qo_plan_indptr,
+            }
+
+        fast_plan_encoder(
+            prefill_wrapper,
+            qo_indptr_cpu=qo_plan_indptr,
+            kv_indptr_cpu=kv_plan_indptr,
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim,
+            head_dim_vo=self.head_dim,
+            causal=False,
+            sm_scale=self.sm_scale,
+            window_left=self.window_left,
+            logits_soft_cap=self.logits_soft_cap,
+            q_data_type=encoder_attention_dtype,
+            kv_data_type=encoder_attention_dtype,
+            o_data_type=self.model_config.dtype,
+            fixed_split_size=self.prefill_fixed_split_size,
+            disable_split_kv=self.disable_split_kv,
+            **plan_kwargs,
+        )
+
+        return _FlashInferEncoderOnlyMetadata(
+            num_actual_tokens=num_actual_tokens,
+            q_data_type=encoder_attention_dtype,
+            prefill_wrapper=prefill_wrapper,
+        )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> _FlashInferEncoderOnlyMetadata:
+        return self._build_encoder_metadata(common_prefix_len, common_attn_metadata)
+
+
+class _FlashInferDecoderMetadataBuilder(_FlashInferMetadataBuilderBase):
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._prefill_wrapper: (
+            BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
+        ) = None
+        self._decode_wrapper = None
+        self._cascade_wrapper = None
+
+        max_num_pages_per_req = cdiv(
+            self.model_config.max_model_len, self.kv_cache_spec.block_size
+        )
+        max_num_pages = self._max_num_reqs * max_num_pages_per_req
+
+        speculative_config = vllm_config.speculative_config
+        num_spec_tokens = (
+            speculative_config.num_speculative_tokens
+            if speculative_config is not None
+            else 0
+        )
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        self.enable_cuda_graph = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        if self.enable_cuda_graph:
+            # For full cudagraph capture, one `decode_wrapper` for each batch
+            # size is needed for FlashInfer.
+            self._decode_wrappers_cudagraph: dict[
+                int, BatchDecodeWithPagedKVCacheWrapper
+            ] = {}
+            self._cudagraph_max_bs = (1 + num_spec_tokens) * self._max_num_reqs
+            self._init_cudagraph_max_bs()
+
+        self.paged_kv_indptr = self._make_buffer(self._max_num_reqs + 1)
+        self.paged_kv_indptr_cpu_buffer = torch.zeros_like(
+            self.paged_kv_indptr.cpu, pin_memory=self.pin_memory
+        )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
+        self.paged_kv_indices = self._make_buffer(max_num_pages)
+        self.paged_kv_last_page_len = self._make_buffer(self._max_num_reqs)
+
     def _get_prefill_wrapper(
         self,
     ) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
@@ -844,13 +1046,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
-
-    def _get_encoder_prefill_wrapper(self) -> BatchPrefillWithRaggedKVCacheWrapper:
-        if self._encoder_prefill_wrapper is None:
-            self._encoder_prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
-                self._get_workspace_buffer()
-            )
-        return self._encoder_prefill_wrapper
 
     def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
         if use_cudagraph:
@@ -979,62 +1174,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         qo_indptr = common_attn_metadata.query_start_loc
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
 
-        if isinstance(self.kv_cache_spec, EncoderOnlyAttentionSpec):
-            assert common_prefix_len == 0, (
-                "FlashInfer encoder-only attention does not use cascade attention"
-            )
-            if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
-                raise NotImplementedError(
-                    "FlashInfer encoder-only attention does not support "
-                    "quantized KV cache dtypes."
-                )
-
-            assert self.global_hyperparameters.has_same_all_params, (
-                "FlashInfer backend currently only supports models in which "
-                "all layers share the same values for the following "
-                "hyperparameters: `window_left`, `logits_soft_cap`, "
-                "`sm_scale`."
-            )
-            if self.window_left != -1:
-                raise NotImplementedError(
-                    "FlashInfer encoder-only attention does not support "
-                    "sliding-window attention. Use disable_sliding_window=True "
-                    "or select another attention backend."
-                )
-
-            prefill_wrapper = self._get_encoder_prefill_wrapper()
-            prefill_wrapper.plan(
-                qo_indptr=qo_indptr_cpu,
-                kv_indptr=qo_indptr_cpu,
-                num_qo_heads=self.num_qo_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim_qk=self.head_dim,
-                causal=False,
-                sm_scale=self.sm_scale,
-                window_left=self.window_left,
-                logits_soft_cap=self.logits_soft_cap,
-                q_data_type=self.model_config.dtype,
-                kv_data_type=self.model_config.dtype,
-                o_data_type=self.model_config.dtype,
-                fixed_split_size=self.prefill_fixed_split_size,
-                disable_split_kv=self.disable_split_kv,
-            )
-
-            return FlashInferMetadata(
-                num_actual_tokens=num_actual_tokens,
-                slot_mapping=common_attn_metadata.slot_mapping,
-                q_data_type=self.model_config.dtype,
-                num_decodes=0,
-                num_decode_tokens=0,
-                num_prefills=num_reqs,
-                num_prefill_tokens=num_actual_tokens,
-                use_cascade=False,
-                prefill=None,
-                decode=None,
-                encoder_prefill=FIEncoderPrefill(wrapper=prefill_wrapper),
-                cascade_wrapper=None,
-            )
-
         # Step 1: Decide which dispatch modes to use:
         # - Cascade attention (distinct mode)
         # - Prefill (FI native or TRTLLM)
@@ -1101,7 +1240,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             use_cascade=use_cascade,
             prefill=None,
             decode=None,
-            encoder_prefill=None,
             cascade_wrapper=None,
         )
 
@@ -1336,7 +1474,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 use_cudagraph = (
                     self.enable_cuda_graph
                     and pure_decode
-                    and num_decode_tokens <= self._decode_cudagraph_max_bs
+                    and num_decode_tokens <= self._cudagraph_max_bs
                 )
                 num_input_tokens = num_decode_tokens
 
@@ -1387,7 +1525,298 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return False
 
 
+class FlashInferMetadataBuilder(_FlashInferMetadataBuilderBase):
+    """Factory for FlashInfer metadata builders."""
+
+    @classmethod
+    def get_encoder_builder_cls(
+        cls,
+    ) -> type[_FlashInferEncoderOnlyMetadataBuilder]:
+        return _FlashInferEncoderOnlyMetadataBuilder
+
+    def __new__(cls, *args, **kwargs):
+        if cls is FlashInferMetadataBuilder:
+            kv_cache_spec = args[0] if args else kwargs["kv_cache_spec"]
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                encoder_inst = object.__new__(_FlashInferEncoderOnlyMetadataBuilder)
+                _FlashInferEncoderOnlyMetadataBuilder.__init__(
+                    encoder_inst, *args, **kwargs
+                )
+                return encoder_inst
+            decoder_inst = object.__new__(_FlashInferDecoderMetadataBuilder)
+            _FlashInferDecoderMetadataBuilder.__init__(decoder_inst, *args, **kwargs)
+            return decoder_inst
+        return super().__new__(cls)
+
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        pass
+
+
+def _get_attn_type_from_init_args(
+    args: tuple,
+    kwargs: dict,
+) -> AttentionType:
+    if "attn_type" in kwargs:
+        return kwargs["attn_type"]
+    if len(args) >= 9:
+        return args[8]
+    return AttentionType.DECODER
+
+
 class FlashInferImpl(AttentionImpl):
+    """Factory for private FlashInfer attention implementations.
+
+    The backend API expects a single implementation class. Keep that public
+    contract, but instantiate attention-type-specific implementations within
+    this module.
+    """
+
+    can_return_lse_for_decode: bool = True
+
+    def __new__(cls, *args, **kwargs):
+        if cls is FlashInferImpl:
+            attn_type = _get_attn_type_from_init_args(args, kwargs)
+            impl_cls: type[FlashInferImpl]
+            if attn_type == AttentionType.ENCODER_ONLY:
+                impl_cls = _FlashInferEncoderOnlyImpl
+            else:
+                impl_cls = _FlashInferDecoderImpl
+            return super().__new__(impl_cls)
+        return super().__new__(cls)
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashInferMetadata | _FlashInferEncoderOnlyMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise RuntimeError("FlashInferImpl factory should not run forward directly")
+
+
+class _FlashInferEncoderOnlyImpl(FlashInferImpl):
+    can_return_lse_for_decode: bool = False
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        logits_soft_cap: float | None = None,
+        attn_type: AttentionType = AttentionType.DECODER,
+        kv_sharing_target_layer_name: int | None = None,
+        sinks: torch.Tensor | None = None,
+    ) -> None:
+        if attn_type != AttentionType.ENCODER_ONLY:
+            raise NotImplementedError(
+                "FlashInfer encoder-only implementation only supports "
+                f"encoder-only attention. Got {attn_type}."
+            )
+        if sliding_window is not None:
+            raise NotImplementedError(
+                "FlashInfer encoder-only attention does not support "
+                "sliding-window attention. Use disable_sliding_window=True "
+                "or select another attention backend."
+            )
+
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = float(scale)
+        self.num_kv_heads = num_kv_heads
+        if alibi_slopes is not None:
+            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
+        self.alibi_slopes = alibi_slopes
+        self.sliding_window = (-1, -1)
+        self.window_left = -1
+        self.kv_cache_dtype = kv_cache_dtype
+        self.is_kvcache_nvfp4 = kv_cache_dtype == "nvfp4"
+        self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
+        self.logits_soft_cap = logits_soft_cap
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self.attn_type = attn_type
+
+        self.sinks: torch.Tensor | None = None
+        if sinks is not None:
+            if sinks.shape[0] != num_heads:
+                raise ValueError(
+                    "Sinks must have the same number of heads as the number of "
+                    f"heads in the layer. Expected {num_heads}, but got "
+                    f"{sinks.shape[0]}."
+                )
+            self.sinks = sinks
+
+        self.support_trtllm_attn = can_use_trtllm_attention(num_heads, num_kv_heads)
+        vllm_config = get_current_vllm_config_or_none()
+        self.supports_quant_query_input = (
+            self.support_trtllm_attn
+            and vllm_config is not None
+            and not vllm_config.attention_config.disable_flashinfer_q_quantization
+        )
+
+        self._encoder_fp8_per_tensor_quant: QuantFP8 | None = (
+            QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
+            if is_quantized_kv_cache(self.kv_cache_dtype)
+            else None
+        )
+
+    def _get_encoder_fp8_quant(self) -> QuantFP8:
+        assert self._encoder_fp8_per_tensor_quant is not None
+        return self._encoder_fp8_per_tensor_quant
+
+    def _quantize_encoder_fp8_activation(
+        self,
+        tensor: torch.Tensor,
+        scale: torch.Tensor,
+        name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        scale = scale.to(device=tensor.device, dtype=torch.float32)
+        scale = scale.reshape(-1)
+        if scale.numel() != 1:
+            raise ValueError(
+                "FlashInfer cuDNN FP8 encoder-only attention requires "
+                f"per-tensor {name} scale, got {scale.numel()} elements."
+            )
+        fp8_scale = scale.view(1, 1, 1, 1)
+        if tensor.dtype == FP8_DTYPE:
+            return tensor, fp8_scale
+
+        quant = self._get_encoder_fp8_quant()
+        tensor_shape = tensor.shape
+        tensor_2d = tensor.reshape(-1, tensor_shape[-2] * tensor_shape[-1])
+        quantized, _ = quant(tensor_2d, scale)
+        return quantized.reshape(tensor_shape), fp8_scale
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        if self.sinks is not None and self.sinks.dtype != torch.float32:
+            self.sinks = self.sinks.to(torch.float32)
+
+    def _forward_encoder_attention(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: _FlashInferEncoderOnlyMetadata,
+    ) -> torch.Tensor:
+        """Forward pass for encoder-only self-attention without KV cache."""
+        prefill_wrapper = getattr(attn_metadata, "prefill_wrapper", None)
+        if prefill_wrapper is None:
+            # Keep direct unit-test calls that pass the previous ad-hoc shape
+            # working; the builder now produces _FlashInferEncoderOnlyMetadata.
+            prefill_wrapper = attn_metadata.encoder_prefill.wrapper  # type: ignore[attr-defined]
+        if __debug__:
+            assert prefill_wrapper._window_left == self.window_left
+            assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
+            assert prefill_wrapper._sm_scale == self.scale
+            assert not prefill_wrapper._causal
+        use_cudnn = getattr(prefill_wrapper, "_backend", None) == "cudnn"
+
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            assert use_cudnn, (
+                "FlashInfer FP8 encoder-only attention must use the cuDNN backend."
+            )
+            query, q_scale = self._quantize_encoder_fp8_activation(
+                query,
+                layer._q_scale,  # type: ignore[attr-defined]
+                "query",
+            )
+            key, k_scale = self._quantize_encoder_fp8_activation(
+                key,
+                layer._k_scale,  # type: ignore[attr-defined]
+                "key",
+            )
+            value, v_scale = self._quantize_encoder_fp8_activation(
+                value,
+                layer._v_scale,  # type: ignore[attr-defined]
+                "value",
+            )
+        else:
+            q_scale = k_scale = v_scale = None
+
+        if q_scale is None:
+            prefill_wrapper.run(query, key, value, out=output)
+        else:
+            prefill_wrapper.run(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                out=output,
+            )
+        return output
+
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashInferMetadata | _FlashInferEncoderOnlyMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass with FlashInfer encoder-only attention."""
+        if attn_metadata is None:
+            # Profiling run.
+            return output.fill_(0)
+
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not supported for "
+                "FlashInfer encoder-only attention"
+            )
+        attn_metadata = cast(_FlashInferEncoderOnlyMetadata, attn_metadata)
+        if not is_quantized_kv_cache(self.kv_cache_dtype):
+            assert attn_metadata.q_data_type == query.dtype, (
+                f"Query dtype mismatch: expected {attn_metadata.q_data_type}, "
+                f"got {query.dtype}"
+            )
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        return self._forward_encoder_attention(
+            layer,
+            query[:num_actual_tokens],
+            key[:num_actual_tokens],
+            value[:num_actual_tokens],
+            output[:num_actual_tokens],
+            attn_metadata,
+        )
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        return
+
+
+class _FlashInferDecoderImpl(FlashInferImpl):
     can_return_lse_for_decode: bool = True
 
     def __init__(
@@ -1411,11 +1840,10 @@ class FlashInferImpl(AttentionImpl):
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
-        if attn_type == AttentionType.ENCODER_ONLY and sliding_window is not None:
+        if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
-                "FlashInfer encoder-only attention does not support "
-                "sliding-window attention. Use disable_sliding_window=True "
-                "or select another attention backend."
+                "FlashInfer decoder implementation only supports decoder "
+                f"attention. Got {attn_type}."
             )
         if sliding_window is None:
             self.sliding_window = (-1, -1)
@@ -1432,11 +1860,6 @@ class FlashInferImpl(AttentionImpl):
 
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
-        if attn_type not in (AttentionType.DECODER, AttentionType.ENCODER_ONLY):
-            raise NotImplementedError(
-                "FlashInferImpl supports decoder and encoder-only attention. "
-                f"Got {attn_type}."
-            )
         self.attn_type = attn_type
 
         self.sinks: torch.Tensor | None = None
@@ -1493,30 +1916,6 @@ class FlashInferImpl(AttentionImpl):
         if self.sinks is not None and self.sinks.dtype != torch.float32:
             self.sinks = self.sinks.to(torch.float32)
 
-    def _forward_encoder_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        output: torch.Tensor,
-        attn_metadata: FlashInferMetadata,
-    ) -> torch.Tensor:
-        """Forward pass for encoder-only self-attention without KV cache."""
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError(
-                "FlashInfer encoder-only attention does not support "
-                "quantized KV cache dtypes."
-            )
-
-        assert attn_metadata.encoder_prefill is not None
-        prefill_wrapper = attn_metadata.encoder_prefill.wrapper
-        assert prefill_wrapper._window_left == self.window_left
-        assert prefill_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
-        assert prefill_wrapper._sm_scale == self.scale
-        assert not prefill_wrapper._causal
-        prefill_wrapper.run(query, key, value, out=output)
-        return output
-
     def forward(
         self,
         layer: torch.nn.Module,
@@ -1524,7 +1923,7 @@ class FlashInferImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: FlashInferMetadata,
+        attn_metadata: FlashInferMetadata | _FlashInferEncoderOnlyMetadata,
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -1546,26 +1945,13 @@ class FlashInferImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        attn_metadata = cast(FlashInferMetadata, attn_metadata)
+
         # Ensure query dtype matches the expected dtype from attention metadata
         assert attn_metadata.q_data_type == query.dtype, (
             f"Query dtype mismatch: expected {attn_metadata.q_data_type}, "
             f"got {query.dtype}"
         )
-
-        if self.attn_type == AttentionType.ENCODER_ONLY:
-            if output_scale is not None or output_block_scale is not None:
-                raise NotImplementedError(
-                    "fused output quantization is not supported for "
-                    "FlashInfer encoder-only attention"
-                )
-            num_actual_tokens = attn_metadata.num_actual_tokens
-            return self._forward_encoder_attention(
-                query[:num_actual_tokens],
-                key[:num_actual_tokens],
-                value[:num_actual_tokens],
-                output[:num_actual_tokens],
-                attn_metadata,
-            )
 
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale
@@ -2007,8 +2393,6 @@ class FlashInferImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        if self.attn_type == AttentionType.ENCODER_ONLY:
-            return
         if self.kv_sharing_target_layer_name is None:
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
@@ -2029,6 +2413,111 @@ class FlashInferImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+
+
+def fast_plan_encoder(
+    wrapper: BatchPrefillWithRaggedKVCacheWrapper,
+    qo_indptr_cpu: torch.Tensor,
+    kv_indptr_cpu: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int | None = None,
+    causal: bool = False,
+    window_left: int = -1,
+    logits_soft_cap: float | None = None,
+    q_data_type: str | torch.dtype = "float16",
+    kv_data_type: str | torch.dtype | None = None,
+    o_data_type: str | torch.dtype | None = None,
+    sm_scale: float | None = None,
+    non_blocking: bool = True,
+    fixed_split_size: int = -1,
+    disable_split_kv: bool = False,
+    **extra_plan_kwargs,
+) -> None:
+    """A faster encoder plan path mirroring fast_plan_decode for CUDA graphs.
+
+    On the first call (or when CUDA graphs are disabled), run the full
+    FlashInfer plan to JIT-compile kernels. Under CUDA graph capture/replay,
+    subsequent calls only refresh indptr buffers and re-run the cached module
+    plan, skipping backend selection and module lookup.
+    """
+    is_cuda_graph_enabled = getattr(wrapper, "is_cuda_graph_enabled", False)
+    backend = getattr(wrapper, "_backend", None)
+    use_full_plan = (
+        not is_cuda_graph_enabled
+        or getattr(wrapper, "vllm_first_call", True)
+        or backend in _ENCODER_FULL_PLAN_BACKENDS
+        or getattr(wrapper, "_cached_module", None) is None
+    )
+    plan_kwargs = {
+        "qo_indptr": qo_indptr_cpu,
+        "kv_indptr": kv_indptr_cpu,
+        "num_qo_heads": num_qo_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "causal": causal,
+        "sm_scale": sm_scale,
+        "window_left": window_left,
+        "logits_soft_cap": logits_soft_cap,
+        "q_data_type": q_data_type,
+        "kv_data_type": kv_data_type,
+        "o_data_type": o_data_type,
+        "fixed_split_size": fixed_split_size,
+        "disable_split_kv": disable_split_kv,
+        "non_blocking": non_blocking,
+        **extra_plan_kwargs,
+    }
+    if use_full_plan:
+        wrapper.plan(**plan_kwargs)
+        if is_cuda_graph_enabled:
+            wrapper.vllm_first_call = False
+        return
+
+    if head_dim_vo is None:
+        head_dim_vo = head_dim_qk
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
+
+    qo_indptr_host = qo_indptr_cpu.cpu()
+    kv_indptr_host = kv_indptr_cpu.cpu()
+    batch_size = len(qo_indptr_host) - 1
+    total_num_rows = int(qo_indptr_host[-1])
+    kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
+
+    wrapper._qo_indptr_buf.copy_(qo_indptr_cpu, non_blocking=non_blocking)
+    wrapper._kv_indptr_buf.copy_(kv_indptr_cpu, non_blocking=non_blocking)
+    wrapper._qo_indptr_last = total_num_rows
+
+    args = [
+        wrapper._float_workspace_buffer,
+        wrapper._int_workspace_buffer,
+        wrapper._pin_memory_int_workspace_buffer,
+        qo_indptr_host,
+        kv_indptr_host,
+        kv_len_arr,
+        wrapper._max_total_num_rows or total_num_rows,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        1,  # page_size
+        is_cuda_graph_enabled,
+        head_dim_qk,
+        head_dim_vo,
+        causal,
+        window_left,
+    ]
+    if wrapper._backend == "fa2":
+        args.append(fixed_split_size if fixed_split_size != -1 else -1)
+        args.append(disable_split_kv)
+        args.append(0)  # num_colocated_ctas
+    wrapper._plan_info = wrapper._cached_module.plan(*args)
+
+    wrapper._causal = causal
+    wrapper._window_left = window_left
+    wrapper._logits_soft_cap = logits_soft_cap
+    wrapper._sm_scale = sm_scale
 
 
 def fast_plan_decode(
