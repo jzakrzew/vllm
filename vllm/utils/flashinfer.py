@@ -24,6 +24,21 @@ from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
+# Buckets used by cuDNN attention graph caching. Keeping the number of graph
+# variants bounded avoids rebuilding a graph for every exact batch/sequence
+# shape seen by the scheduler.
+FLASHINFER_BATCH_SIZE_BUCKETS = (8, 16, 32, 64)
+FLASHINFER_MAX_SEQ_LEN_BUCKETS = (
+    1 * 1024,
+    2 * 1024,
+    4 * 1024,
+    8 * 1024,
+    16 * 1024,
+    32 * 1024,
+    64 * 1024,
+    128 * 1024,
+)
+
 # This is the storage path for the cubins, it can be replaced
 # with a local path for testing.
 # Referenced from https://github.com/flashinfer-ai/flashinfer/blob/0c9a92c3d9a7e043ab6f3f7b2273269caf6ab044/flashinfer/jit/cubin_loader.py#L35  # noqa: E501
@@ -31,6 +46,28 @@ FLASHINFER_CUBINS_REPOSITORY = os.environ.get(
     "FLASHINFER_CUBINS_REPOSITORY",
     "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/",  # noqa: E501
 )
+
+
+def get_flashinfer_batch_size_bucket(batch_size: int) -> int:
+    """Return the cuDNN graph-cache bucket for ``batch_size``."""
+    if batch_size <= 0:
+        return FLASHINFER_BATCH_SIZE_BUCKETS[0]
+    return next(
+        (size for size in FLASHINFER_BATCH_SIZE_BUCKETS if size >= batch_size),
+        cdiv(batch_size, FLASHINFER_BATCH_SIZE_BUCKETS[0])
+        * FLASHINFER_BATCH_SIZE_BUCKETS[0],
+    )
+
+
+def get_flashinfer_max_seq_len_bucket(max_seq_len: int) -> int:
+    """Return the cuDNN graph-cache bucket for ``max_seq_len``."""
+    if max_seq_len <= 0:
+        return FLASHINFER_MAX_SEQ_LEN_BUCKETS[0]
+    return next(
+        (size for size in FLASHINFER_MAX_SEQ_LEN_BUCKETS if size >= max_seq_len),
+        cdiv(max_seq_len, FLASHINFER_MAX_SEQ_LEN_BUCKETS[-1])
+        * FLASHINFER_MAX_SEQ_LEN_BUCKETS[-1],
+    )
 
 
 @functools.cache
@@ -969,6 +1006,8 @@ def is_flashinfer_cudnn_fp8_prefill_attn_supported() -> bool:
 
 
 __all__ = [
+    "get_flashinfer_batch_size_bucket",
+    "get_flashinfer_max_seq_len_bucket",
     "has_flashinfer",
     "flashinfer_trtllm_fp8_block_scale_moe",
     "flashinfer_cutlass_fused_moe",

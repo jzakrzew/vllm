@@ -25,9 +25,10 @@ from vllm.model_executor.models.vision import (
     get_vit_attn_backend,
 )
 from vllm.utils.flashinfer import (
+    get_flashinfer_batch_size_bucket,
+    get_flashinfer_max_seq_len_bucket,
     is_flashinfer_cudnn_fp8_prefill_attn_supported,
 )
-from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.ops.vit_attn_wrappers import (
@@ -141,30 +142,6 @@ def _maybe_save_fp8_scales(
     logger.info("Saved FP8 scales (%d layers) to %s", len(scales), path)
 
 
-# Batch buckets for cuDNN graph caching.
-# Graphs use batch size and max sequence length as cache key.
-# This avoids creating a new graph for each unique set of
-# batch size and max sequence length at runtime.
-# From the cuDNN team's performance measurements, there
-# is no significant kernel performance difference between padding
-# to a smaller batch size/seq length and padding to larger
-# ones. The bucketing here is solely used to avoid memory
-# operation overhead, which won't be needed if we have CUDA
-# graph support in the future.
-# TODO: Remove buckets after issue #34763
-# (cuda graph support) is addressed.
-FLASHINFER_BATCH_BUCKETS = [8, 16, 32, 64]
-FLASHINFER_MAX_SEQLEN_BUCKETS = [
-    1 * 1024,
-    2 * 1024,
-    4 * 1024,
-    8 * 1024,
-    16 * 1024,
-    32 * 1024,
-    64 * 1024,
-    128 * 1024,
-]
-
 # Workspace buffer for FlashInfer CuDNN backend
 FLASHINFER_CUDNN_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
 _flashinfer_workspace_buffer: torch.Tensor | None = None
@@ -186,10 +163,7 @@ def add_padding_to_seqlens(
     batch_size: int,
     padding_value: int,
 ) -> np.ndarray:
-    batch_size_padded = next(
-        (b for b in FLASHINFER_BATCH_BUCKETS if b >= batch_size),
-        round_up(batch_size, FLASHINFER_BATCH_BUCKETS[0]),
-    )
+    batch_size_padded = get_flashinfer_batch_size_bucket(batch_size)
     if batch_size_padded == batch_size:
         return seq
     return np.concatenate(
@@ -197,17 +171,6 @@ def add_padding_to_seqlens(
             seq,
             np.full((batch_size_padded - batch_size,), padding_value, dtype=seq.dtype),
         ]
-    )
-
-
-def bucket_flashinfer_max_seqlen(
-    real_max_seqlen: int,
-) -> int:
-    if real_max_seqlen <= 0:
-        return FLASHINFER_MAX_SEQLEN_BUCKETS[0]
-    return next(
-        (s for s in FLASHINFER_MAX_SEQLEN_BUCKETS if s >= real_max_seqlen),
-        round_up(real_max_seqlen, FLASHINFER_MAX_SEQLEN_BUCKETS[-1]),
     )
 
 
@@ -236,7 +199,7 @@ class MMEncoderAttention(CustomOp):
         ):
             max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
         if attn_backend == AttentionBackendEnum.FLASHINFER:
-            max_seqlen = bucket_flashinfer_max_seqlen(max_seqlen)
+            max_seqlen = get_flashinfer_max_seq_len_bucket(max_seqlen)
         return max_seqlen
 
     @classmethod

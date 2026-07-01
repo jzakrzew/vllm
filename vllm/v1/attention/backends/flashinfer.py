@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
+    get_fp8_min_max,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
@@ -40,6 +41,8 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
     can_use_trtllm_attention,
+    get_flashinfer_batch_size_bucket,
+    get_flashinfer_max_seq_len_bucket,
     is_flashinfer_cudnn_fp8_prefill_attn_supported,
     use_trtllm_attention,
 )
@@ -84,6 +87,7 @@ FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
+FP8_MIN, FP8_MAX = get_fp8_min_max()
 
 logger = init_logger(__name__)
 
@@ -104,6 +108,189 @@ def _encoder_cudagraph_mode_enabled(cudagraph_mode: CUDAGraphMode) -> bool:
     if callable(separate_routine) and separate_routine():
         return cudagraph_mode.mixed_mode() == CUDAGraphMode.FULL
     return cudagraph_mode == CUDAGraphMode.FULL
+
+
+@triton.jit
+def _fused_encoder_qkv_fp8_quant_kernel(
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    output_ptr,
+    q_scale_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    q_token_stride,
+    q_head_stride,
+    q_dim_stride,
+    k_token_stride,
+    k_head_stride,
+    k_dim_stride,
+    v_token_stride,
+    v_head_stride,
+    v_dim_stride,
+    Q_HIDDEN: tl.constexpr,
+    K_HIDDEN: tl.constexpr,
+    V_HIDDEN: tl.constexpr,
+    Q_HEAD_DIM: tl.constexpr,
+    K_HEAD_DIM: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
+    Q_BLOCKS: tl.constexpr,
+    K_BLOCKS: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    task_idx = tl.program_id(1)
+    num_tokens = tl.num_programs(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_SIZE)
+
+    if task_idx < Q_BLOCKS:
+        columns = task_idx * BLOCK_SIZE + offsets
+        mask = columns < Q_HIDDEN
+        heads = columns // Q_HEAD_DIM
+        dims = columns % Q_HEAD_DIM
+        input_ptrs = (
+            query_ptr
+            + token_idx * q_token_stride
+            + heads * q_head_stride
+            + dims * q_dim_stride
+        )
+        output_ptrs = output_ptr + token_idx * Q_HIDDEN + columns
+        scale = tl.load(q_scale_ptr)
+    elif task_idx < Q_BLOCKS + K_BLOCKS:
+        columns = (task_idx - Q_BLOCKS) * BLOCK_SIZE + offsets
+        mask = columns < K_HIDDEN
+        heads = columns // K_HEAD_DIM
+        dims = columns % K_HEAD_DIM
+        input_ptrs = (
+            key_ptr
+            + token_idx * k_token_stride
+            + heads * k_head_stride
+            + dims * k_dim_stride
+        )
+        output_ptrs = (
+            output_ptr + num_tokens * Q_HIDDEN + token_idx * K_HIDDEN + columns
+        )
+        scale = tl.load(k_scale_ptr)
+    else:
+        columns = (task_idx - Q_BLOCKS - K_BLOCKS) * BLOCK_SIZE + offsets
+        mask = columns < V_HIDDEN
+        heads = columns // V_HEAD_DIM
+        dims = columns % V_HEAD_DIM
+        input_ptrs = (
+            value_ptr
+            + token_idx * v_token_stride
+            + heads * v_head_stride
+            + dims * v_dim_stride
+        )
+        output_ptrs = (
+            output_ptr
+            + num_tokens * (Q_HIDDEN + K_HIDDEN)
+            + token_idx * V_HIDDEN
+            + columns
+        )
+        scale = tl.load(v_scale_ptr)
+
+    value = tl.load(input_ptrs, mask=mask, other=0.0).to(tl.float32)
+    value = value * (1.0 / scale)
+    value = tl.clamp(value, FP8_MIN, FP8_MAX)
+    tl.store(output_ptrs, value.to(output_ptr.dtype.element_ty), mask=mask)
+
+
+def _can_use_fused_encoder_qkv_fp8_quant(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> bool:
+    return (
+        query.is_cuda
+        and key.is_cuda
+        and value.is_cuda
+        and query.device == key.device == value.device
+        and query.dtype == key.dtype == value.dtype
+        and query.dtype != FP8_DTYPE
+        and query.ndim == key.ndim == value.ndim == 3
+        and query.shape[0] == key.shape[0] == value.shape[0]
+    )
+
+
+def _fused_encoder_qkv_fp8_quant(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize Q/K/V into one packed allocation with one kernel launch."""
+    num_tokens = query.shape[0]
+    q_hidden = query.shape[1] * query.shape[2]
+    k_hidden = key.shape[1] * key.shape[2]
+    v_hidden = value.shape[1] * value.shape[2]
+    packed_output = torch.empty(
+        num_tokens * (q_hidden + k_hidden + v_hidden),
+        dtype=FP8_DTYPE,
+        device=query.device,
+    )
+    if num_tokens == 0:
+        return (
+            packed_output[:0].view(query.shape),
+            packed_output[:0].view(key.shape),
+            packed_output[:0].view(value.shape),
+        )
+
+    # Keep the launch close to the existing one-program-per-token quantizer
+    # while bounding register pressure for unusually wide attention tensors.
+    block_size = min(
+        triton.next_power_of_2(max(q_hidden, k_hidden, v_hidden)),
+        4096,
+    )
+    q_blocks = cdiv(q_hidden, block_size)
+    k_blocks = cdiv(k_hidden, block_size)
+    v_blocks = cdiv(v_hidden, block_size)
+    _fused_encoder_qkv_fp8_quant_kernel[
+        (
+            num_tokens,
+            q_blocks + k_blocks + v_blocks,
+        )
+    ](
+        query,
+        key,
+        value,
+        packed_output,
+        q_scale,
+        k_scale,
+        v_scale,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        Q_HIDDEN=q_hidden,
+        K_HIDDEN=k_hidden,
+        V_HIDDEN=v_hidden,
+        Q_HEAD_DIM=query.shape[2],
+        K_HEAD_DIM=key.shape[2],
+        V_HEAD_DIM=value.shape[2],
+        Q_BLOCKS=q_blocks,
+        K_BLOCKS=k_blocks,
+        FP8_MIN=FP8_MIN,
+        FP8_MAX=FP8_MAX,
+        BLOCK_SIZE=block_size,
+        num_warps=8 if block_size >= 2048 else 4,
+    )
+
+    q_numel = num_tokens * q_hidden
+    k_numel = num_tokens * k_hidden
+    quantized_query = packed_output[:q_numel].view(query.shape)
+    quantized_key = packed_output[q_numel : q_numel + k_numel].view(key.shape)
+    quantized_value = packed_output[q_numel + k_numel :].view(value.shape)
+    return quantized_query, quantized_key, quantized_value
 
 
 def _get_trtllm_gen_workspace_buffer():
@@ -824,6 +1011,21 @@ class _FlashInferMetadataBuilderBase(
 
 
 class _FlashInferEncoderOnlyMetadataBuilder(_FlashInferMetadataBuilderBase):
+    @override
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        """Declare full CUDA graph support for encoder-only attention.
+
+        The ragged prefill wrapper uses persistent indptr buffers when full
+        CUDA graphs are enabled, so encoder batches do not depend on the
+        TRTLLM decode support checked by the base implementation.
+        """
+        return AttentionCGSupport.ALWAYS
+
     def _should_check_kv_cache_model_dtype_match(self) -> bool:
         return False
 
@@ -838,6 +1040,13 @@ class _FlashInferEncoderOnlyMetadataBuilder(_FlashInferMetadataBuilderBase):
         self._encoder_prefill_wrapper = None
         self._encoder_prefill_wrapper_backend: str | None = None
 
+        self._encoder_max_batch_bucket = get_flashinfer_batch_size_bucket(
+            self._max_num_reqs
+        )
+        self.encoder_qo_indptr = self._make_buffer(self._encoder_max_batch_bucket + 1)
+        self.encoder_kv_indptr = self._make_buffer(self._encoder_max_batch_bucket + 1)
+        self.encoder_seq_lens = self._make_buffer(self._encoder_max_batch_bucket)
+
         cudagraph_mode = self.compilation_config.cudagraph_mode
         self.enable_cuda_graph = _encoder_cudagraph_mode_enabled(cudagraph_mode)
         if self.enable_cuda_graph:
@@ -846,8 +1055,6 @@ class _FlashInferEncoderOnlyMetadataBuilder(_FlashInferMetadataBuilderBase):
             ] = {}
             self._cudagraph_max_bs = self._max_num_reqs
             self._init_cudagraph_max_bs()
-            self.encoder_qo_indptr = self._make_buffer(self._max_num_reqs + 1)
-            self.encoder_kv_indptr = self._make_buffer(self._max_num_reqs + 1)
 
     def _get_encoder_prefill_wrapper(
         self,
@@ -895,7 +1102,6 @@ class _FlashInferEncoderOnlyMetadataBuilder(_FlashInferMetadataBuilderBase):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_seq_len = common_attn_metadata.max_seq_len
-        seq_lens = common_attn_metadata.seq_lens
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
 
         encoder_attention_dtype = self.kv_cache_spec.dtype
@@ -923,29 +1129,62 @@ class _FlashInferEncoderOnlyMetadataBuilder(_FlashInferMetadataBuilderBase):
                 "or select another attention backend."
             )
 
+        planned_num_reqs = num_reqs
+        planned_max_seq_len = max_seq_len
         use_cudagraph = self.enable_cuda_graph and num_reqs <= self._cudagraph_max_bs
-        prefill_wrapper = self._get_encoder_prefill_wrapper(
-            num_reqs,
-            use_cudagraph=use_cudagraph,
-            backend=prefill_backend,
-        )
 
         plan_kwargs: dict = {}
         qo_plan_indptr = qo_indptr_cpu
         kv_plan_indptr = qo_indptr_cpu
         if prefill_backend == "cudnn":
+            planned_num_reqs = get_flashinfer_batch_size_bucket(num_reqs)
+            planned_max_seq_len = get_flashinfer_max_seq_len_bucket(max_seq_len)
+
             qo_element_stride = self.num_qo_heads * self.head_dim
             kv_element_stride = self.num_kv_heads * self.head_dim
-            qo_plan_indptr = (qo_indptr_cpu * qo_element_stride).view(-1, 1, 1, 1)
-            kv_plan_indptr = (qo_indptr_cpu * kv_element_stride).view(-1, 1, 1, 1)
+            source_indptr = qo_indptr_cpu.numpy()
+            np.multiply(
+                source_indptr,
+                qo_element_stride,
+                out=self.encoder_qo_indptr.np[: num_reqs + 1],
+            )
+            np.multiply(
+                source_indptr,
+                kv_element_stride,
+                out=self.encoder_kv_indptr.np[: num_reqs + 1],
+            )
+            self.encoder_qo_indptr.np[num_reqs + 1 : planned_num_reqs + 1] = (
+                self.encoder_qo_indptr.np[num_reqs]
+            )
+            self.encoder_kv_indptr.np[num_reqs + 1 : planned_num_reqs + 1] = (
+                self.encoder_kv_indptr.np[num_reqs]
+            )
+            np.subtract(
+                source_indptr[1:],
+                source_indptr[:-1],
+                out=self.encoder_seq_lens.np[:num_reqs],
+            )
+            self.encoder_seq_lens.np[num_reqs:planned_num_reqs] = 0
+            self.encoder_seq_lens.copy_to_gpu(planned_num_reqs)
+
+            qo_plan_indptr = self.encoder_qo_indptr.cpu[: planned_num_reqs + 1].view(
+                -1, 1, 1, 1
+            )
+            kv_plan_indptr = self.encoder_kv_indptr.cpu[: planned_num_reqs + 1].view(
+                -1, 1, 1, 1
+            )
             plan_kwargs = {
-                "seq_lens": seq_lens,
-                "seq_lens_q": seq_lens,
-                "max_token_per_sequence": max_seq_len,
-                "max_sequence_kv": max_seq_len,
-                "v_indptr": kv_plan_indptr,
-                "o_indptr": qo_plan_indptr,
+                "seq_lens": self.encoder_seq_lens.gpu[:planned_num_reqs],
+                "seq_lens_q": self.encoder_seq_lens.gpu[:planned_num_reqs],
+                "max_token_per_sequence": planned_max_seq_len,
+                "max_sequence_kv": planned_max_seq_len,
             }
+
+        prefill_wrapper = self._get_encoder_prefill_wrapper(
+            planned_num_reqs,
+            use_cudagraph=use_cudagraph,
+            backend=prefill_backend,
+        )
 
         fast_plan_encoder(
             prefill_wrapper,
@@ -1682,19 +1921,27 @@ class _FlashInferEncoderOnlyImpl(FlashInferImpl):
         assert self._encoder_fp8_per_tensor_quant is not None
         return self._encoder_fp8_per_tensor_quant
 
+    @staticmethod
+    def _prepare_encoder_fp8_scale(
+        tensor: torch.Tensor,
+        scale: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor:
+        scale = scale.to(device=tensor.device, dtype=torch.float32).reshape(-1)
+        if scale.numel() != 1:
+            raise ValueError(
+                "FlashInfer cuDNN FP8 encoder-only attention requires "
+                f"per-tensor {name} scale, got {scale.numel()} elements."
+            )
+        return scale
+
     def _quantize_encoder_fp8_activation(
         self,
         tensor: torch.Tensor,
         scale: torch.Tensor,
         name: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        scale = scale.to(device=tensor.device, dtype=torch.float32)
-        scale = scale.reshape(-1)
-        if scale.numel() != 1:
-            raise ValueError(
-                "FlashInfer cuDNN FP8 encoder-only attention requires "
-                f"per-tensor {name} scale, got {scale.numel()} elements."
-            )
+        scale = self._prepare_encoder_fp8_scale(tensor, scale, name)
         fp8_scale = scale.view(1, 1, 1, 1)
         if tensor.dtype == FP8_DTYPE:
             return tensor, fp8_scale
@@ -1704,6 +1951,49 @@ class _FlashInferEncoderOnlyImpl(FlashInferImpl):
         tensor_2d = tensor.reshape(-1, tensor_shape[-2] * tensor_shape[-1])
         quantized, _ = quant(tensor_2d, scale)
         return quantized.reshape(tensor_shape), fp8_scale
+
+    def _quantize_encoder_fp8_qkv(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        q_scale: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        q_scale = self._prepare_encoder_fp8_scale(query, q_scale, "query")
+        k_scale = self._prepare_encoder_fp8_scale(key, k_scale, "key")
+        v_scale = self._prepare_encoder_fp8_scale(value, v_scale, "value")
+
+        if _can_use_fused_encoder_qkv_fp8_quant(query, key, value):
+            query, key, value = _fused_encoder_qkv_fp8_quant(
+                query,
+                key,
+                value,
+                q_scale,
+                k_scale,
+                v_scale,
+            )
+        else:
+            query, _ = self._quantize_encoder_fp8_activation(query, q_scale, "query")
+            key, _ = self._quantize_encoder_fp8_activation(key, k_scale, "key")
+            value, _ = self._quantize_encoder_fp8_activation(value, v_scale, "value")
+
+        return (
+            query,
+            key,
+            value,
+            q_scale.view(1, 1, 1, 1),
+            k_scale.view(1, 1, 1, 1),
+            v_scale.view(1, 1, 1, 1),
+        )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if self.sinks is not None and self.sinks.dtype != torch.float32:
@@ -1735,20 +2025,15 @@ class _FlashInferEncoderOnlyImpl(FlashInferImpl):
             assert use_cudnn, (
                 "FlashInfer FP8 encoder-only attention must use the cuDNN backend."
             )
-            query, q_scale = self._quantize_encoder_fp8_activation(
-                query,
-                layer._q_scale,  # type: ignore[attr-defined]
-                "query",
-            )
-            key, k_scale = self._quantize_encoder_fp8_activation(
-                key,
-                layer._k_scale,  # type: ignore[attr-defined]
-                "key",
-            )
-            value, v_scale = self._quantize_encoder_fp8_activation(
-                value,
-                layer._v_scale,  # type: ignore[attr-defined]
-                "value",
+            query, key, value, q_scale, k_scale, v_scale = (
+                self._quantize_encoder_fp8_qkv(
+                    query,
+                    key,
+                    value,
+                    layer._q_scale,  # type: ignore[attr-defined]
+                    layer._k_scale,  # type: ignore[attr-defined]
+                    layer._v_scale,  # type: ignore[attr-defined]
+                )
             )
         else:
             q_scale = k_scale = v_scale = None
