@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     MambaSpec,
+    get_kv_quant_mode,
 )
 
 
@@ -195,6 +196,7 @@ def create_standard_kv_cache_spec(
         head_size=vllm_config.model_config.get_head_size(),
         dtype=vllm_config.model_config.dtype,
         sliding_window=vllm_config.model_config.get_sliding_window(),
+        kv_quant_mode=get_kv_quant_mode(vllm_config.cache_config.cache_dtype),
     )
 
 
