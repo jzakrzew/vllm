@@ -8,7 +8,13 @@ import torch.nn as nn
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention import Attention
-from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import (
+    PIN_MEMORY,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    is_quantized_kv_cache,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionType,
@@ -21,6 +27,27 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
+
+def _make_encoder_only_attention_spec(
+    layer: Attention, vllm_config: VllmConfig
+) -> EncoderOnlyAttentionSpec:
+    encoder_attention_dtype = getattr(
+        layer, "encoder_attention_dtype", layer.kv_cache_dtype
+    )
+    dtype = (
+        current_platform.fp8_dtype()
+        if is_quantized_kv_cache(encoder_attention_dtype)
+        else kv_cache_dtype_str_to_dtype(
+            encoder_attention_dtype, vllm_config.model_config
+        )
+    )
+    return EncoderOnlyAttentionSpec(
+        block_size=vllm_config.cache_config.block_size,
+        num_kv_heads=layer.num_kv_heads,
+        head_size=layer.head_size,
+        dtype=dtype,
+    )
 
 
 class EncoderOnlyModelState(DefaultModelState):
@@ -53,7 +80,9 @@ class EncoderOnlyModelState(DefaultModelState):
         # encoder-only layers, grouped by backend + query/KV head config. Models
         # are typically uniform, yielding a single group.
         attn_layers = get_layers_from_vllm_config(vllm_config, Attention)
-        groups: dict[tuple[tuple[str, str], int, int, int], AttentionGroup] = {}
+        groups: dict[
+            tuple[tuple[str, str], int, int, int, torch.dtype], AttentionGroup
+        ] = {}
         for name, layer in attn_layers.items():
             if layer.attn_type != AttentionType.ENCODER_ONLY:
                 continue
@@ -61,21 +90,17 @@ class EncoderOnlyModelState(DefaultModelState):
             # device tensor so the attention forward context is well-formed.
             layer.kv_cache = torch.empty(0, dtype=kv_cache_dtype, device=device)
             backend = layer.get_attn_backend()
+            spec = _make_encoder_only_attention_spec(layer, vllm_config)
             # Metadata builders require a uniform query-head count per group.
             key = (
                 backend.full_cls_name(),
                 layer.num_heads,
                 layer.num_kv_heads,
                 layer.head_size,
+                spec.dtype,
             )
             group = groups.get(key)
             if group is None:
-                spec = EncoderOnlyAttentionSpec(
-                    block_size=cache_config.block_size,
-                    num_kv_heads=layer.num_kv_heads,
-                    head_size=layer.head_size,
-                    dtype=kv_cache_dtype,
-                )
                 group = AttentionGroup(backend, [], spec, kv_cache_group_id=len(groups))
                 groups[key] = group
             group.layer_names.append(name)
