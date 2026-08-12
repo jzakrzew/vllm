@@ -1463,15 +1463,6 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
-            if (
-                self.vllm_flash_attn_version != 3
-                or not current_platform.is_device_capability_family(90)
-            ):
-                raise NotImplementedError(
-                    "FP8 encoder attention is only supported with "
-                    "FlashAttention 3 on SM90 GPUs."
-                )
-
             query = self._quantize_encoder_fp8_activation(
                 query,
                 layer._q_scale,  # type: ignore[attr-defined]

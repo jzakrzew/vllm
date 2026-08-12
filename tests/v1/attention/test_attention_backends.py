@@ -1181,13 +1181,21 @@ def test_flash_attention_encoder_only_fp8_backend_correctness(
     """Test FlashAttention encoder-only FP8 against an SDPA reference."""
     if not current_platform.is_cuda() or not torch.cuda.is_available():
         pytest.skip("FlashAttention FP8 encoder-only test requires CUDA")
-    if not current_platform.has_device_capability(90):
-        pytest.skip("FlashAttention FP8 encoder-only test requires SM90")
 
-    from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+    from vllm.v1.attention.backends.fa_utils import (
+        flash_attn_supports_kv_cache_dtype,
+        get_flash_attn_version,
+    )
 
-    if get_flash_attn_version(head_size=128) != 3:
-        pytest.skip("FlashAttention FP8 encoder-only test requires FA3")
+    if not flash_attn_supports_kv_cache_dtype(
+        encoder_attention_dtype,
+        head_size=128,
+        head_size_v=128,
+    ):
+        pytest.skip("FlashAttention FP8 is not supported on this device")
+
+    fa_version = get_flash_attn_version(head_size=128, head_size_v=128)
+    assert fa_version in (3, 4)
 
     def bidirectional_mask_mod(
         b: torch.Tensor,
@@ -1206,7 +1214,7 @@ def test_flash_attention_encoder_only_fp8_backend_correctness(
         bidirectional_mask_mod,
         causal=False,
         attn_type=AttentionType.ENCODER_ONLY,
-        model_dtype=torch.float16,
+        model_dtype=torch.bfloat16 if fa_version == 4 else torch.float16,
         kv_cache_dtype="auto",
         encoder_attention_dtype=encoder_attention_dtype,
         input_scale=0.25,
