@@ -130,6 +130,37 @@ def _patch_flash_attn_fp8_environment(
     )
 
 
+def test_flash_attn_encoder_fp8_initializes_quantizers_before_forward(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.v1.attention.backends.flash_attn as fa_mod
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+
+    _patch_flash_attn_fp8_environment(
+        monkeypatch,
+        fa_mod,
+        fa_version=4,
+    )
+
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    with set_current_vllm_config(config):
+        impl = FlashAttentionImpl(
+            num_heads=4,
+            head_size=16,
+            scale=0.25,
+            num_kv_heads=2,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8",
+            attn_type=AttentionType.ENCODER_ONLY,
+        )
+
+    assert impl._get_encoder_fp8_quant(None) is not None
+    assert impl._get_encoder_fp8_quant(16) is not None
+    assert impl._get_encoder_fp8_quant(32) is not None
+
+
 @pytest.mark.parametrize("fa_version", [3, 4])
 def test_flash_attn_encoder_only_fp8_quantizes_direct_qkv(
     monkeypatch: pytest.MonkeyPatch,

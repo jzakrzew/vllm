@@ -915,26 +915,39 @@ class FlashAttentionImpl(AttentionImpl):
                 vllm_config.scheduler_config.max_num_batched_tokens
             )
 
+        self._init_encoder_fp8_quant()
+
+    def _init_encoder_fp8_quant(self) -> None:
         self._encoder_fp8_per_tensor_quant: QuantFP8 | None = None
         self._encoder_fp8_quant_by_group_width: dict[int, QuantFP8] = {}
+        if self.attn_type not in (
+            AttentionType.ENCODER,
+            AttentionType.ENCODER_ONLY,
+        ) or not is_quantized_kv_cache(self.kv_cache_dtype):
+            return
 
-    def _get_encoder_fp8_quant(self, group_width: int | None) -> QuantFP8:
-        if group_width is None:
-            if self._encoder_fp8_per_tensor_quant is None:
-                self._encoder_fp8_per_tensor_quant = QuantFP8(
-                    static=True,
-                    group_shape=GroupShape.PER_TENSOR,
-                )
-            return self._encoder_fp8_per_tensor_quant
-
-        quant = self._encoder_fp8_quant_by_group_width.get(group_width)
-        if quant is None:
-            quant = QuantFP8(
+        self._encoder_fp8_per_tensor_quant = QuantFP8(
+            static=True,
+            group_shape=GroupShape.PER_TENSOR,
+        )
+        group_widths = (self.head_size, self.head_size * self.num_queries_per_kv)
+        for group_width in dict.fromkeys(group_widths):
+            self._encoder_fp8_quant_by_group_width[group_width] = QuantFP8(
                 static=True,
                 group_shape=GroupShape(-1, group_width),
             )
-            self._encoder_fp8_quant_by_group_width[group_width] = quant
-        return quant
+
+    def _get_encoder_fp8_quant(self, group_width: int | None) -> QuantFP8:
+        if group_width is None:
+            assert self._encoder_fp8_per_tensor_quant is not None
+            return self._encoder_fp8_per_tensor_quant
+
+        try:
+            return self._encoder_fp8_quant_by_group_width[group_width]
+        except KeyError as err:
+            raise ValueError(
+                f"Unexpected FP8 encoder quantization group width {group_width}."
+            ) from err
 
     def _quantize_encoder_fp8_activation(
         self,
