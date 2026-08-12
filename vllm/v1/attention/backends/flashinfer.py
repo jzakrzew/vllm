@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import ClassVar, cast
+from typing import ClassVar, TypeVar, cast
 
 import numpy as np
 import torch
@@ -104,10 +104,15 @@ trtllm_workspace_buffer = None
 _ENCODER_FULL_PLAN_BACKENDS = frozenset({"cudnn", "cute-dsl", "cutlass"})
 
 
-def _get_flashinfer_encoder_fp8_backend() -> str | None:
+def _get_flashinfer_encoder_fp8_backend() -> str:
     if is_flashinfer_cudnn_fp8_prefill_attn_supported():
         return "cudnn"
-    return None
+    raise ValueError(
+        "FlashInfer FP8 encoder-only attention requires the FlashInfer "
+        "cuDNN backend with cuDNN >= 9.17.1 on Blackwell (SM 100) or "
+        "newer. cuDNN's FP8 SDPA path with bf16/fp16 output is not "
+        "available on Hopper (H100/H200) or earlier."
+    )
 
 
 def _encoder_cudagraph_mode_enabled(cudagraph_mode: CUDAGraphMode) -> bool:
@@ -883,8 +888,15 @@ class _FlashInferEncoderOnlyMetadata:
     prefill_wrapper: BatchPrefillWithRaggedKVCacheWrapper
 
 
+_FlashInferMetadataT = TypeVar(
+    "_FlashInferMetadataT",
+    FlashInferMetadata,
+    _FlashInferEncoderOnlyMetadata,
+)
+
+
 class _FlashInferMetadataBuilderBase(
-    AttentionMetadataBuilder[FlashInferMetadata | _FlashInferEncoderOnlyMetadata]
+    AttentionMetadataBuilder[_FlashInferMetadataT],
 ):
     kv_cache_spec: AttentionSpec
     reorder_batch_threshold: int = 1
@@ -1217,7 +1229,9 @@ class _FlashInferMetadataBuilderBase(
         self._workspace_buffer = workspace_buffer
 
 
-class _FlashInferEncoderOnlyMetadataBuilder(_FlashInferMetadataBuilderBase):
+class _FlashInferEncoderOnlyMetadataBuilder(
+    _FlashInferMetadataBuilderBase[_FlashInferEncoderOnlyMetadata],
+):
     @override
     @classmethod
     def get_cudagraph_support(
@@ -1315,11 +1329,6 @@ class _FlashInferEncoderOnlyMetadataBuilder(_FlashInferMetadataBuilderBase):
         encoder_uses_fp8 = encoder_attention_dtype == FP8_DTYPE
         if encoder_uses_fp8:
             prefill_backend = _get_flashinfer_encoder_fp8_backend()
-            if prefill_backend is None:
-                raise NotImplementedError(
-                    "FlashInfer FP8 encoder-only attention requires "
-                    "FlashInfer cuDNN FP8 attention support."
-                )
         else:
             prefill_backend = "auto"
 
@@ -1428,7 +1437,9 @@ class _FlashInferEncoderOnlyMetadataBuilder(_FlashInferMetadataBuilderBase):
         return self._build_encoder_metadata(common_prefix_len, common_attn_metadata)
 
 
-class _FlashInferDecoderMetadataBuilder(_FlashInferMetadataBuilderBase):
+class _FlashInferDecoderMetadataBuilder(
+    _FlashInferMetadataBuilderBase[FlashInferMetadata],
+):
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
