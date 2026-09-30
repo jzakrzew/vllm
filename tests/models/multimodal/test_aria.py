@@ -6,12 +6,45 @@ import torch
 from transformers import AriaTextConfig
 from transformers.models.aria.modeling_aria import AriaTextMoELayer as HFMoE
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
 )
-from vllm.model_executor.models.aria import AriaTextModel, AriaTextMoELayer
+from vllm.model_executor.models.aria import (
+    AriaTextDecoderLayer,
+    AriaTextModel,
+    AriaTextMoELayer,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
+
+
+@pytest.mark.cpu_test
+def test_aria_decoder_forward_with_moe():
+    """Inherited decoder forward must support an MoE without gate_up_proj."""
+    hidden_size = 64
+    x = torch.randn(3, hidden_size, device="cpu")
+    with set_current_vllm_config(VllmConfig()):
+        layer = AriaTextDecoderLayer.__new__(AriaTextDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.input_layernorm = RMSNorm(hidden_size, dtype=x.dtype)
+        layer.post_attention_layernorm = RMSNorm(hidden_size, dtype=x.dtype)
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.qkv_proj = torch.nn.Identity()
+        layer.self_attn.forward = lambda positions, hidden_states: hidden_states
+        layer.mlp = AriaTextMoELayer.__new__(AriaTextMoELayer)
+        torch.nn.Module.__init__(layer.mlp)
+        layer.mlp.router_weight = torch.nn.Parameter(torch.zeros(2, hidden_size))
+        layer.mlp.experts = torch.nn.Module()
+        layer.mlp.experts.forward = lambda hidden_states, router_output: hidden_states
+
+        expected, expected_residual = layer.post_attention_layernorm(
+            layer.input_layernorm(x), x
+        )
+        actual, residual = layer(torch.arange(x.shape[0]), x, None)
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(residual, expected_residual)
 
 
 @pytest.mark.cpu_test

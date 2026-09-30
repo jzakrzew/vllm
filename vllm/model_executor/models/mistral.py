@@ -11,6 +11,7 @@ from transformers import LlamaConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.fusion.fused_norm_quant import maybe_fused_norm_quant
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -185,19 +186,28 @@ class MistralDecoderLayer(LlamaDecoderLayer):
         t_cond: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = maybe_fused_norm_quant(
+            self.input_layernorm,
+            hidden_states,
+            getattr(self.self_attn, "qkv_proj", None),
+            residual,
+        )
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
         if self.ada_rms_norm_t_cond is not None:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
             assert t_cond is not None
             hidden_states = hidden_states * (1 + self.ada_rms_norm_t_cond(t_cond))
+        else:
+            hidden_states, residual = maybe_fused_norm_quant(
+                self.post_attention_layernorm,
+                hidden_states,
+                getattr(self.mlp, "gate_up_proj", None),
+                residual,
+            )
 
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual

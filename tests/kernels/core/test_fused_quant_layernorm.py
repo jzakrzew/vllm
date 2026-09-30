@@ -47,6 +47,99 @@ CUDA_DEVICES = [
 EPS = 1e-6
 
 
+@pytest.mark.parametrize("add_residual", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(1, 256), (257, 1024), (2, 3, 256)])
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(100),
+    reason="FlashInfer NVFP4 norm fusion requires SM100+",
+)
+@torch.inference_mode()
+def test_manual_norm_nvfp4_quant(add_residual, dtype, shape, compiled):
+    """Both norm paths preserve residuals and use the consumer's global scale."""
+    from tests.kernels.quantization.nvfp4_utils import (
+        dequantize_nvfp4_to_dtype,
+        quant_nvfp4_tensor,
+    )
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
+    from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
+        FlashInferCutlassNvFp4LinearKernel,
+    )
+    from vllm.model_executor.layers.fusion import fused_norm_quant
+    from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
+
+    if fused_norm_quant._rmsnorm_fp4quant is None:
+        pytest.skip("FlashInfer NVFP4 norm kernels are unavailable")
+    if not FlashInferCutlassNvFp4LinearKernel.is_supported()[0]:
+        pytest.skip("FlashInfer CUTLASS NVFP4 consumer is unavailable")
+    set_random_seed(0)
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    original_x = x.clone()
+    residual = torch.randn_like(x) if add_residual else None
+    linear = torch.nn.Module()
+    linear._input_quant_key = kNvfp4Dynamic
+    linear.input_global_scale_inv = torch.tensor(
+        0.25, dtype=torch.float32, device=x.device
+    )
+    weight, weight_scale, weight_scale_inv = quant_nvfp4_tensor(
+        torch.randn(128, shape[-1], dtype=dtype, device=x.device),
+        is_sf_swizzled_layout=False,
+    )
+    linear.weight = torch.nn.Parameter(weight, requires_grad=False)
+    linear.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+    linear.alpha = 1 / (linear.input_global_scale_inv * weight_scale_inv)
+    linear.input_size_per_partition = shape[-1]
+    linear.output_size_per_partition = 128
+    kernel = FlashInferCutlassNvFp4LinearKernel(NvFp4LinearLayerConfig())
+    kernel.process_weights_after_loading(linear)
+    config = VllmConfig()
+    with set_current_vllm_config(config):
+        norm = RMSNorm(shape[-1], eps=EPS, dtype=dtype).to(x.device)
+        reference = norm(x.clone(), residual.clone() if residual is not None else None)
+        forward = fused_norm_quant.maybe_fused_norm_quant
+        if compiled:
+            from tests.compile.backend import TestBackend
+            from vllm.compilation.passes.fx_utils import find_auto_fn_maybe
+            from vllm.compilation.passes.utility.fix_functionalization import (
+                FixFunctionalizationPass,
+            )
+
+            backend = TestBackend(FixFunctionalizationPass(config))
+            forward = torch.compile(forward, backend=backend, fullgraph=True)
+        result, updated_residual = forward(norm, x, linear, residual)
+        if compiled:
+            op = torch.ops.vllm.flashinfer_fused_add_rms_norm_nvfp4_quant.default
+            assert find_auto_fn_maybe(backend.graph_post_pass.nodes, op) is None
+            assert backend.op_count(op) == 1
+    assert isinstance(result, QuantizedActivation)
+    assert result.orig_shape == x.shape
+    assert result.orig_dtype == dtype
+    expected = reference[0] if residual is not None else reference
+    actual = dequantize_nvfp4_to_dtype(
+        result.data,
+        result.scale,
+        linear.input_global_scale_inv,
+        dtype=dtype,
+        device=x.device,
+    ).view(shape)
+    torch.testing.assert_close(actual, expected, atol=0.3, rtol=0.2)
+    torch.testing.assert_close(
+        kernel.apply_weights(linear, result),
+        kernel.apply_weights(linear, expected),
+        atol=0.2,
+        rtol=0.2,
+    )
+    torch.testing.assert_close(x, original_x)
+    if residual is None:
+        assert updated_residual is x
+    else:
+        assert updated_residual is residual
+        torch.testing.assert_close(updated_residual, reference[1])
+
+
 def _is_valid_config(
     hidden_size: int,
     has_scale_ub: bool,
