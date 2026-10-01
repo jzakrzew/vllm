@@ -191,13 +191,22 @@ class MistralDecoderLayer(LlamaDecoderLayer):
             hidden_states,
             getattr(self.self_attn, "qkv_proj", None),
             residual,
+            do_allreduce=self._allreduce_input,
         )
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # Fully Connected
+        o_proj = getattr(self.self_attn, "o_proj", None)
+        do_allreduce = getattr(o_proj, "tp_size", 1) > 1 and not getattr(
+            o_proj, "reduce_results", True
+        )
         if self.ada_rms_norm_t_cond is not None:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
+            hidden_states, residual = maybe_fused_norm_quant(
+                self.post_attention_layernorm,
+                hidden_states,
+                None,
+                residual,
+                do_allreduce=do_allreduce,
             )
             assert t_cond is not None
             hidden_states = hidden_states * (1 + self.ada_rms_norm_t_cond(t_cond))
@@ -207,6 +216,7 @@ class MistralDecoderLayer(LlamaDecoderLayer):
                 hidden_states,
                 getattr(self.mlp, "gate_up_proj", None),
                 residual,
+                do_allreduce=do_allreduce,
             )
 
         hidden_states = self.mlp(hidden_states)

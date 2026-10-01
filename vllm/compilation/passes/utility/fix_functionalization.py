@@ -135,6 +135,7 @@ class FixFunctionalizationPass(VllmInductorPass):
                     1: "result",
                     2: "result_block_scale",
                     3: "residual",
+                    4: "input",
                 }
                 self.defunctionalize(graph, node, mutated_args)
             # For some reason we need to specify the args for both

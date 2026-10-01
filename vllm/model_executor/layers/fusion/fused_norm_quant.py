@@ -8,7 +8,11 @@ from typing import Any
 import torch
 
 from vllm import envs
-from vllm.config import get_current_vllm_config_or_none
+from vllm._custom_ops import create_fp4_output_tensors
+from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.model_executor.layers.fusion.allreduce_norm import (
+    try_fused_allreduce_norm_nvfp4_quant,
+)
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     get_input_quant_key,
@@ -28,12 +32,17 @@ if (
     and has_flashinfer()
 ):
     try:
-        from flashinfer.norm import add_rmsnorm_fp4quant, rmsnorm_fp4quant
+        from flashinfer.norm import add_rmsnorm_fp4quant
+    except ImportError:
+        pass
+    else:
+        _add_rmsnorm_fp4quant = add_rmsnorm_fp4quant
+    try:
+        from flashinfer.norm import rmsnorm_fp4quant
     except ImportError:
         pass
     else:
         _rmsnorm_fp4quant = rmsnorm_fp4quant
-        _add_rmsnorm_fp4quant = add_rmsnorm_fp4quant
 
 
 def _flashinfer_fused_add_rms_norm_nvfp4_quant(
@@ -46,16 +55,37 @@ def _flashinfer_fused_add_rms_norm_nvfp4_quant(
     block_scale_unswizzled: torch.Tensor | None,
     is_sf_swizzled_layout: bool,
     epsilon: float,
+    do_allreduce: bool = False,
 ) -> None:
     """Shared FlashInfer wrapper for standalone and residual-add NVFP4 norms."""
     if input.numel() == 0:
         return
+    if do_allreduce:
+        if is_sf_swizzled_layout and try_fused_allreduce_norm_nvfp4_quant(
+            input,
+            residual,
+            weight,
+            epsilon,
+            result,
+            result_block_scale,
+            input_global_scale,
+        ):
+            return
+        reduced = tensor_model_parallel_all_reduce(input)
+        if residual is None:
+            input.copy_(reduced)
+        else:
+            input = reduced
     block_scale = result_block_scale.view(torch.float8_e4m3fn)
     if is_sf_swizzled_layout:
         block_scale = block_scale.flatten()
         if input.shape[-1] % 64 != 0:
             # Compiler callers may have a partial scale tile along K.
-            block_scale.zero_()
+            scale_cols = input.shape[-1] // 16
+            scale_tiles = (scale_cols + 3) // 4
+            block_scale.view(-1, scale_tiles, 32, 4, 4)[
+                :, -1, :, :, scale_cols % 4 :
+            ].zero_()
     kwargs: dict[str, Any] = dict(
         y_fp4=result.view(torch.float4_e2m1fn_x2),
         block_scale=block_scale,
@@ -90,16 +120,18 @@ def _flashinfer_fused_add_rms_norm_nvfp4_quant_fake(
     block_scale_unswizzled: torch.Tensor | None,
     is_sf_swizzled_layout: bool,
     epsilon: float,
+    do_allreduce: bool = False,
 ) -> None:
     return None
 
 
-direct_register_custom_op(
-    op_name="flashinfer_fused_add_rms_norm_nvfp4_quant",
-    op_func=_flashinfer_fused_add_rms_norm_nvfp4_quant,
-    mutates_args=["result", "result_block_scale", "residual"],
-    fake_impl=_flashinfer_fused_add_rms_norm_nvfp4_quant_fake,
-)
+if _rmsnorm_fp4quant is not None or _add_rmsnorm_fp4quant is not None:
+    direct_register_custom_op(
+        op_name="flashinfer_fused_add_rms_norm_nvfp4_quant",
+        op_func=_flashinfer_fused_add_rms_norm_nvfp4_quant,
+        mutates_args=["result", "result_block_scale", "residual", "input"],
+        fake_impl=_flashinfer_fused_add_rms_norm_nvfp4_quant_fake,
+    )
 
 _FLASHINFER_NVFP4_RMS_QUANT_OP = (
     torch.ops.vllm.flashinfer_fused_add_rms_norm_nvfp4_quant.default
@@ -108,38 +140,25 @@ _FLASHINFER_NVFP4_RMS_QUANT_OP = (
 )
 
 
-def _has_competing_collective_fusion(linear: torch.nn.Module) -> bool:
-    if getattr(linear, "tp_size", 1) == 1:
-        return False
-    config = get_current_vllm_config_or_none()
-    if config is None:
-        return False
-    pass_config = config.compilation_config.pass_config
-    return bool(
-        pass_config.fuse_allreduce_rms
-        or pass_config.enable_sp
-        or pass_config.fuse_gemm_comms
-    )
-
-
 def maybe_fused_norm_quant(
     norm: RMSNorm,
     x: torch.Tensor,
     linear: torch.nn.Module | None,
     residual: torch.Tensor | None = None,
     *,
-    enabled: bool = True,
+    do_allreduce: bool = False,
 ) -> tuple[torch.Tensor | QuantizedActivation, torch.Tensor]:
     """Normalize and optionally quantize, returning the unquantized residual.
 
     A supported NVFP4 consumer receives packed activations and swizzled block
     scales. Otherwise use the norm's ordinary forward. With residual addition,
     the fused kernel updates residual in place; without it, x is preserved.
+    If do_allreduce is set, x is a local projection output and its reduction
+    precedes normalization. The collective kernel may overwrite x.
     """
     kernel = _rmsnorm_fp4quant if residual is None else _add_rmsnorm_fp4quant
     supported = (
-        enabled
-        and linear is not None
+        linear is not None
         and type(norm) is RMSNorm
         and get_input_quant_key(linear) == kNvfp4Dynamic
         and kernel is not None
@@ -156,14 +175,13 @@ def maybe_fused_norm_quant(
         and (
             residual is None or (residual.dtype == x.dtype and residual.is_contiguous())
         )
-        and not _has_competing_collective_fusion(linear)
     )
     if not supported:
+        if do_allreduce:
+            x = tensor_model_parallel_all_reduce(x)
         if residual is None:
             return norm(x), x
         return norm(x, residual)
-
-    from vllm._custom_ops import create_fp4_output_tensors
 
     assert linear is not None
     hidden_size = x.shape[-1]
@@ -181,6 +199,7 @@ def maybe_fused_norm_quant(
         None,
         True,
         norm.variance_epsilon,
+        do_allreduce,
     )
     return (
         QuantizedActivation(

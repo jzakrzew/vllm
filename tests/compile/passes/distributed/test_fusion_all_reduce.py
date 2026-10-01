@@ -15,7 +15,6 @@ from vllm.compilation.passes.fusion.allreduce_rms_fusion import (
     AllReduceFusionPass,
     RocmAiterAllReduceFusionPass,
     _fused_ar_workspace_hidden_dim,
-    _select_flashinfer_allreduce_use_oneshot,
 )
 from vllm.compilation.passes.fx_utils import find_op_nodes
 from vllm.compilation.passes.utility.fix_functionalization import (
@@ -39,6 +38,9 @@ from vllm.distributed.device_communicators.aiter_custom_all_reduce import (
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
+)
+from vllm.model_executor.layers.fusion.allreduce_norm import (
+    _select_flashinfer_allreduce_use_oneshot,
 )
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.layers.quantization.utils.quant_utils import (

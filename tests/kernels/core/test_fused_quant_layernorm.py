@@ -9,6 +9,7 @@ import torch
 
 import vllm._custom_ops as ops
 from tests.kernels.utils import fp8_allclose, fp8_ulp_distance, opcheck
+from tests.utils import multi_gpu_test
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
@@ -138,6 +139,104 @@ def test_manual_norm_nvfp4_quant(add_residual, dtype, shape, compiled):
     else:
         assert updated_residual is residual
         torch.testing.assert_close(updated_residual, reference[1])
+
+
+@multi_gpu_test(num_gpus=2)
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(100),
+    reason="FlashInfer NVFP4 collective norm fusion requires SM100+",
+)
+@pytest.mark.parametrize("add_residual", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_manual_allreduce_norm_nvfp4_quant(add_residual, dtype):
+    from vllm.model_executor.layers.fusion import fused_norm_quant
+    from vllm.utils.network_utils import get_open_port
+
+    kernel = (
+        fused_norm_quant._add_rmsnorm_fp4quant
+        if add_residual
+        else fused_norm_quant._rmsnorm_fp4quant
+    )
+    if kernel is None:
+        pytest.skip("FlashInfer NVFP4 norm kernels are unavailable")
+    torch.multiprocessing.spawn(
+        _run_manual_allreduce_norm_nvfp4_quant,
+        args=(get_open_port(), add_residual, dtype),
+        nprocs=2,
+    )
+
+
+def _run_manual_allreduce_norm_nvfp4_quant(rank, port, add_residual, dtype):
+    from tests.kernels.quantization.nvfp4_utils import dequantize_nvfp4_to_dtype
+    from vllm.config import (
+        CompilationConfig,
+        CompilationMode,
+        ParallelConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.layers.fusion import fused_norm_quant
+    from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
+    from vllm.utils.system_utils import update_environment_variables
+
+    update_environment_variables(
+        {
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+            "WORLD_SIZE": "2",
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": str(port),
+        }
+    )
+    torch.accelerator.set_device_index(rank)
+    init_distributed_environment()
+    config = VllmConfig(
+        compilation_config=CompilationConfig(mode=CompilationMode.NONE),
+        parallel_config=ParallelConfig(tensor_parallel_size=2),
+    )
+    try:
+        with set_current_vllm_config(config), torch.inference_mode():
+            initialize_model_parallel(tensor_model_parallel_size=2)
+            set_random_seed(rank)
+            x = torch.randn((2, 3, 1024), dtype=dtype, device=f"cuda:{rank}")
+            reduced = x.clone()
+            torch.distributed.all_reduce(reduced)
+            residual = torch.full_like(x, 0.5) if add_residual else None
+            norm = RMSNorm(1024, eps=EPS, dtype=dtype).to(x.device)
+            reference = norm(
+                reduced, residual.clone() if residual is not None else None
+            )
+            expected = reference[0] if add_residual else reference
+            expected_residual = reference[1] if add_residual else reduced
+            linear = torch.nn.Module()
+            linear._input_quant_key = kNvfp4Dynamic
+            linear.input_global_scale_inv = torch.tensor(0.25, device=x.device)
+            result, updated_residual = fused_norm_quant.maybe_fused_norm_quant(
+                norm, x, linear, residual, do_allreduce=True
+            )
+            assert isinstance(result, QuantizedActivation)
+            actual = dequantize_nvfp4_to_dtype(
+                result.data,
+                result.scale,
+                linear.input_global_scale_inv,
+                dtype=dtype,
+                device=x.device,
+            ).view(x.shape)
+            torch.testing.assert_close(actual, expected, atol=0.3, rtol=0.2)
+            tolerance = 4 * torch.finfo(dtype).eps
+            torch.testing.assert_close(
+                updated_residual, expected_residual, atol=tolerance, rtol=tolerance
+            )
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
 
 def _is_valid_config(

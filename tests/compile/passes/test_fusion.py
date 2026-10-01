@@ -421,15 +421,13 @@ def test_fusion_rmsnorm_quant(
 def test_fusion_add_rmsnorm_nvfp4_quant(
     dtype: torch.dtype, eps: float, num_tokens: int, hidden_size: int
 ):
-    fused_op = getattr(
-        torch.ops.vllm,
-        "flashinfer_fused_add_rms_norm_nvfp4_quant",
-        None,
+    from vllm.model_executor.layers.fusion.fused_norm_quant import (
+        _FLASHINFER_NVFP4_RMS_QUANT_OP,
     )
-    if not current_platform.has_device_capability(100) or fused_op is None:
+
+    fused_op_default = _FLASHINFER_NVFP4_RMS_QUANT_OP
+    if fused_op_default is None:
         pytest.skip("FlashInfer add-RMSNorm NVFP4 fusion is not available")
-    assert fused_op is not None
-    fused_op_default = fused_op.default
 
     vllm_config = VllmConfig(
         model_config=ModelConfig(dtype=dtype),

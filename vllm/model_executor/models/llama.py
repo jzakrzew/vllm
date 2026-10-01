@@ -34,7 +34,11 @@ from transformers import LlamaConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import (
     Attention,
@@ -310,6 +314,7 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self._allreduce_input = False
 
     def forward(
         self,
@@ -323,15 +328,21 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states,
             getattr(self.self_attn, "qkv_proj", None),
             residual,
+            do_allreduce=self._allreduce_input,
         )
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # Fully Connected
+        o_proj = getattr(self.self_attn, "o_proj", None)
         hidden_states, residual = maybe_fused_norm_quant(
             self.post_attention_layernorm,
             hidden_states,
             getattr(self.mlp, "gate_up_proj", None),
             residual,
+            do_allreduce=(
+                getattr(o_proj, "tp_size", 1) > 1
+                and not getattr(o_proj, "reduce_results", True)
+            ),
         )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -398,6 +409,7 @@ class LlamaModel(nn.Module, EagleModelMixin):
             lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        self._configure_allreduces()
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -406,6 +418,31 @@ class LlamaModel(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+
+    def _configure_allreduces(self) -> None:
+        """Keep dense MLP outputs local until the next norm or PP boundary."""
+        layers = self.layers[self.start_layer : self.end_layer]
+        dense_llama = bool(layers) and all(
+            isinstance(layer, LlamaDecoderLayer) and isinstance(layer.mlp, LlamaMLP)
+            for layer in layers
+        )
+        tp_enabled = get_tensor_model_parallel_world_size() > 1
+        # Auxiliary capture needs reduced outputs at every layer boundary.
+        self._allreduce_output = (
+            dense_llama and tp_enabled and not self.aux_hidden_state_layers
+        )
+        for idx, layer in enumerate(layers, start=self.start_layer):
+            if isinstance(layer, LlamaDecoderLayer):
+                layer.self_attn.o_proj.reduce_results = not tp_enabled
+                layer._allreduce_input = (
+                    self._allreduce_output and idx > self.start_layer
+                )
+                if isinstance(layer.mlp, LlamaMLP):
+                    layer.mlp.down_proj.reduce_results = not self._allreduce_output
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        self._configure_allreduces()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -448,6 +485,8 @@ class LlamaModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
+            if self._allreduce_output:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,
@@ -456,7 +495,13 @@ class LlamaModel(nn.Module, EagleModelMixin):
                 }
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = maybe_fused_norm_quant(
+            self.norm,
+            hidden_states,
+            None,
+            residual,
+            do_allreduce=self._allreduce_output,
+        )
 
         aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
