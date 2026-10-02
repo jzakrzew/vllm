@@ -47,6 +47,9 @@ from vllm.model_executor.kernels.linear import (
     _KernelT,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm, RMSNormGated
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    swizzle_blockscale,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     create_fp8_quant_key,
@@ -247,9 +250,17 @@ class TestModel(torch.nn.Module):
 
 
 class AddRMSNormNvfp4Model(torch.nn.Module):
-    def __init__(self, hidden_size: int, eps: float):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float,
+        fused_add: bool = True,
+        is_sf_swizzled_layout: bool = True,
+    ):
         super().__init__()
         self.norm = RMSNorm(hidden_size, eps)
+        self.fused_add = fused_add
+        self.is_sf_swizzled_layout = is_sf_swizzled_layout
         self.activation_scale = torch.rand((1, 1), dtype=torch.float32)
 
         weight = torch.rand((hidden_size, hidden_size))
@@ -258,8 +269,16 @@ class AddRMSNormNvfp4Model(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = residual = torch.relu(x)
-        x, residual = self.norm(x, residual)
-        x, block_scale = scaled_fp4_quant(x, self.activation_scale)
+        output_shape = x.shape
+        if self.fused_add:
+            x, residual = self.norm(x, residual)
+        else:
+            x = self.norm(x)
+        x, block_scale = scaled_fp4_quant(
+            x, self.activation_scale, self.is_sf_swizzled_layout
+        )
+        if not self.is_sf_swizzled_layout:
+            block_scale = swizzle_blockscale(block_scale.view(torch.float8_e4m3fn))
         x = cutlass_scaled_fp4_mm(
             x,
             self.weight,
@@ -268,7 +287,7 @@ class AddRMSNormNvfp4Model(torch.nn.Module):
             self.alpha,
             out_dtype=torch.get_default_dtype(),
         )
-        return x, residual
+        return x.reshape(output_shape), residual
 
 
 def _run_fusion_test(
@@ -413,21 +432,35 @@ def test_fusion_rmsnorm_quant(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
+@pytest.mark.parametrize("fused_add", [True, False])
+@pytest.mark.parametrize("batch_size", [None, 1, 2])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize(
     ("num_tokens", "hidden_size"),
     [(1, 256), (32, 1024), (257, 4096)],
 )
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
 def test_fusion_add_rmsnorm_nvfp4_quant(
-    dtype: torch.dtype, eps: float, num_tokens: int, hidden_size: int
+    dtype: torch.dtype,
+    eps: float,
+    num_tokens: int,
+    hidden_size: int,
+    fused_add: bool,
+    batch_size: int | None,
+    is_sf_swizzled_layout: bool,
 ):
+    op_name = (
+        "flashinfer_fused_add_rms_norm_nvfp4_quant"
+        if fused_add
+        else "flashinfer_rms_norm_nvfp4_quant"
+    )
     fused_op = getattr(
         torch.ops.vllm,
-        "flashinfer_fused_add_rms_norm_nvfp4_quant",
+        op_name,
         None,
     )
     if not current_platform.has_device_capability(100) or fused_op is None:
-        pytest.skip("FlashInfer add-RMSNorm NVFP4 fusion is not available")
+        pytest.skip("FlashInfer RMSNorm NVFP4 fusion is not available")
     assert fused_op is not None
     fused_op_default = fused_op.default
 
@@ -463,9 +496,17 @@ def test_fusion_add_rmsnorm_nvfp4_quant(
             FixFunctionalizationPass(vllm_config),
         )
 
-        model = AddRMSNormNvfp4Model(hidden_size=hidden_size, eps=eps)
-        x = torch.rand(num_tokens, hidden_size)
-        torch._dynamo.mark_dynamic(x, 0)
+        model = AddRMSNormNvfp4Model(
+            hidden_size=hidden_size,
+            eps=eps,
+            fused_add=fused_add,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+        )
+        shape = (num_tokens, hidden_size)
+        if batch_size is not None:
+            shape = (batch_size, *shape)
+        x = torch.rand(shape)
+        torch._dynamo.mark_dynamic(x, x.ndim - 2)
 
         result_fused = torch.compile(model, backend=fused_backend)(x)
         result_unfused = torch.compile(model, backend=unfused_backend)(x)

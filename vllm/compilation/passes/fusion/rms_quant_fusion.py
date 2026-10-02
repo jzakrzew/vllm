@@ -30,7 +30,11 @@ from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..inductor_pass import enable_fake_mode
-from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
+from ..vllm_inductor_pass import (
+    VllmFusionPatternMatcherPass,
+    VllmInductorPass,
+    VllmPatternMatcherPass,
+)
 from .matcher_utils import (
     MatcherQuantFP8,
 )
@@ -43,6 +47,42 @@ FP4_DTYPE = torch.uint8
 _RMS_NORM_OP = torch.ops.vllm_ir.rms_norm.default
 _FUSED_ADD_RMS_NORM_OP = torch.ops.vllm_ir.fused_add_rms_norm.default
 _FLASHINFER_ADD_RMSNORM_FP4QUANT: Any | None = None
+_FLASHINFER_RMSNORM_FP4QUANT: Any | None = None
+
+
+def _flashinfer_rms_norm_nvfp4_quant(
+    result: torch.Tensor,
+    result_block_scale: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    is_sf_swizzled_layout: bool,
+    epsilon: float,
+) -> None:
+    assert _FLASHINFER_RMSNORM_FP4QUANT is not None
+    _FLASHINFER_RMSNORM_FP4QUANT(
+        input,
+        weight,
+        y_fp4=result.view(torch.float4_e2m1fn_x2),
+        block_scale=result_block_scale.view(torch.float8_e4m3fn),
+        global_scale=input_global_scale.reshape(1),
+        eps=epsilon,
+        block_size=16,
+        scale_format="e4m3",
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+    )
+
+
+def _flashinfer_rms_norm_nvfp4_quant_fake(
+    result: torch.Tensor,
+    result_block_scale: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    is_sf_swizzled_layout: bool,
+    epsilon: float,
+) -> None:
+    return None
 
 
 def _flashinfer_fused_add_rms_norm_nvfp4_quant(
@@ -89,6 +129,7 @@ def _flashinfer_fused_add_rms_norm_nvfp4_quant_fake(
 
 
 _FLASHINFER_NVFP4_RMS_QUANT_OP: OpOverload | None = None
+_FLASHINFER_NVFP4_PLAIN_RMS_QUANT_OP: OpOverload | None = None
 if (
     current_platform.is_cuda()
     and hasattr(torch, "float4_e2m1fn_x2")
@@ -108,6 +149,22 @@ if (
         )
         _FLASHINFER_NVFP4_RMS_QUANT_OP = (
             torch.ops.vllm.flashinfer_fused_add_rms_norm_nvfp4_quant.default
+        )
+
+    try:
+        from flashinfer import rmsnorm_fp4quant
+    except ImportError:
+        pass
+    else:
+        _FLASHINFER_RMSNORM_FP4QUANT = rmsnorm_fp4quant
+        direct_register_custom_op(
+            op_name="flashinfer_rms_norm_nvfp4_quant",
+            op_func=_flashinfer_rms_norm_nvfp4_quant,
+            mutates_args=["result", "result_block_scale"],
+            fake_impl=_flashinfer_rms_norm_nvfp4_quant_fake,
+        )
+        _FLASHINFER_NVFP4_PLAIN_RMS_QUANT_OP = (
+            torch.ops.vllm.flashinfer_rms_norm_nvfp4_quant.default
         )
 
 
@@ -678,14 +735,27 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
         )
 
 
-class FusedAddRMSNormNvfp4QuantPattern:
-    """Fuse add-RMSNorm with NVFP4 quantization for either scale layout."""
+class FusedRMSNormNvfp4QuantPattern:
+    """Fuse RMSNorm, optionally with residual add, with NVFP4 quantization."""
 
-    def __init__(self, epsilon: float, is_sf_swizzled_layout: bool) -> None:
-        assert _FLASHINFER_NVFP4_RMS_QUANT_OP is not None
+    def __init__(
+        self,
+        epsilon: float,
+        is_sf_swizzled_layout: bool,
+        flatten_input: bool = False,
+        fused_add: bool = False,
+    ) -> None:
+        fused_op = (
+            _FLASHINFER_NVFP4_RMS_QUANT_OP
+            if fused_add
+            else _FLASHINFER_NVFP4_PLAIN_RMS_QUANT_OP
+        )
+        assert fused_op is not None
         self.epsilon = epsilon
         self.is_sf_swizzled_layout = is_sf_swizzled_layout
-        self.FUSED_OP = _FLASHINFER_NVFP4_RMS_QUANT_OP
+        self.flatten_input = flatten_input
+        self.fused_add = fused_add
+        self.FUSED_OP = fused_op
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
@@ -693,12 +763,17 @@ class FusedAddRMSNormNvfp4QuantPattern:
             result_block_scale: torch.Tensor,
             input: torch.Tensor,
             weight: torch.Tensor,
-            residual: torch.Tensor,
+            residual: torch.Tensor | None,
             input_global_scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            result_rms, updated_residual = vllm.ir.ops.fused_add_rms_norm(
-                input, residual, weight, self.epsilon
-            )
+        ) -> tuple[torch.Tensor, ...]:
+            if residual is not None:
+                result_rms, updated_residual = vllm.ir.ops.fused_add_rms_norm(
+                    input, residual, weight, self.epsilon
+                )
+            else:
+                result_rms = vllm.ir.ops.rms_norm(input, weight, self.epsilon)
+            if self.flatten_input:
+                result_rms = result_rms.reshape(-1, result_rms.shape[-1])
             at = auto_functionalized(
                 torch.ops._C.scaled_fp4_quant.out,
                 input=result_rms,
@@ -707,40 +782,65 @@ class FusedAddRMSNormNvfp4QuantPattern:
                 output=result,
                 output_scale=result_block_scale,
             )
-            return at[1], updated_residual, at[2]
+            if residual is not None:
+                return at[1], updated_residual, at[2]
+            return at[1], at[2]
 
         def replacement(
             result: torch.Tensor,
             result_block_scale: torch.Tensor,
             input: torch.Tensor,
             weight: torch.Tensor,
-            residual: torch.Tensor,
+            residual: torch.Tensor | None,
             input_global_scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, ...]:
+            original_shape = input.shape
             hidden_size = input.shape[-1]
-            num_tokens = input.numel() // hidden_size
-            # This full-size dummy is required by FlashInfer's TVM-FFI tensor
-            # validation even though output_both_sf_layouts=False leaves it untouched.
-            block_scale_unswizzled = torch.empty(
-                (num_tokens, hidden_size // 16),
-                dtype=torch.float8_e4m3fn,
-                device=input.device,
-            )
+            input = input.reshape(-1, hidden_size)
+            extra_kwargs: dict[str, torch.Tensor] = {}
+            if residual is not None:
+                residual = residual.reshape(-1, hidden_size)
+                num_tokens = input.numel() // hidden_size
+                # This full-size dummy is required by FlashInfer's TVM-FFI tensor
+                # validation even though output_both_sf_layouts=False leaves it
+                # untouched.
+                block_scale_unswizzled = torch.empty(
+                    (num_tokens, hidden_size // 16),
+                    dtype=torch.float8_e4m3fn,
+                    device=input.device,
+                )
+                extra_kwargs = {
+                    "residual": residual,
+                    "block_scale_unswizzled": block_scale_unswizzled,
+                }
             at = auto_functionalized(
                 self.FUSED_OP,
                 result=result,
                 result_block_scale=result_block_scale,
-                residual=residual,
                 input=input,
                 weight=weight,
                 input_global_scale=input_global_scale,
-                block_scale_unswizzled=block_scale_unswizzled,
                 is_sf_swizzled_layout=self.is_sf_swizzled_layout,
                 epsilon=self.epsilon,
+                **extra_kwargs,
             )
-            # result, updated residual, block scale in the requested layout
-            return at[1], at[3], at[2]
+            if residual is not None:
+                # result, updated residual, block scale in the requested layout
+                return at[1], at[3].reshape(original_shape), at[2]
+            return at[1], at[2]
 
+        def _without_residual(fn):
+            return (
+                lambda result,
+                result_block_scale,
+                input,
+                weight,
+                input_global_scale: fn(
+                    result, result_block_scale, input, weight, None, input_global_scale
+                )
+            )
+
+        input = empty_bf16(1, 5, 64) if self.flatten_input else empty_bf16(5, 64)
         inputs = [
             torch.empty(
                 (5, 32), dtype=torch.uint8, device=current_platform.device_type
@@ -754,16 +854,18 @@ class FusedAddRMSNormNvfp4QuantPattern:
                     device=current_platform.device_type,
                 )
             ),
-            empty_bf16(5, 64),
+            input,
             empty_bf16(64),
-            empty_bf16(5, 64),
-            empty_fp32(1),
         ]
+        if self.fused_add:
+            inputs.append(torch.empty_like(input))
+        inputs.append(empty_fp32(1))
+
         pm.register_replacement(
-            pattern,
-            replacement,
+            pattern if self.fused_add else _without_residual(pattern),
+            replacement if self.fused_add else _without_residual(replacement),
             inputs,
-            pm.fwd_only,
+            VllmFusionPatternMatcherPass._trace_fn,
             pm_pass,
             extra_check=_rms_input_weight_dtype_match,
         )
@@ -785,13 +887,21 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
         # Make sure fused add patterns are before simple rms norm,
         # as the latter is a subset of the former in torch ops
         for epsilon in [1e-5, 1e-6]:
-            if _FLASHINFER_NVFP4_RMS_QUANT_OP is not None and (
-                current_platform.has_device_capability(100)
+            for fused_add, fused_op in (
+                (True, _FLASHINFER_NVFP4_RMS_QUANT_OP),
+                (False, _FLASHINFER_NVFP4_PLAIN_RMS_QUANT_OP),
             ):
-                for is_sf_swizzled_layout in (True, False):
-                    FusedAddRMSNormNvfp4QuantPattern(
-                        epsilon, is_sf_swizzled_layout
-                    ).register(self.patterns)
+                if fused_op is not None and (
+                    current_platform.has_device_capability(100)
+                ):
+                    for is_sf_swizzled_layout in (True, False):
+                        for flatten_input in (False, True):
+                            FusedRMSNormNvfp4QuantPattern(
+                                epsilon,
+                                is_sf_swizzled_layout,
+                                flatten_input,
+                                fused_add=fused_add,
+                            ).register(self.patterns)
 
             # Fuse fused_add_rms_norm + static fp8 quant
             FusedAddRMSNormStaticQuantPattern(epsilon, FP8_DTYPE).register(
@@ -851,5 +961,5 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
             FusedAddRMSNormStaticQuantPattern,
             FusedAddRMSNormDynamicQuantPattern,
             FusedAddRMSNormGroupQuantPattern,
-            FusedAddRMSNormNvfp4QuantPattern,
+            FusedRMSNormNvfp4QuantPattern,
         )
