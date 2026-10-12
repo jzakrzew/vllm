@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for model adapter weight loading (adapters.py)."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
-from transformers import Gemma3Config, PreTrainedConfig, Qwen2Config
+from transformers import Gemma3Config, LlamaConfig, PreTrainedConfig, Qwen2Config
 
+from vllm.config import CompilationConfig, CompilationMode, set_current_vllm_config
 from vllm.model_executor.models.adapters import (
     _create_pooling_model_cls,
     _resolve_num_labels,
@@ -244,6 +247,71 @@ def test_pooling_prefix_probe_uses_hf_to_vllm_mapper(monkeypatch):
         "language_model.model.embed.weight",
         "language_model.model.layer0.weight",
     }
+
+
+@pytest.mark.parametrize("num_bits", [4, 8])
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+def test_pooling_loads_packed_embeddings(num_bits, tie_word_embeddings, dist_init):
+    """Named INT embeddings load without tying the discarded LM head."""
+    from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+        CompressedTensorsConfig,
+    )
+    from vllm.model_executor.models.llama import LlamaForCausalLM
+
+    class PoolingLlama(_create_pooling_model_cls(LlamaForCausalLM)):  # type: ignore[misc]
+        def _init_pooler(self, vllm_config, prefix=""):
+            return torch.nn.Identity()
+
+    quant_config = CompressedTensorsConfig.from_config(
+        {
+            "format": "pack-quantized",
+            "config_groups": {
+                "embedding": {
+                    "targets": ["model.embed_tokens"],
+                    "weights": {
+                        "num_bits": num_bits,
+                        "type": "int",
+                        "strategy": "channel",
+                        "symmetric": True,
+                    },
+                }
+            },
+        }
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=LlamaConfig(
+                vocab_size=64,
+                hidden_size=32,
+                num_hidden_layers=0,
+                tie_word_embeddings=tie_word_embeddings,
+            ),
+            head_dtype=torch.float32,
+        ),
+        quant_config=quant_config,
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE, custom_ops=["none"]
+        ),
+        speculative_config=None,
+    )
+    ints = torch.arange(64 * 32).reshape(64, 32) % (2**num_bits)
+    ints = (ints - 2 ** (num_bits - 1)).to(torch.int8)
+    weights = {
+        "model.embed_tokens.weight_packed": pack_to_int32(ints, num_bits),
+        "model.embed_tokens.weight_scale": torch.ones(64, 1),
+        "model.embed_tokens.weight_shape": torch.tensor([64, 32]),
+        "model.norm.weight": torch.ones(32),
+    }
+    with set_current_vllm_config(config):
+        model = PoolingLlama(vllm_config=config)
+        loaded = model.load_weights(_buffer_reusing_iterator(weights))
+
+    assert isinstance(model.lm_head, StageMissingLayer)
+    assert loaded == set(weights)
+    for name, param in model.named_parameters():
+        torch.testing.assert_close(param, weights[name], rtol=0, atol=0)
 
 
 def _composite_config(outer_labels=None, inner_labels=None):
