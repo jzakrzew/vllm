@@ -837,6 +837,7 @@ class Attention(nn.Module):
 @support_torch_compile(
     dynamic_arg_dims={
         "x": 1,
+        "residual": 1,
         "freqs_cis": 0,
         "cu_seqlens": 0,
         "sequence_lengths": 0,
@@ -876,18 +877,23 @@ class TransformerBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
         sequence_lengths: torch.Tensor | None,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = x
+            x = self.attention_norm(x)
+        else:
+            x, residual = self.attention_norm(x, residual)
         r = self.attention.forward(
-            self.attention_norm(x),
+            x,
             freqs_cis=freqs_cis,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
-        h = x + r
-        r = self.feed_forward.forward(self.ffn_norm(h))
-        out = h + r
-        return out
+        r, residual = self.ffn_norm(r, residual)
+        r = self.feed_forward.forward(r)
+        return r, residual
 
 
 class Transformer(nn.Module):
@@ -918,15 +924,17 @@ class Transformer(nn.Module):
         max_seqlen: torch.Tensor,
         sequence_lengths: torch.Tensor | None,
     ) -> torch.Tensor:
+        residual = None
         for layer in self.layers:
-            x = layer(
+            x, residual = layer(
                 x,
                 freqs_cis=freqs_cis,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
+                residual=residual,
             )
-        return x
+        return x if residual is None else x + residual
 
 
 def position_meshgrid(
@@ -1347,6 +1355,7 @@ class PixtralHFAttention(nn.Module):
 @support_torch_compile(
     dynamic_arg_dims={
         "hidden_states": 1,
+        "residual": 1,
         "rotary_pos_emb_cos": 0,
         "rotary_pos_emb_sin": 0,
         "cu_seqlens": 0,
@@ -1386,18 +1395,23 @@ class PixtralHFTransformerBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
         sequence_lengths: torch.Tensor | None,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.attention_norm(hidden_states)
+        else:
+            hidden_states, residual = self.attention_norm(hidden_states, residual)
         r, _ = self.attention.forward(
-            self.attention_norm(hidden_states),
+            hidden_states,
             position_embeddings=(rotary_pos_emb_cos, rotary_pos_emb_sin),
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
-        h = hidden_states + r
-        r = self.feed_forward.forward(self.ffn_norm(h))
-        out = h + r
-        return out
+        r, residual = self.ffn_norm(r, residual)
+        r = self.feed_forward.forward(r)
+        return r, residual
 
 
 class PixtralHFTransformer(nn.Module):
@@ -1436,25 +1450,27 @@ class PixtralHFTransformer(nn.Module):
         sequence_lengths: torch.Tensor | None,
         return_all_hidden_states: bool,
     ) -> torch.Tensor:
-        hidden_states_pool = [x]
+        hidden_states_pool = [x.clone()] if return_all_hidden_states else []
         rotary_pos_emb_cos, rotary_pos_emb_sin = position_embeddings
 
+        residual = None
         for layer in self.layers:
-            x = layer(
+            x, residual = layer(
                 x,
                 rotary_pos_emb_cos,
                 rotary_pos_emb_sin,
                 cu_seqlens,
                 max_seqlen,
                 sequence_lengths,
+                residual=residual,
             )
             if return_all_hidden_states:
-                hidden_states_pool.append(x)
+                hidden_states_pool.append(x + residual)
         # If we have multiple feature sample layers, we return all hidden
         # states in order and grab the ones we need by index.
         if return_all_hidden_states:
             return hidden_states_pool
-        return x
+        return x if residual is None else x + residual
 
 
 def pixtral_patch_embed(
