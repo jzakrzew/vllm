@@ -163,6 +163,17 @@ define_extension_target(
   USE_SABI 3.11
   WITH_SOABI)
 
+# Host tensor serialization helper, shared by all device backends.
+define_extension_target(
+  tensor_data_C
+  DESTINATION vllm
+  LANGUAGE CXX
+  SOURCES csrc/tensor_data.cpp
+  USE_SABI 3.11
+  WITH_SOABI)
+target_compile_definitions(tensor_data_C PRIVATE
+  TORCH_TARGET_VERSION=0x020E000000000000ULL)
+
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
 #

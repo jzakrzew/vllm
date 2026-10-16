@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import contextlib
+import ctypes
 import json
 import multiprocessing
 import threading
@@ -28,6 +29,7 @@ from torch.autograd.profiler import record_function
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.tensor_data_C import prepare_tensor_data as _prepare_tensor_data
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils.network_utils import ZmqListener, get_open_zmq_ipc_path, get_tcp_uri
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
@@ -811,7 +813,12 @@ def tensor_data(tensor: torch.Tensor) -> memoryview:
         A memoryview of the tensor data as uint8.
 
     """
-    return tensor.flatten().cpu().contiguous().view(torch.uint8).numpy().data
+    byte_tensor = _prepare_tensor_data(tensor)
+    array = byte_tensor.numpy()
+    buffer = (ctypes.c_ubyte * array.nbytes).from_buffer(array)
+    # Keep the intermediate tensor alive to defer its GIL-releasing destructor.
+    buffer._tensor_owner = byte_tensor
+    return memoryview(buffer).cast("B")
 
 
 @dataclass

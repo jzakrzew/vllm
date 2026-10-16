@@ -17,9 +17,113 @@ from vllm.multimodal.inputs import (
     MultiModalSharedField,
     NestedTensors,
 )
+from vllm.platforms import current_platform
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.utils import tensor_data
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.int64,
+        torch.bool,
+        torch.complex64,
+    ],
+)
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda_alike(), reason="Requires a GPU"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "layout", ["scalar", "empty", "contiguous", "offset", "transpose", "strided"]
+)
+def test_tensor_data_bytes(dtype: torch.dtype, device: str, layout: str):
+    """Raw bytes preserve logical element order, including non-NumPy dtypes."""
+    tensor = torch.arange(24, device=device).to(dtype).reshape(4, 6)
+    if layout == "scalar":
+        tensor = tensor[1, 2]
+    elif layout == "empty":
+        tensor = tensor[:0]
+    elif layout == "offset":
+        tensor = tensor[1:3]
+    elif layout == "transpose":
+        tensor = tensor.t()
+    elif layout == "strided":
+        tensor = tensor[:, ::2]
+
+    expected = tensor.flatten().cpu().contiguous().view(torch.uint8).numpy().data
+    actual = tensor_data(tensor)
+    assert isinstance(actual, memoryview)
+    assert actual.format == "B"
+    assert actual.ndim == 1
+    assert actual.c_contiguous
+    assert actual.nbytes == tensor.numel() * tensor.element_size()
+    assert actual.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_tensor_data_owns_storage(contiguous: bool):
+    """The returned buffer owns both borrowed storage and temporary copies."""
+    import gc
+
+    tensor = torch.arange(24, dtype=torch.bfloat16).reshape(4, 6)
+    if not contiguous:
+        tensor = tensor.t()
+    expected = tensor.flatten().contiguous().view(torch.uint8).numpy().tobytes()
+    data = tensor_data(tensor)
+    data = data[:]
+    if contiguous:
+        tensor[0, 0] = 42
+        assert torch.frombuffer(data, dtype=tensor.dtype)[0] == 42
+        tensor[0, 0] = 0
+    tensor.set_(torch.zeros_like(tensor))
+    del tensor
+    gc.collect()
+    assert data.tobytes() == expected
+
+
+@pytest.mark.parametrize("view", ["conjugate", "negative", "negative_uint8"])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_tensor_data_lazy_view(view: str, contiguous: bool):
+    """Lazy views must match the conversion chain, including its rejections."""
+    tensor = torch.arange(6).reshape(2, 3)
+    if view == "conjugate":
+        tensor = tensor.to(torch.complex64).conj()
+    else:
+        tensor = tensor.to(torch.uint8 if view == "negative_uint8" else torch.float32)
+        tensor = tensor._neg_view()
+    if not contiguous:
+        tensor = tensor.t()
+    try:
+        expected = tensor.flatten().cpu().contiguous().view(torch.uint8).numpy().data
+    except RuntimeError:
+        with pytest.raises(RuntimeError):
+            tensor_data(tensor)
+    else:
+        assert tensor_data(tensor).tobytes() == expected.tobytes()
+
+
+def test_tensor_data_prevents_storage_reallocation():
+    """Exported buffers must prevent resize_ from invalidating their pointer."""
+    tensor = torch.arange(4, dtype=torch.bfloat16)
+    data = tensor_data(tensor)
+    expected = data.tobytes()
+    with pytest.raises(RuntimeError, match="not resizable"):
+        tensor.resize_(1024)
+    assert data.tobytes() == expected
 
 
 class UnrecognizedType(UserDict):
@@ -529,11 +633,8 @@ def test_zero_copy_frames_survive_without_caller_side_references():
     encoder = MsgpackEncoder()
     decoder = MsgpackDecoder(RequestWithTensor)
 
-    # The buffer handed to zmq must keep the tensor's storage alive by itself.
-    holder = tensor_data(expected).obj
-    while getattr(holder, "base", None) is not None:
-        holder = holder.base
-    assert isinstance(holder, torch.Tensor)
+    # Check zero-copy behavior without depending on the buffer owner's type.
+    holder = torch.frombuffer(tensor_data(expected), dtype=expected.dtype)
     assert holder.data_ptr() == expected.data_ptr()
 
     with zmq.Context() as ctx:

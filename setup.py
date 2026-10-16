@@ -1127,6 +1127,7 @@ class precompiled_wheel_utils:
                             "vllm/cumem_allocator.abi3.so",
                             "vllm/spinloop.abi3.so",
                             "vllm/fs_io_C.abi3.so",
+                            "vllm/tensor_data_C.abi3.so",
                             # ROCm-specific libraries
                             "vllm/_rocm_C.abi3.so",
                         }
@@ -1524,6 +1525,8 @@ def get_requirements() -> list[str]:
 
 
 ext_modules = []
+
+ext_modules.append(CMakeExtension(name="vllm.tensor_data_C"))
 
 if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
