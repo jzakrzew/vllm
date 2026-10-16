@@ -5,6 +5,7 @@
 
 #include <memory>
 
+#include <torch/csrc/inductor/aoti_torch/generated/c_shim_cpu.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/pyobject.h>
 #include <torch/csrc/stable/tensor.h>
@@ -19,18 +20,25 @@ PyObject* prepare_tensor_data(PyObject* /*self*/, PyObject* arg) {
     {
       const std::unique_ptr<PyThreadState, decltype(&PyEval_RestoreThread)> gil(
           PyEval_SaveThread(), PyEval_RestoreThread);
-      // Avoid boxed dispatcher calls for operations that return the input.
-      if (tensor.dim() != 1) {
-        tensor = torch::stable::flatten(tensor);
-      }
       if (!tensor.is_cpu()) {
         tensor = torch::stable::to(
             tensor, torch::stable::Device(torch::headeronly::DeviceType::CPU));
       }
-      if (!tensor.is_contiguous()) {
-        tensor = torch::stable::contiguous(tensor);
+      // CPU shims avoid boxing and materialize conjugate/negative views.
+      AtenTensorHandle output;
+      if (tensor.dim() != 1) {
+        const int64_t shape = -1;
+        STABLE_TORCH_ERROR_CODE_CHECK(
+            aoti_torch_cpu_reshape(tensor.get(), &shape, 1, &output));
+        tensor = torch::stable::Tensor(output);
       }
-      tensor = torch::stable::view(tensor, torch::headeronly::ScalarType::Byte);
+      if (!tensor.is_contiguous()) {
+        STABLE_TORCH_ERROR_CODE_CHECK(aoti_torch_clone(tensor.get(), &output));
+        tensor = torch::stable::Tensor(output);
+      }
+      STABLE_TORCH_ERROR_CODE_CHECK(aoti_torch_cpu_view_dtype(
+          tensor.get(), aoti_torch_dtype_uint8(), &output));
+      tensor = torch::stable::Tensor(output);
     }
     return static_cast<PyObject*>(torch::stable::tensor_to_pyobject(tensor));
   } catch (const std::exception& error) {

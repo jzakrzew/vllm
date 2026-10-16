@@ -95,25 +95,43 @@ def test_tensor_data_owns_storage(contiguous: bool):
     assert data.tobytes() == expected
 
 
-@pytest.mark.parametrize("view", ["conjugate", "negative", "negative_uint8"])
-@pytest.mark.parametrize("contiguous", [True, False])
-def test_tensor_data_lazy_view(view: str, contiguous: bool):
-    """Lazy views must match the conversion chain, including its rejections."""
-    tensor = torch.arange(6).reshape(2, 3)
-    if view == "conjugate":
-        tensor = tensor.to(torch.complex64).conj()
+@pytest.mark.parametrize(
+    "view", ["conjugate", "negative", "negative_uint8", "conjugate_negative"]
+)
+@pytest.mark.parametrize("layout", ["flat", "flat_strided", "contiguous", "transpose"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda_alike(), reason="Requires a GPU"
+            ),
+        ),
+    ],
+)
+def test_tensor_data_lazy_view(view: str, layout: str, device: str):
+    """Serialize logical values of lazy views without changing their flags."""
+    tensor = torch.arange(6, device=device)
+    if view in ("conjugate", "conjugate_negative"):
+        tensor = torch.complex(tensor.float(), tensor.float() + 1).conj()
+        if view == "conjugate_negative":
+            tensor = tensor._neg_view()
     else:
         tensor = tensor.to(torch.uint8 if view == "negative_uint8" else torch.float32)
         tensor = tensor._neg_view()
-    if not contiguous:
-        tensor = tensor.t()
-    try:
-        expected = tensor.flatten().cpu().contiguous().view(torch.uint8).numpy().data
-    except RuntimeError:
-        with pytest.raises(RuntimeError):
-            tensor_data(tensor)
-    else:
-        assert tensor_data(tensor).tobytes() == expected.tobytes()
+    if layout == "flat_strided":
+        tensor = tensor[::2]
+    elif layout in ("contiguous", "transpose"):
+        tensor = tensor.reshape(2, 3)
+        if layout == "transpose":
+            tensor = tensor.t()
+    flags = (tensor.is_conj(), tensor.is_neg())
+    expected = tensor.resolve_conj().resolve_neg()
+    expected = expected.flatten().cpu().contiguous().view(torch.uint8).numpy().data
+    assert tensor_data(tensor).tobytes() == expected.tobytes()
+    assert (tensor.is_conj(), tensor.is_neg()) == flags
 
 
 def test_tensor_data_prevents_storage_reallocation():

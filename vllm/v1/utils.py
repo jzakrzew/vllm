@@ -806,7 +806,7 @@ class _TensorDataArray(np.ndarray):
 
 def tensor_data(tensor: torch.Tensor) -> memoryview:
     """Get the raw data of a tensor as a uint8 memoryview, useful for
-    serializing and hashing.
+    serializing and hashing. Conjugate and negative views are materialized.
 
     Args:
         tensor: The input tensor.
