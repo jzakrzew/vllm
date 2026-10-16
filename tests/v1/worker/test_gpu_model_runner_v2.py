@@ -20,7 +20,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+from vllm.v1.worker.gpu.async_utils import AsyncPoolingOutput, async_copy_to_np
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
 from vllm.v1.worker.gpu.spec_decode.standalone_ar import speculator as ar_module
@@ -360,6 +360,22 @@ def test_get_drafter_hidden_states_tolerates_missing_target_buffer(target_buffer
         assert torch.equal(out, buffer[:4])
     else:
         assert out is hidden_states
+
+
+@pytest.mark.parametrize("shape", [(), (1, 4), (3, 4)])
+@pytest.mark.parametrize("finished_mask", [[True, True], [False, True]])
+def test_async_pooling_output_rejects_mismatched_batch_size(shape, finished_mask):
+    """Reject malformed outputs before CUDA copies can return misaligned rows."""
+    with pytest.raises(
+        ValueError, match="batch size does not match finished mask size"
+    ):
+        AsyncPoolingOutput(
+            model_runner_output=Mock(),
+            pooler_output=torch.zeros(shape),
+            finished_mask=finished_mask,
+            main_stream=Mock(),
+            copy_stream=Mock(),
+        )
 
 
 def test_async_copy_to_np_does_not_alias_reused_buffer():

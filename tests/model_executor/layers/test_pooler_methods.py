@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for sequence and token pooling methods and their factories."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,12 +15,14 @@ from transformers import PreTrainedConfig
 from vllm.config import PoolerConfig, set_current_vllm_config
 from vllm.model_executor.layers.pooler import PoolingParamsUpdate
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
+from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
 from vllm.model_executor.layers.pooler.seqwise.methods import (
     CLSPool,
     LastPool,
     MeanPool,
     get_seq_pooling_method,
 )
+from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.layers.pooler.special import BOSEOSFilter, DispatchPooler
 from vllm.model_executor.layers.pooler.tokwise.heads import TokenEmbeddingPoolerHead
 from vllm.model_executor.layers.pooler.tokwise.methods import (
@@ -306,6 +309,69 @@ class _FakeSchedulerConfig:
 @dataclass
 class _FakeVllmConfig:
     scheduler_config: _FakeSchedulerConfig
+    use_v2_model_runner: bool = False
+
+
+@pytest.mark.parametrize("use_v2_model_runner", [None, False, True])
+def test_dispatch_preserves_batched_sequence_embeddings_only_for_mrv2(
+    use_v2_model_runner,
+):
+    """Only batch MRV2 outputs; allow standalone use without a config."""
+    config_context = (
+        nullcontext()
+        if use_v2_model_runner is None
+        else set_current_vllm_config(
+            _FakeVllmConfig(
+                _FakeSchedulerConfig(), use_v2_model_runner=use_v2_model_runner
+            )
+        )
+    )
+    with config_context:
+        pooler = DispatchPooler(
+            {"embed": SequencePooler(LastPool(), EmbeddingPoolerHead())}
+        )
+    metadata = _make_metadata([2, 3])
+    hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+
+    outputs = pooler(hidden, metadata)
+
+    if use_v2_model_runner:
+        assert isinstance(outputs, torch.Tensor)
+        torch.testing.assert_close(outputs, hidden[[1, 4]])
+    else:
+        assert isinstance(outputs, list)
+        assert len(outputs) == 2
+        for output, expected in zip(outputs, hidden[[1, 4]]):
+            torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
+def test_dispatch_preserves_mixed_task_request_order(use_v2_model_runner):
+    """Flatten tensor and list outputs in order, including repeated task groups."""
+    config = _FakeVllmConfig(
+        _FakeSchedulerConfig(), use_v2_model_runner=use_v2_model_runner
+    )
+    with set_current_vllm_config(config):
+        token_pooler = TokenPooler(AllPool())
+        pooler = DispatchPooler(
+            {
+                "embed": SequencePooler(LastPool(), EmbeddingPoolerHead()),
+                "token_embed": token_pooler,
+            }
+        )
+    metadata = _make_metadata(
+        [2, 3, 2, 1], tasks=["embed", "embed", "token_embed", "embed"]
+    )
+    hidden = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+
+    outputs = pooler(hidden, metadata)
+
+    assert isinstance(outputs, list)
+    assert len(outputs) == 4
+    for output, expected in zip(
+        outputs, [hidden[1], hidden[4], hidden[5:7], hidden[7]]
+    ):
+        torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.parametrize("tok_pooling_type", ["ALL", "STEP"])
@@ -316,6 +382,7 @@ def test_dispatch_seq_cls_honors_token_pooling_type(tok_pooling_type):
     )
     config = SimpleNamespace(
         scheduler_config=_FakeSchedulerConfig(),
+        use_v2_model_runner=False,
         model_config=SimpleNamespace(
             pooler_config=pooler_config,
             head_dtype=None,

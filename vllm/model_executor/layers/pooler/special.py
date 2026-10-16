@@ -6,7 +6,7 @@ from itertools import groupby
 
 import torch
 
-from vllm.config import PoolerConfig
+from vllm.config import PoolerConfig, get_current_vllm_config_or_none
 from vllm.model_executor.layers.pooler import PoolingParamsUpdate
 from vllm.tasks import PoolingTask
 from vllm.v1.pool.metadata import PoolingMetadata
@@ -67,6 +67,10 @@ class DispatchPooler(Pooler):
                 )
 
         self.poolers_by_task = poolers_by_task
+        vllm_config = get_current_vllm_config_or_none()
+        self.use_v2_model_runner = (
+            vllm_config is not None and vllm_config.use_v2_model_runner
+        )
 
     def get_supported_tasks(self) -> Set[PoolingTask]:
         return set(self.poolers_by_task)
@@ -94,12 +98,21 @@ class DispatchPooler(Pooler):
         pooling_metadata: PoolingMetadata,
     ) -> PoolerOutput:
         poolers_by_task = self.poolers_by_task
+        tasks = pooling_metadata.tasks
+        # In MRV2, a single task needs no metadata slicing and can keep tensor
+        # outputs batched for one CPU copy. MRV1 stays on the list path to avoid
+        # a blocking index transfer for partial batches.
+        if self.use_v2_model_runner and tasks and tasks.count(tasks[0]) == len(tasks):
+            pooler = poolers_by_task.get(tasks[0])
+            if pooler is not None:
+                return pooler(hidden_states, pooling_metadata)
+
         cursor = pooling_metadata.pooling_cursor
 
         outputs = list[torch.Tensor | None]()
         offset = 0
         token_offset = 0
-        for task, group in groupby(pooling_metadata.tasks):
+        for task, group in groupby(tasks):
             if not (pooler := poolers_by_task.get(task)):
                 raise ValueError(
                     f"Unsupported task: {task!r} "

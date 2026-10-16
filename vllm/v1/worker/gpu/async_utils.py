@@ -226,6 +226,15 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
     ):
+        if isinstance(pooler_output, torch.Tensor) and (
+            pooler_output.ndim == 0 or pooler_output.shape[0] != len(finished_mask)
+        ):
+            raise ValueError(
+                "Pooler output batch size does not match finished mask size: "
+                f"output shape {tuple(pooler_output.shape)}, "
+                f"{len(finished_mask)} requests."
+            )
+
         self.model_runner_output = model_runner_output
         self.pooler_output = pooler_output
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
