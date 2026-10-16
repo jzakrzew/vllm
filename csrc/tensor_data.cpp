@@ -19,11 +19,18 @@ PyObject* prepare_tensor_data(PyObject* /*self*/, PyObject* arg) {
     {
       const std::unique_ptr<PyThreadState, decltype(&PyEval_RestoreThread)> gil(
           PyEval_SaveThread(), PyEval_RestoreThread);
-      tensor = torch::stable::view(
-          torch::stable::contiguous(torch::stable::to(
-              torch::stable::flatten(tensor),
-              torch::stable::Device(torch::headeronly::DeviceType::CPU))),
-          torch::headeronly::ScalarType::Byte);
+      // Avoid boxed dispatcher calls for operations that return the input.
+      if (tensor.dim() != 1) {
+        tensor = torch::stable::flatten(tensor);
+      }
+      if (!tensor.is_cpu()) {
+        tensor = torch::stable::to(
+            tensor, torch::stable::Device(torch::headeronly::DeviceType::CPU));
+      }
+      if (!tensor.is_contiguous()) {
+        tensor = torch::stable::contiguous(tensor);
+      }
+      tensor = torch::stable::view(tensor, torch::headeronly::ScalarType::Byte);
     }
     return static_cast<PyObject*>(torch::stable::tensor_to_pyobject(tensor));
   } catch (const std::exception& error) {

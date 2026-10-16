@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import contextlib
-import ctypes
 import json
 import multiprocessing
 import threading
@@ -23,6 +22,7 @@ from typing import (
     overload,
 )
 
+import numpy as np
 import torch
 import uvloop
 from torch.autograd.profiler import record_function
@@ -37,8 +37,6 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
-    import numpy as np
-
     from vllm.v1.engine.coordinator import DPCoordinator
     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
 
@@ -802,6 +800,10 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     return func(name)
 
 
+class _TensorDataArray(np.ndarray):
+    _tensor_owner: torch.Tensor
+
+
 def tensor_data(tensor: torch.Tensor) -> memoryview:
     """Get the raw data of a tensor as a uint8 memoryview, useful for
     serializing and hashing.
@@ -814,11 +816,10 @@ def tensor_data(tensor: torch.Tensor) -> memoryview:
 
     """
     byte_tensor = _prepare_tensor_data(tensor)
-    array = byte_tensor.numpy()
-    buffer = (ctypes.c_ubyte * array.nbytes).from_buffer(array)
+    array = byte_tensor.numpy().view(_TensorDataArray)
     # Keep the intermediate tensor alive to defer its GIL-releasing destructor.
-    buffer._tensor_owner = byte_tensor
-    return memoryview(buffer).cast("B")
+    array._tensor_owner = byte_tensor
+    return array.data
 
 
 @dataclass
