@@ -14,12 +14,14 @@ from transformers import PreTrainedConfig
 from vllm.config import PoolerConfig, set_current_vllm_config
 from vllm.model_executor.layers.pooler import PoolingParamsUpdate
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
+from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
 from vllm.model_executor.layers.pooler.seqwise.methods import (
     CLSPool,
     LastPool,
     MeanPool,
     get_seq_pooling_method,
 )
+from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.layers.pooler.special import BOSEOSFilter, DispatchPooler
 from vllm.model_executor.layers.pooler.tokwise.heads import TokenEmbeddingPoolerHead
 from vllm.model_executor.layers.pooler.tokwise.methods import (
@@ -309,7 +311,8 @@ class _FakeVllmConfig:
 
 
 @pytest.mark.parametrize("tok_pooling_type", ["ALL", "STEP"])
-def test_dispatch_seq_cls_honors_token_pooling_type(tok_pooling_type):
+@pytest.mark.parametrize("preserve_batch", [False, True])
+def test_dispatch_seq_cls_honors_token_pooling_type(tok_pooling_type, preserve_batch):
     """Filter STEP rows before classification; preserve all rows for resolved ALL."""
     pooler_config = PoolerConfig(
         seq_pooling_type="LAST", tok_pooling_type=tok_pooling_type
@@ -337,7 +340,11 @@ def test_dispatch_seq_cls_honors_token_pooling_type(tok_pooling_type):
     ]
     metadata = _make_metadata([4, 2, 2], token_ids=token_ids, pooling_params=params)
     hidden = torch.arange(32, dtype=torch.float32).reshape(8, 4)
-    outputs = pooler(hidden, metadata)
+    outputs = (
+        pooler.forward_batch(hidden, metadata)
+        if preserve_batch
+        else pooler(hidden, metadata)
+    )
 
     expected_rows = (
         [[1, 3], [5], []]
@@ -350,6 +357,31 @@ def test_dispatch_seq_cls_honors_token_pooling_type(tok_pooling_type):
     assert pooler.get_pooling_updates("token_classify").requires_token_ids == (
         tok_pooling_type == "STEP"
     )
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+def test_mrv2_dispatch_preserves_dense_batches_and_ragged_dimensions(ragged):
+    from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+
+    pooler = DispatchPooler(
+        {"embed": SequencePooler(LastPool(), EmbeddingPoolerHead())}
+    )
+    params = [
+        PoolingParams(task="embed", dimensions=d)
+        for d in ([2, 3] if ragged else [None, None])
+    ]
+    metadata = _make_metadata([2, 3], pooling_params=params)
+    hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    runner = PoolingRunner.__new__(PoolingRunner)
+    runner.model = SimpleNamespace(pooler=pooler)
+
+    output = runner._run_pooler(hidden, metadata)
+    legacy_output = pooler(hidden, metadata)
+
+    assert isinstance(output, list if ragged else torch.Tensor)
+    assert isinstance(legacy_output, list)
+    for actual, expected in zip(output, legacy_output, strict=True):
+        torch.testing.assert_close(actual, expected)
 
 
 class TestAllPool:

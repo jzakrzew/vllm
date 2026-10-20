@@ -145,6 +145,19 @@ class DispatchPooler(Pooler):
 
         return outputs
 
+    def forward_batch(
+        self,
+        hidden_states: torch.Tensor,
+        pooling_metadata: PoolingMetadata,
+    ) -> PoolerOutput:
+        """Preserve a homogeneous batch for callers that accept dense outputs."""
+        tasks = pooling_metadata.tasks
+        if tasks and all(task == tasks[0] for task in tasks):
+            pooler = self.poolers_by_task.get(tasks[0])
+            if pooler is not None:
+                return pooler(hidden_states, pooling_metadata)
+        return self(hidden_states, pooling_metadata)
+
     def extra_repr(self) -> str:
         s = f"supported_task={self.get_supported_tasks()}"
         return s

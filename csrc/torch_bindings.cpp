@@ -11,7 +11,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // Asynchronous D2H copies into views of one pinned allocation.
   ops.def("release_completed_host_copies() -> ()");
   ops.def("copy_tensors_to_cpu(Tensor[] tensors) -> Tensor[]");
-  ops.def("copy_rows_to_cpu(Tensor tensor, int[] rows) -> Tensor[]");
+  ops.def("copy_rows_to_cpu(Tensor tensor, int[] rows) -> Tensor");
 
   // Compute per-token-group FP8 quantized tensor and scaling factor.
   // The dummy arguments are here so we can correctly fuse with RMSNorm.

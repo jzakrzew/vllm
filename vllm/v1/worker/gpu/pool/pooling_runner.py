@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.pooler.special import DispatchPooler
 from vllm.model_executor.models import VllmModelForPooling, is_pooling_model
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
@@ -155,7 +156,7 @@ class PoolingRunner:
             device=hidden_states.device,
             query_start_loc_gpu=input_batch.query_start_loc[: num_reqs + 1],
         )
-        pooler_output = self.model.pooler(hidden_states, pooling_metadata)
+        pooler_output = self._run_pooler(hidden_states, pooling_metadata)
         finished_mask = pooling_metadata.get_pooling_cursor().get_finished_mask()
         pooler_output = self.late_interaction_runner.postprocess_pooler_output(
             raw_pooler_output=pooler_output,
@@ -164,6 +165,14 @@ class PoolingRunner:
             finished_mask=finished_mask,
         )
         return pooler_output, finished_mask
+
+    def _run_pooler(
+        self, hidden_states: torch.Tensor, pooling_metadata: PoolingMetadata
+    ) -> PoolerOutput:
+        pooler = self.model.pooler
+        if isinstance(pooler, DispatchPooler):
+            return pooler.forward_batch(hidden_states, pooling_metadata)
+        return pooler(hidden_states, pooling_metadata)
 
     def _dummy_pooler_run_task(
         self, hidden_states: torch.Tensor, task: PoolingTask
@@ -199,7 +208,7 @@ class PoolingRunner:
             device=hidden_states.device,
         )
         try:
-            return self.model.pooler(hidden_states, pooling_metadata)
+            return self._run_pooler(hidden_states, pooling_metadata)
         except RuntimeError as e:
             if "out of memory" not in str(e):
                 raise

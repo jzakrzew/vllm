@@ -423,7 +423,15 @@ std::vector<HostTensor> copy_to_cpu(std::vector<HostTensor> tensors,
     }
   }
   const int64_t count = rows ? rows->size() : tensors.size();
-  if (count == 0) return {};
+  if (count == 0) {
+    if (!rows) return {};
+    auto sizes = tensors.front().sizes();
+    std::vector<int64_t> shape(sizes.begin(), sizes.end());
+    shape[0] = 0;
+    return {torch::stable::empty(
+        shape, tensors.front().scalar_type(), std::nullopt,
+        torch::stable::Device(torch::headeronly::DeviceType::CPU), true)};
+  }
   auto& pending = pending_host_copies();
   pending.release_completed();
   const torch::stable::accelerator::DeviceGuard guard(device.index());
@@ -457,11 +465,13 @@ std::vector<HostTensor> copy_to_cpu(std::vector<HostTensor> tensors,
   lengths.reserve(count);
   int64_t total = 0;
   constexpr int64_t max_size = std::numeric_limits<int64_t>::max();
+  const auto& row_source = copy->sources[num_sources];
+  const auto row_itemsize = rows ? row_source.element_size() : 0;
+  const auto row_numel = rows ? row_source.numel() / row_source.size(0) : 0;
   for (int64_t i = 0; i < count; ++i) {
     const auto& source = copy->sources[num_sources + (rows ? 0 : i)];
-    int64_t numel = source.numel();
-    if (rows) numel /= source.size(0);  // count > 0 implies nonempty dim 0.
-    const int64_t itemsize = source.element_size();
+    const int64_t numel = rows ? row_numel : source.numel();
+    const int64_t itemsize = rows ? row_itemsize : source.element_size();
     STD_TORCH_CHECK(numel <= max_size / itemsize, "host copy is too large");
     const int64_t bytes = numel * itemsize;
     const int64_t padding = (itemsize - total % itemsize) % itemsize;
@@ -476,26 +486,44 @@ std::vector<HostTensor> copy_to_cpu(std::vector<HostTensor> tensors,
   copy->arena = torch::stable::empty(
       {total}, torch::headeronly::ScalarType::Byte, std::nullopt,
       torch::stable::Device(torch::headeronly::DeviceType::CPU), true);
-  auto output_arena = torch::stable::from_blob(
-      copy->arena.data_ptr(), {total}, {1},
-      torch::stable::Device(torch::headeronly::DeviceType::CPU),
-      torch::headeronly::ScalarType::Byte, [copy](void*) {});
-  const auto base = reinterpret_cast<int64_t>(output_arena.data_ptr());
+  const auto base = reinterpret_cast<int64_t>(copy->arena.data_ptr());
   std::vector<HostTensor> outputs;
-  outputs.reserve(count);
-  for (int64_t i = 0; i < count; ++i) {
-    const auto& source = copy->sources[num_sources + (rows ? 0 : i)];
-    auto shape = source.sizes();
-    int64_t source_ptr = reinterpret_cast<int64_t>(source.data_ptr());
-    const int64_t storage =
-        source_ptr - source.storage_offset() * source.element_size();
-    if (rows) {
-      source_ptr += (*rows)[i] * source.stride(0) * source.element_size();
-      shape = shape.slice(1);
+  outputs.reserve(rows ? 1 : count);
+  if (rows) {
+    const auto source_ptr = reinterpret_cast<int64_t>(row_source.data_ptr());
+    const auto stride = row_source.stride(0) * row_itemsize;
+    const auto storage =
+        source_ptr - row_source.storage_offset() * row_itemsize;
+    for (int64_t i = 0; i < count; ++i) {
+      copy->add(source_ptr + (*rows)[i] * stride, base + offsets[i], lengths[i],
+                storage);
     }
-    outputs.push_back(host_view(output_arena, offsets[i], lengths[i],
-                                source.scalar_type(), shape));
-    copy->add(source_ptr, base + offsets[i], lengths[i], storage);
+    const auto sizes = row_source.sizes();
+    std::vector<int64_t> shape(sizes.begin(), sizes.end());
+    shape[0] = count;
+    std::vector<int64_t> strides(shape.size(), 1);
+    for (int64_t d = shape.size() - 1; d > 0; --d) {
+      strides[d - 1] = strides[d] * std::max<int64_t>(shape[d], 1);
+    }
+    outputs.push_back(torch::stable::from_blob(
+        copy->arena.data_ptr(), shape, strides,
+        torch::stable::Device(torch::headeronly::DeviceType::CPU),
+        row_source.scalar_type(), [copy](void*) {}));
+  } else {
+    auto output_arena = torch::stable::from_blob(
+        copy->arena.data_ptr(), {total}, {1},
+        torch::stable::Device(torch::headeronly::DeviceType::CPU),
+        torch::headeronly::ScalarType::Byte, [copy](void*) {});
+    for (int64_t i = 0; i < count; ++i) {
+      const auto& source = copy->sources[num_sources + i];
+      auto shape = source.sizes();
+      int64_t source_ptr = reinterpret_cast<int64_t>(source.data_ptr());
+      const int64_t storage =
+          source_ptr - source.storage_offset() * source.element_size();
+      outputs.push_back(host_view(output_arena, offsets[i], lengths[i],
+                                  source.scalar_type(), shape));
+      copy->add(source_ptr, base + offsets[i], lengths[i], storage);
+    }
   }
   submit_copy_batch(copy->dst.data(), copy->src.data(), copy->sizes.data(),
                     copy->sizes.size(), false, stream, &copy->metadata, true);
@@ -511,9 +539,9 @@ std::vector<torch::stable::Tensor> copy_tensors_to_cpu(
   return copy_to_cpu(std::move(tensors), nullptr);
 }
 
-std::vector<torch::stable::Tensor> copy_rows_to_cpu(
-    const torch::stable::Tensor& tensor, std::vector<int64_t> rows) {
-  return copy_to_cpu({tensor}, &rows);
+torch::stable::Tensor copy_rows_to_cpu(const torch::stable::Tensor& tensor,
+                                       std::vector<int64_t> rows) {
+  return copy_to_cpu({tensor}, &rows).front();
 }
 
 void release_completed_host_copies() {

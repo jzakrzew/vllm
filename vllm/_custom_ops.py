@@ -3009,15 +3009,15 @@ def copy_tensors_to_cpu(tensors: list[torch.Tensor]) -> list[torch.Tensor]:
 
 
 @torch.compiler.disable
-def copy_rows_to_cpu(tensor: torch.Tensor, rows: list[int]) -> list[torch.Tensor]:
-    """Copy selected dim-0 rows into views of one pinned host allocation.
+def copy_rows_to_cpu(tensor: torch.Tensor, rows: list[int]) -> torch.Tensor:
+    """Copy selected dim-0 rows into one packed pinned CPU tensor.
 
     Rows retain their input order, including duplicates. Consecutive rows are
     merged into a single transfer when possible. Synchronization and lifetime
     requirements are the same as for `copy_tensors_to_cpu`.
     """
     if not current_platform.is_cuda_alike() or tensor.is_cpu:
-        return [tensor[i].to("cpu", non_blocking=True) for i in rows]
+        return tensor[rows].to("cpu", non_blocking=True)
     return torch.ops._C.copy_rows_to_cpu(tensor, rows)
 
 

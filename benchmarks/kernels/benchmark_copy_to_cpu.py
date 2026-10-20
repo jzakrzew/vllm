@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--independent", action="store_true")
+    parser.add_argument("--row-step", type=int, default=1)
     parser.add_argument("--contend-gil", action="store_true")
     args = parser.parse_args()
     stop = threading.Event()
@@ -50,10 +51,11 @@ def main():
 
     print("batch  method       enqueue_us  destroy_us")
     for batch in args.batch_sizes:
+        tensor = torch.randn(batch * args.row_step, args.width, device="cuda")
         sources = (
             [torch.randn(args.width, device="cuda") for _ in range(batch)]
             if args.independent
-            else list(torch.randn(batch, args.width, device="cuda").unbind())
+            else list(tensor[:: args.row_step].unbind())
         )
         torch.accelerator.synchronize()
         methods = {
@@ -62,6 +64,11 @@ def main():
             ],
             "packed": lambda sources=sources: ops.copy_tensors_to_cpu(sources),
         }
+        if not args.independent:
+            rows = list(range(0, batch * args.row_step, args.row_step))
+            methods["indexed"] = lambda tensor=tensor, rows=rows: ops.copy_rows_to_cpu(
+                tensor, rows
+            )
         with torch.cuda.stream(torch.cuda.Stream()):
             for copy in methods.values():
                 measure(copy, 3)

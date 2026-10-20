@@ -90,9 +90,13 @@ def test_copy_rows_to_cpu_preserves_selection(rows, layout):
         outputs = ops.copy_rows_to_cpu(source, rows)
         copy_stream.synchronize()
     assert len(outputs) == len(rows)
+    assert isinstance(outputs, torch.Tensor)
+    assert outputs.shape == (len(rows), *source.shape[1:])
+    if outputs.numel():
+        assert outputs.is_pinned()
     for row, output in zip(rows, outputs, strict=True):
         torch.testing.assert_close(output, source[row].cpu(), rtol=0, atol=0)
-    if outputs:
+    if len(outputs):
         assert len({t.untyped_storage().data_ptr() for t in outputs}) == 1
 
 
