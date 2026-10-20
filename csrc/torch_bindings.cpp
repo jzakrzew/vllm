@@ -8,6 +8,10 @@
 // Note: We register under namespace "_C" so ops are accessible as
 // torch.ops._C.<op_name> for compatibility with existing code.
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+  // Asynchronous D2H copies into views of one pinned allocation.
+  ops.def("copy_tensors_to_cpu(Tensor[] tensors) -> Tensor[]");
+  ops.def("copy_rows_to_cpu(Tensor tensor, int[] rows) -> Tensor[]");
+
   // Compute per-token-group FP8 quantized tensor and scaling factor.
   // The dummy arguments are here so we can correctly fuse with RMSNorm.
   ops.def(
@@ -763,6 +767,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+  ops.impl("copy_tensors_to_cpu", TORCH_BOX(&copy_tensors_to_cpu));
+  ops.impl("copy_rows_to_cpu", TORCH_BOX(&copy_rows_to_cpu));
   // LongCat n-gram embedding index kernel.
   ops.impl("ngram_compute_n_gram_ids", TORCH_BOX(&ngram_compute_n_gram_ids));
   ops.impl("vocab_parallel_embedding", TORCH_BOX(&vocab_parallel_embedding));

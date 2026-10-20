@@ -667,6 +667,11 @@ void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
                  int64_t block_size_in_bytes,
                  const torch::stable::Tensor& block_mapping);
 
+std::vector<torch::stable::Tensor> copy_tensors_to_cpu(
+    std::vector<torch::stable::Tensor> tensors);
+std::vector<torch::stable::Tensor> copy_rows_to_cpu(
+    const torch::stable::Tensor& tensor, std::vector<int64_t> rows);
+
 // Batch swap: submit all block copies in a single driver call.
 void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
                        const torch::stable::Tensor& dst_ptrs,

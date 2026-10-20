@@ -400,3 +400,36 @@ def test_standalone_draft_kv_dtype_override(monkeypatch, draft_dtype, expected_d
     assert draft_config.cache_config.cache_dtype == expected_dtype
     assert speculator.attn_vllm_config.cache_config.cache_dtype == expected_dtype
     assert target.cache_config.cache_dtype == "fp8_e4m3"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("as_list", [False, True])
+@pytest.mark.parametrize(
+    "finished", [[True] * 4, [True, False, True, False], [False] * 4]
+)
+def test_async_pooling_output_copies_only_finished_requests(as_list, finished):
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.worker.gpu.async_utils import AsyncPoolingOutput
+
+    source = torch.randn(4, 3, 5, device="cuda")
+    raw = list(source.unbind()) if as_list else source
+    if as_list:
+        raw[2] = None
+    runner_output = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+    output = AsyncPoolingOutput(
+        runner_output,
+        raw,
+        finished,
+        torch.cuda.current_stream(),
+        torch.cuda.Stream(),
+    ).get_output()
+    assert output is runner_output
+    host_outputs = output.pooler_output
+    assert len(host_outputs) == 4
+    for i, host in enumerate(host_outputs):
+        if not finished[i] or (as_list and i == 2):
+            assert host is None
+        else:
+            torch.testing.assert_close(host, source[i].cpu(), rtol=0, atol=0)
+    copied = [t for t in host_outputs if t is not None]
+    assert len({t.untyped_storage().data_ptr() for t in copied}) <= 1

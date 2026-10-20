@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
+from vllm._custom_ops import copy_rows_to_cpu, copy_tensors_to_cpu
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -233,22 +234,28 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
-            if isinstance(self.pooler_output, torch.Tensor) and all(finished_mask):
-                self.pooler_output_cpu: PoolerOutput = self.pooler_output.to(
-                    "cpu", non_blocking=True
-                )
+            if len(pooler_output) != len(finished_mask):
+                raise ValueError("Pooler output and finished mask sizes must match")
+            self.pooler_output_cpu: PoolerOutput
+            if isinstance(pooler_output, torch.Tensor) and all(finished_mask):
+                self.pooler_output_cpu = pooler_output.to("cpu", non_blocking=True)
             else:
-                outputs = (
-                    self.pooler_output.unbind()
-                    if isinstance(self.pooler_output, torch.Tensor)
-                    else self.pooler_output
-                )
-                self.pooler_output_cpu = [
-                    None
-                    if output is None or not is_finished
-                    else output.to("cpu", non_blocking=True)
-                    for output, is_finished in zip(outputs, finished_mask, strict=True)
-                ]
+                if isinstance(pooler_output, torch.Tensor):
+                    indices = [i for i, done in enumerate(finished_mask) if done]
+                    outputs = copy_rows_to_cpu(pooler_output, indices)
+                else:
+                    selected = [
+                        (i, output)
+                        for i, (output, done) in enumerate(
+                            zip(pooler_output, finished_mask, strict=True)
+                        )
+                        if done and output is not None
+                    ]
+                    indices = [i for i, _ in selected]
+                    outputs = copy_tensors_to_cpu([output for _, output in selected])
+                self.pooler_output_cpu = [None] * len(finished_mask)
+                for i, output in zip(indices, outputs, strict=True):
+                    self.pooler_output_cpu[i] = output
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:

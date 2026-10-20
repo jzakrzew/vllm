@@ -19,7 +19,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
@@ -107,31 +114,11 @@ int64_t resolve_max_batch_descriptors() {
 }
 }  // namespace
 
-void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
-                       const torch::stable::Tensor& dst_ptrs,
-                       const torch::stable::Tensor& sizes,
-                       bool is_src_access_order_any) {
-  STD_TORCH_CHECK(src_ptrs.device().is_cpu(), "src_ptrs must be on CPU");
-  STD_TORCH_CHECK(dst_ptrs.device().is_cpu(), "dst_ptrs must be on CPU");
-  STD_TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
-  STD_TORCH_CHECK(src_ptrs.scalar_type() == torch::headeronly::ScalarType::Long,
-                  "src_ptrs must be int64");
-  STD_TORCH_CHECK(dst_ptrs.scalar_type() == torch::headeronly::ScalarType::Long,
-                  "dst_ptrs must be int64");
-  STD_TORCH_CHECK(sizes.scalar_type() == torch::headeronly::ScalarType::Long,
-                  "sizes must be int64");
-
-  const int64_t n = src_ptrs.size(0);
-  STD_TORCH_CHECK(dst_ptrs.size(0) == n, "dst_ptrs length must match src_ptrs");
-  STD_TORCH_CHECK(sizes.size(0) == n, "sizes length must match src_ptrs");
-
+namespace {
+void submit_copy_batch(int64_t* dst_data, int64_t* src_data, int64_t* size_data,
+                       int64_t n, bool is_src_access_order_any,
+                       cudaStream_t stream) {
   if (n == 0) return;
-
-  int64_t* src_data = src_ptrs.mutable_data_ptr<int64_t>();
-  int64_t* dst_data = dst_ptrs.mutable_data_ptr<int64_t>();
-  int64_t* size_data = sizes.mutable_data_ptr<int64_t>();
-
-  const cudaStream_t stream = get_current_cuda_stream();
 
   // Use cuMemcpyBatchAsync / hipMemcpyBatchAsync to submit all copies in a
   // single driver call, amortizing per-copy submission overhead. int64_t
@@ -238,12 +225,261 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
     // individual async copies. cudaMemcpyDefault lets the driver infer
     // direction from pointer types.
     for (int64_t i = 0; i < n; i++) {
-      cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
-                      reinterpret_cast<void*>(src_data[i]),
-                      static_cast<size_t>(size_data[i]), cudaMemcpyDefault,
-                      stream);
+      const auto error = cudaMemcpyAsync(reinterpret_cast<void*>(dst_data[i]),
+                                         reinterpret_cast<void*>(src_data[i]),
+                                         static_cast<size_t>(size_data[i]),
+                                         cudaMemcpyDefault, stream);
+      STD_TORCH_CHECK(error == cudaSuccess,
+                      "cudaMemcpyAsync failed: ", cudaGetErrorString(error));
     }
   }
+}
+
+}  // namespace
+
+void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
+                       const torch::stable::Tensor& dst_ptrs,
+                       const torch::stable::Tensor& sizes,
+                       bool is_src_access_order_any) {
+  STD_TORCH_CHECK(src_ptrs.device().is_cpu(), "src_ptrs must be on CPU");
+  STD_TORCH_CHECK(dst_ptrs.device().is_cpu(), "dst_ptrs must be on CPU");
+  STD_TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
+  STD_TORCH_CHECK(src_ptrs.scalar_type() == torch::headeronly::ScalarType::Long,
+                  "src_ptrs must be int64");
+  STD_TORCH_CHECK(dst_ptrs.scalar_type() == torch::headeronly::ScalarType::Long,
+                  "dst_ptrs must be int64");
+  STD_TORCH_CHECK(sizes.scalar_type() == torch::headeronly::ScalarType::Long,
+                  "sizes must be int64");
+
+  const int64_t n = src_ptrs.size(0);
+  STD_TORCH_CHECK(dst_ptrs.size(0) == n, "dst_ptrs length must match src_ptrs");
+  STD_TORCH_CHECK(sizes.size(0) == n, "sizes length must match src_ptrs");
+
+  if (n == 0) return;
+
+  submit_copy_batch(dst_ptrs.mutable_data_ptr<int64_t>(),
+                    src_ptrs.mutable_data_ptr<int64_t>(),
+                    sizes.mutable_data_ptr<int64_t>(), n,
+                    is_src_access_order_any, get_current_cuda_stream());
+}
+
+namespace {
+using HostTensor = torch::stable::Tensor;
+
+void check_copy_error(cudaError_t error) {
+  STD_TORCH_CHECK(error == cudaSuccess,
+                  "Host copy failed: ", cudaGetErrorString(error));
+}
+
+// Raw batch copies bypass PyTorch's allocator stream tracking. Retain both
+// allocations and descriptors until the event completes, including on abort.
+struct PendingHostCopy {
+  cudaStream_t stream;
+  cudaEvent_t event = nullptr;
+  bool recorded = false;
+  std::vector<HostTensor> sources;
+  HostTensor arena;
+  std::vector<int64_t> src, dst, sizes;
+  int64_t last_storage = 0;
+
+  explicit PendingHostCopy(cudaStream_t stream) : stream(stream) {
+    check_copy_error(cudaEventCreateWithFlags(
+        &event, cudaEventDisableTiming | cudaEventBlockingSync));
+  }
+
+  ~PendingHostCopy() {
+    // Also covers exceptions after only some copies/staging kernels were
+    // issued.
+    if (recorded) {
+      cudaEventSynchronize(event);
+    } else {
+      cudaStreamSynchronize(stream);
+    }
+    cudaEventDestroy(event);
+  }
+
+  void add(int64_t source, int64_t dest, int64_t bytes, int64_t storage) {
+    if (bytes == 0) return;
+    if (!sizes.empty() && last_storage == storage &&
+        src.back() + sizes.back() == source &&
+        dst.back() + sizes.back() == dest) {
+      sizes.back() += bytes;
+    } else {
+      src.push_back(source);
+      dst.push_back(dest);
+      sizes.push_back(bytes);
+    }
+    last_storage = storage;
+  }
+};
+
+class PendingHostCopies {
+ public:
+  PendingHostCopies() : worker_([this] { run(); }) {}
+
+  ~PendingHostCopies() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    ready_.notify_one();
+    worker_.join();
+  }
+
+  void retain(std::unique_ptr<PendingHostCopy> copy) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      copies_.push_back(std::move(copy));
+    }
+    ready_.notify_one();
+  }
+
+ private:
+  void run() {
+    while (true) {
+      std::unique_ptr<PendingHostCopy> copy;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [this] { return stopping_ || !copies_.empty(); });
+        if (copies_.empty()) return;
+        copy = std::move(copies_.front());
+        copies_.pop_front();
+      }
+      // Destruction waits for the event outside the queue lock, without the
+      // GIL.
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<std::unique_ptr<PendingHostCopy>> copies_;
+  bool stopping_ = false;
+  std::thread worker_;
+};
+
+PendingHostCopies& pending_host_copies() {
+  static PendingHostCopies copies;
+  return copies;
+}
+
+HostTensor host_view(HostTensor& arena, int64_t offset, int64_t bytes,
+                     torch::headeronly::ScalarType dtype,
+                     torch::headeronly::IntHeaderOnlyArrayRef shape) {
+  auto slice = torch::stable::narrow(arena, 0, offset, bytes);
+  std::array<StableIValue, 2> stack{torch::stable::detail::from(slice),
+                                    torch::stable::detail::from(dtype)};
+  TORCH_ERROR_CODE_CHECK(torch_call_dispatcher(
+      "aten::view", "dtype", stack.data(), TORCH_ABI_VERSION));
+  return torch::stable::view(torch::stable::detail::to<HostTensor>(stack[0]),
+                             shape);
+}
+
+bool contiguous_rows(const HostTensor& tensor) {
+  int64_t stride = 1;
+  for (int64_t d = tensor.dim() - 1; d > 0; --d) {
+    if (tensor.size(d) != 1 && tensor.stride(d) != stride) return false;
+    stride *= tensor.size(d);
+  }
+  return true;
+}
+
+std::vector<HostTensor> copy_to_cpu(std::vector<HostTensor> tensors,
+                                    const std::vector<int64_t>* rows) {
+  if (tensors.empty()) return {};
+  const auto device = tensors.front().device();
+  STD_TORCH_CHECK(device.is_cuda(), "sources must be CUDA tensors");
+  for (const auto& tensor : tensors) {
+    STD_TORCH_CHECK(tensor.device() == device,
+                    "sources must be on the same CUDA device");
+    STD_TORCH_CHECK(tensor.layout() == torch::headeronly::Layout::Strided,
+                    "sources must have strided layout");
+  }
+  if (rows != nullptr) {
+    const auto& tensor = tensors.front();
+    STD_TORCH_CHECK(tensor.dim() > 0, "source must have a row dimension");
+    for (auto row : *rows) {
+      STD_TORCH_CHECK(row >= 0 && row < tensor.size(0), "row out of range");
+    }
+  }
+  const int64_t count = rows ? rows->size() : tensors.size();
+  const torch::stable::accelerator::DeviceGuard guard(device.index());
+  const auto stream = get_current_cuda_stream(device.index());
+  cudaStreamCaptureStatus capture;
+  check_copy_error(cudaStreamIsCapturing(stream, &capture));
+  STD_TORCH_CHECK(capture == cudaStreamCaptureStatusNone,
+                  "host copies cannot be captured in a CUDA graph");
+  if (count == 0) return {};
+
+  auto copy = std::make_unique<PendingHostCopy>(stream);
+  copy->sources = std::move(tensors);
+  const int64_t num_sources = copy->sources.size();
+  copy->sources.reserve(2 * num_sources);
+  for (int64_t i = 0; i < num_sources; ++i) {
+    auto source = copy->sources[i];
+    if (rows ? !contiguous_rows(source) : !source.is_contiguous()) {
+      source = torch::stable::contiguous(source);
+    }
+    copy->sources.push_back(std::move(source));
+  }
+
+  std::vector<int64_t> offsets, lengths;
+  offsets.reserve(count);
+  lengths.reserve(count);
+  int64_t total = 0;
+  constexpr int64_t max_size = std::numeric_limits<int64_t>::max();
+  for (int64_t i = 0; i < count; ++i) {
+    const auto& source = copy->sources[num_sources + (rows ? 0 : i)];
+    int64_t numel = source.numel();
+    if (rows) numel /= source.size(0);  // count > 0 implies nonempty dim 0.
+    const int64_t itemsize = source.element_size();
+    STD_TORCH_CHECK(numel <= max_size / itemsize, "host copy is too large");
+    const int64_t bytes = numel * itemsize;
+    const int64_t padding = (itemsize - total % itemsize) % itemsize;
+    STD_TORCH_CHECK(
+        total <= max_size - padding && total + padding <= max_size - bytes,
+        "host copy is too large");
+    total += padding;
+    offsets.push_back(total);
+    lengths.push_back(bytes);
+    total += bytes;
+  }
+  copy->arena = torch::stable::empty(
+      {total}, torch::headeronly::ScalarType::Byte, std::nullopt,
+      torch::stable::Device(torch::headeronly::DeviceType::CPU), true);
+  const auto base = reinterpret_cast<int64_t>(copy->arena.data_ptr());
+  std::vector<HostTensor> outputs;
+  outputs.reserve(count);
+  for (int64_t i = 0; i < count; ++i) {
+    const auto& source = copy->sources[num_sources + (rows ? 0 : i)];
+    auto shape = source.sizes();
+    int64_t source_ptr = reinterpret_cast<int64_t>(source.data_ptr());
+    const int64_t storage =
+        source_ptr - source.storage_offset() * source.element_size();
+    if (rows) {
+      source_ptr += (*rows)[i] * source.stride(0) * source.element_size();
+      shape = shape.slice(1);
+    }
+    outputs.push_back(host_view(copy->arena, offsets[i], lengths[i],
+                                source.scalar_type(), shape));
+    copy->add(source_ptr, base + offsets[i], lengths[i], storage);
+  }
+  submit_copy_batch(copy->dst.data(), copy->src.data(), copy->sizes.data(),
+                    copy->sizes.size(), false, stream);
+  check_copy_error(cudaEventRecord(copy->event, stream));
+  copy->recorded = true;
+  pending_host_copies().retain(std::move(copy));
+  return outputs;
+}
+}  // namespace
+
+std::vector<torch::stable::Tensor> copy_tensors_to_cpu(
+    std::vector<torch::stable::Tensor> tensors) {
+  return copy_to_cpu(std::move(tensors), nullptr);
+}
+
+std::vector<torch::stable::Tensor> copy_rows_to_cpu(
+    const torch::stable::Tensor& tensor, std::vector<int64_t> rows) {
+  return copy_to_cpu({tensor}, &rows);
 }
 
 namespace vllm {
