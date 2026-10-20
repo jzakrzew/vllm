@@ -2977,22 +2977,38 @@ def concat_and_cache_mla_rope_fused(
     )
 
 
+@torch.compiler.disable
+def release_completed_host_copies() -> None:
+    """Release completed transfers' GPU sources, without waiting for pending ones."""
+    if current_platform.is_cuda_alike():
+        torch.ops._C.release_completed_host_copies()
+
+
+@torch.compiler.disable
 def copy_tensors_to_cpu(tensors: list[torch.Tensor]) -> list[torch.Tensor]:
     """Copy tensors asynchronously into views of one pinned host allocation.
 
-    CUDA sources must be on the same device. Shapes and dtypes are preserved;
-    non-contiguous sources are staged on the current stream. Sources and host
-    storage are retained internally until the copies complete. The caller must
+    This helper is eager-only and introduces a torch.compile graph break.
+    CPU inputs are passed through; CUDA sources must be on the same device.
+    Shapes and dtypes are preserved;
+    non-contiguous sources are staged on the current stream. Returned tensors
+    own the transfer state; dropping the last output waits for unfinished copies.
+    Call `release_completed_host_copies` after synchronization to release GPU
+    sources while retaining the CPU outputs. The caller must
     synchronize the current stream (or a subsequent event) before reading the
     outputs, and must not modify the sources while the copies are in flight.
     """
     if not tensors:
         return []
-    if not current_platform.is_cuda_alike() or any(t.is_cpu for t in tensors):
+    if not current_platform.is_cuda_alike():
         return [t.to("cpu", non_blocking=True) for t in tensors]
+    if any(t.is_cpu for t in tensors):
+        copied = iter(copy_tensors_to_cpu([t for t in tensors if not t.is_cpu]))
+        return [t if t.is_cpu else next(copied) for t in tensors]
     return torch.ops._C.copy_tensors_to_cpu(tensors)
 
 
+@torch.compiler.disable
 def copy_rows_to_cpu(tensor: torch.Tensor, rows: list[int]) -> list[torch.Tensor]:
     """Copy selected dim-0 rows into views of one pinned host allocation.
 

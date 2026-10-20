@@ -19,13 +19,11 @@
 
 #include <algorithm>
 #include <cassert>
-#include <condition_variable>
 #include <cstdlib>
-#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <thread>
+#include <unistd.h>
 #include <vector>
 
 #ifdef USE_ROCM
@@ -115,10 +113,24 @@ int64_t resolve_max_batch_descriptors() {
 }  // namespace
 
 namespace {
+struct CopyBatchMetadata {
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
+  CUmemcpyAttributes attributes = {};
+#elif defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
+  hipMemcpyAttributes attributes = {};
+#endif
+  size_t attributes_index = 0;
+  std::vector<size_t> failure_indices;
+};
+
 void submit_copy_batch(int64_t* dst_data, int64_t* src_data, int64_t* size_data,
                        int64_t n, bool is_src_access_order_any,
-                       cudaStream_t stream) {
+                       cudaStream_t stream,
+                       CopyBatchMetadata* persistent_metadata = nullptr,
+                       bool check_errors = false) {
   if (n == 0) return;
+  CopyBatchMetadata local_metadata;
+  auto& metadata = persistent_metadata ? *persistent_metadata : local_metadata;
 
   // Use cuMemcpyBatchAsync / hipMemcpyBatchAsync to submit all copies in a
   // single driver call, amortizing per-copy submission overhead. int64_t
@@ -151,29 +163,29 @@ void submit_copy_batch(int64_t* dst_data, int64_t* src_data, int64_t* size_data,
   // streams take the batch fast path.
   const bool usable_stream = stream != nullptr && stream != cudaStreamLegacy;
   if (batch_fn != nullptr && usable_stream) {
-    CUmemcpyAttributes attr = {};
+    auto& attr = metadata.attributes;
     // ANY lets the DMA engine prefetch source bytes out of stream order,
     // which is only safe when no GPU stream is concurrently writing the
     // source.
     attr.srcAccessOrder = is_src_access_order_any
                               ? CU_MEMCPY_SRC_ACCESS_ORDER_ANY
                               : CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
-    size_t attrs_idx = 0;
-    size_t fail_idx = 0;
     // Uncapped on CUDA (max_desc == 0 -> single call) unless overridden by
     // VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS; chunk to honor the override.
     const int64_t max_desc = resolve_max_batch_descriptors();
     const int64_t step = max_desc <= 0 ? n : max_desc;
+    metadata.failure_indices.resize(1 + (n - 1) / step);
     for (int64_t off = 0; off < n; off += step) {
       const int64_t cnt = std::min(step, n - off);
-      CUresult result = batch_fn(reinterpret_cast<CUdeviceptr*>(dst_data + off),
-                                 reinterpret_cast<CUdeviceptr*>(src_data + off),
-                                 reinterpret_cast<size_t*>(size_data + off),
-                                 static_cast<size_t>(cnt), &attr, &attrs_idx, 1,
-                                 &fail_idx, static_cast<CUstream>(stream));
-      STD_TORCH_CHECK(result == CUDA_SUCCESS,
-                      "cuMemcpyBatchAsync failed at index ", fail_idx,
-                      " with error ", result);
+      CUresult result = batch_fn(
+          reinterpret_cast<CUdeviceptr*>(dst_data + off),
+          reinterpret_cast<CUdeviceptr*>(src_data + off),
+          reinterpret_cast<size_t*>(size_data + off), static_cast<size_t>(cnt),
+          &attr, &metadata.attributes_index, 1,
+          &metadata.failure_indices[off / step], static_cast<CUstream>(stream));
+      STD_TORCH_CHECK(
+          result == CUDA_SUCCESS, "cuMemcpyBatchAsync failed at index ",
+          metadata.failure_indices[off / step], " with error ", result);
     }
     return;
   }
@@ -184,9 +196,7 @@ void submit_copy_batch(int64_t* dst_data, int64_t* src_data, int64_t* size_data,
   // numAttrs=0. ROCm 7.13+ accepts numAttrs > 0.
   // rocm-7.14+ has better performance.
   {
-    hipMemcpyAttributes attr = {};
-    size_t attrs_idx = 0;
-    size_t fail_idx = 0;
+    auto& attr = metadata.attributes;
     size_t num_attrs = 0;
   #if HIP_VERSION >= 71300000
     static const bool runtime_accepts_attrs = []() {
@@ -205,17 +215,19 @@ void submit_copy_batch(int64_t* dst_data, int64_t* src_data, int64_t* size_data,
     // descriptors/call on ROCm 7.15, so chunk the batch at the resolved cap.
     const int64_t max_desc = resolve_max_batch_descriptors();
     const int64_t step = max_desc <= 0 ? n : max_desc;
+    metadata.failure_indices.resize(1 + (n - 1) / step);
     for (int64_t off = 0; off < n; off += step) {
       const int64_t cnt = std::min(step, n - off);
       hipError_t result = hipMemcpyBatchAsync(
           reinterpret_cast<void**>(dst_data + off),
           reinterpret_cast<void**>(src_data + off),
           reinterpret_cast<size_t*>(size_data + off), static_cast<size_t>(cnt),
-          &attr, &attrs_idx, num_attrs, &fail_idx,
+          &attr, &metadata.attributes_index, num_attrs,
+          &metadata.failure_indices[off / step],
           static_cast<hipStream_t>(stream));
-      STD_TORCH_CHECK(result == hipSuccess,
-                      "hipMemcpyBatchAsync failed at index ", fail_idx,
-                      " with error ", result);
+      STD_TORCH_CHECK(
+          result == hipSuccess, "hipMemcpyBatchAsync failed at index ",
+          metadata.failure_indices[off / step], " with error ", result);
     }
     return;
   }
@@ -229,7 +241,7 @@ void submit_copy_batch(int64_t* dst_data, int64_t* src_data, int64_t* size_data,
                                          reinterpret_cast<void*>(src_data[i]),
                                          static_cast<size_t>(size_data[i]),
                                          cudaMemcpyDefault, stream);
-      STD_TORCH_CHECK(error == cudaSuccess,
+      STD_TORCH_CHECK(!check_errors || error == cudaSuccess,
                       "cudaMemcpyAsync failed: ", cudaGetErrorString(error));
     }
   }
@@ -274,20 +286,25 @@ void check_copy_error(cudaError_t error) {
 // Raw batch copies bypass PyTorch's allocator stream tracking. Retain both
 // allocations and descriptors until the event completes, including on abort.
 struct PendingHostCopy {
+  pid_t pid = getpid();
+  int device;
   cudaStream_t stream;
   cudaEvent_t event = nullptr;
   bool recorded = false;
   std::vector<HostTensor> sources;
   HostTensor arena;
   std::vector<int64_t> src, dst, sizes;
+  CopyBatchMetadata metadata;
   int64_t last_storage = 0;
 
-  explicit PendingHostCopy(cudaStream_t stream) : stream(stream) {
+  PendingHostCopy(int device, cudaStream_t stream)
+      : device(device), stream(stream) {
     check_copy_error(cudaEventCreateWithFlags(
         &event, cudaEventDisableTiming | cudaEventBlockingSync));
   }
 
   ~PendingHostCopy() {
+    const torch::stable::accelerator::DeviceGuard guard(device);
     // Also covers exceptions after only some copies/staging kernels were
     // issued.
     if (recorded) {
@@ -296,6 +313,17 @@ struct PendingHostCopy {
       cudaStreamSynchronize(stream);
     }
     cudaEventDestroy(event);
+    sources.clear();
+    arena = HostTensor();
+  }
+
+  bool release_if_completed() {
+    const torch::stable::accelerator::DeviceGuard guard(device);
+    const auto error = cudaEventQuery(event);
+    if (error == cudaErrorNotReady) return false;
+    check_copy_error(error);
+    sources.clear();
+    return true;
   }
 
   void add(int64_t source, int64_t dest, int64_t bytes, int64_t storage) {
@@ -315,51 +343,44 @@ struct PendingHostCopy {
 
 class PendingHostCopies {
  public:
-  PendingHostCopies() : worker_([this] { run(); }) {}
-
-  ~PendingHostCopies() {
+  void release_completed() {
+    STD_TORCH_CHECK(pid_ == getpid(),
+                    "host copies cannot be used after fork; use spawn instead");
+    std::vector<std::weak_ptr<PendingHostCopy>> pending;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      stopping_ = true;
+      pending.swap(copies_);
     }
-    ready_.notify_one();
-    worker_.join();
+    for (auto& weak : pending) {
+      auto copy = weak.lock();
+      if (copy && !copy->release_if_completed()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        copies_.push_back(std::move(weak));
+      }
+    }
   }
 
-  void retain(std::unique_ptr<PendingHostCopy> copy) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      copies_.push_back(std::move(copy));
-    }
-    ready_.notify_one();
+  void track(const std::shared_ptr<PendingHostCopy>& copy) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    copies_.push_back(copy);
   }
 
  private:
-  void run() {
-    while (true) {
-      std::unique_ptr<PendingHostCopy> copy;
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        ready_.wait(lock, [this] { return stopping_ || !copies_.empty(); });
-        if (copies_.empty()) return;
-        copy = std::move(copies_.front());
-        copies_.pop_front();
-      }
-      // Destruction waits for the event outside the queue lock, without the
-      // GIL.
-    }
-  }
-
+  pid_t pid_ = getpid();
   std::mutex mutex_;
-  std::condition_variable ready_;
-  std::deque<std::unique_ptr<PendingHostCopy>> copies_;
-  bool stopping_ = false;
-  std::thread worker_;
+  std::vector<std::weak_ptr<PendingHostCopy>> copies_;
 };
 
 PendingHostCopies& pending_host_copies() {
   static PendingHostCopies copies;
   return copies;
+}
+
+HostTensor detached_source(const HostTensor& source) {
+  std::array<StableIValue, 1> stack{torch::stable::detail::from(source)};
+  TORCH_ERROR_CODE_CHECK(torch_call_dispatcher("aten::detach", "", stack.data(),
+                                               TORCH_ABI_VERSION));
+  return torch::stable::detail::to<HostTensor>(stack[0]);
 }
 
 HostTensor host_view(HostTensor& arena, int64_t offset, int64_t bytes,
@@ -402,18 +423,27 @@ std::vector<HostTensor> copy_to_cpu(std::vector<HostTensor> tensors,
     }
   }
   const int64_t count = rows ? rows->size() : tensors.size();
+  if (count == 0) return {};
+  auto& pending = pending_host_copies();
+  pending.release_completed();
   const torch::stable::accelerator::DeviceGuard guard(device.index());
   const auto stream = get_current_cuda_stream(device.index());
   cudaStreamCaptureStatus capture;
   check_copy_error(cudaStreamIsCapturing(stream, &capture));
   STD_TORCH_CHECK(capture == cudaStreamCaptureStatusNone,
                   "host copies cannot be captured in a CUDA graph");
-  if (count == 0) return {};
 
-  auto copy = std::make_unique<PendingHostCopy>(stream);
-  copy->sources = std::move(tensors);
+  auto copy = std::shared_ptr<PendingHostCopy>(
+      new PendingHostCopy(device.index(), stream), [](PendingHostCopy* copy) {
+        // CUDA is not usable in a forked child. Inherited owners must not
+        // synchronize or free their parent's allocations during child exit.
+        if (copy->pid == getpid()) delete copy;
+      });
+  copy->sources.reserve(2 * tensors.size());
+  for (const auto& tensor : tensors) {
+    copy->sources.push_back(detached_source(tensor));
+  }
   const int64_t num_sources = copy->sources.size();
-  copy->sources.reserve(2 * num_sources);
   for (int64_t i = 0; i < num_sources; ++i) {
     auto source = copy->sources[i];
     if (rows ? !contiguous_rows(source) : !source.is_contiguous()) {
@@ -446,7 +476,11 @@ std::vector<HostTensor> copy_to_cpu(std::vector<HostTensor> tensors,
   copy->arena = torch::stable::empty(
       {total}, torch::headeronly::ScalarType::Byte, std::nullopt,
       torch::stable::Device(torch::headeronly::DeviceType::CPU), true);
-  const auto base = reinterpret_cast<int64_t>(copy->arena.data_ptr());
+  auto output_arena = torch::stable::from_blob(
+      copy->arena.data_ptr(), {total}, {1},
+      torch::stable::Device(torch::headeronly::DeviceType::CPU),
+      torch::headeronly::ScalarType::Byte, [copy](void*) {});
+  const auto base = reinterpret_cast<int64_t>(output_arena.data_ptr());
   std::vector<HostTensor> outputs;
   outputs.reserve(count);
   for (int64_t i = 0; i < count; ++i) {
@@ -459,15 +493,15 @@ std::vector<HostTensor> copy_to_cpu(std::vector<HostTensor> tensors,
       source_ptr += (*rows)[i] * source.stride(0) * source.element_size();
       shape = shape.slice(1);
     }
-    outputs.push_back(host_view(copy->arena, offsets[i], lengths[i],
+    outputs.push_back(host_view(output_arena, offsets[i], lengths[i],
                                 source.scalar_type(), shape));
     copy->add(source_ptr, base + offsets[i], lengths[i], storage);
   }
   submit_copy_batch(copy->dst.data(), copy->src.data(), copy->sizes.data(),
-                    copy->sizes.size(), false, stream);
+                    copy->sizes.size(), false, stream, &copy->metadata, true);
   check_copy_error(cudaEventRecord(copy->event, stream));
   copy->recorded = true;
-  pending_host_copies().retain(std::move(copy));
+  pending.track(copy);
   return outputs;
 }
 }  // namespace
@@ -480,6 +514,10 @@ std::vector<torch::stable::Tensor> copy_tensors_to_cpu(
 std::vector<torch::stable::Tensor> copy_rows_to_cpu(
     const torch::stable::Tensor& tensor, std::vector<int64_t> rows) {
   return copy_to_cpu({tensor}, &rows);
+}
+
+void release_completed_host_copies() {
+  pending_host_copies().release_completed();
 }
 
 namespace vllm {

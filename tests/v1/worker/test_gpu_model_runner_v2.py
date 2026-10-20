@@ -433,3 +433,27 @@ def test_async_pooling_output_copies_only_finished_requests(as_list, finished):
             torch.testing.assert_close(host, source[i].cpu(), rtol=0, atol=0)
     copied = [t for t in host_outputs if t is not None]
     assert len({t.untyped_storage().data_ptr() for t in copied}) <= 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dropped_dense_pooling_output_completes_before_freeing_allocations():
+    """Dense outputs use the same ownership protection as ragged outputs."""
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.worker.gpu.async_utils import AsyncPoolingOutput
+
+    main_stream = torch.cuda.current_stream()
+    copy_stream = torch.cuda.Stream()
+    source = torch.randn(8, 1024, device="cuda")
+    before_copy = torch.cuda.Event()
+    with torch.cuda.stream(copy_stream):
+        torch.cuda._sleep(100_000_000)
+        before_copy.record(copy_stream)
+    output = AsyncPoolingOutput(
+        ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+        source,
+        [True] * 8,
+        main_stream,
+        copy_stream,
+    )
+    del source, output
+    assert before_copy.query()

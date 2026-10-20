@@ -109,47 +109,87 @@ def test_copy_rows_to_cpu_rejects_invalid_indices_before_copying():
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 @pytest.mark.parametrize("as_rows", [False, True])
-def test_pending_host_copies_survive_dropped_outputs(as_rows):
-    """Abort must not return either allocation to its pool during a raw copy."""
+def test_pending_host_copies_complete_when_last_output_is_dropped(as_rows):
+    """Dropping an unfinished output waits before releasing its allocations."""
     source = torch.randn(8, 1024, device="cuda")
-    source_ptr = source.data_ptr()
-    size = source.nbytes
     main_stream = torch.cuda.current_stream()
     copy_stream = torch.cuda.Stream()
+    before_copy = torch.cuda.Event()
     with torch.cuda.stream(copy_stream):
         copy_stream.wait_stream(main_stream)
         torch.cuda._sleep(100_000_000)
+        before_copy.record(copy_stream)
         outputs = (
             ops.copy_rows_to_cpu(source, list(range(8)))
             if as_rows
             else ops.copy_tensors_to_cpu([source])
         )
-        host_ptr = outputs[0].untyped_storage().data_ptr()
     del source, outputs
-    for _ in range(4):
-        host = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-        device = torch.empty((8, 1024), device="cuda")
-        assert host.data_ptr() != host_ptr
-        assert device.data_ptr() != source_ptr
-    copy_stream.synchronize()
+    assert before_copy.query()
 
 
 @pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="requires CUDA/HIP")
 def test_completed_host_copy_releases_source_without_another_submission():
-    """Keeping the CPU output must not retain the GPU source during idle time."""
-    import time
-
+    """Release GPU sources at the existing output completion boundary."""
     torch.accelerator.synchronize()
     baseline = torch.accelerator.memory_allocated()
     source = torch.ones(1024, 1024, device="cuda")
     outputs = ops.copy_tensors_to_cpu([source])
     del source
     torch.cuda.current_stream().synchronize()
-    deadline = time.monotonic() + 2
-    while (
-        torch.accelerator.memory_allocated() > baseline and time.monotonic() < deadline
-    ):
-        time.sleep(0.001)
+    ops.release_completed_host_copies()
     assert torch.accelerator.memory_allocated() <= baseline
     assert outputs[0].shape == (1024, 1024)
     assert torch.all(outputs[0] == 1)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("strided", [False, True])
+def test_pending_copy_does_not_retain_python_row_views(strided):
+    """In-flight ownership must retain storage rather than Python row objects."""
+    import weakref
+
+    source = torch.randn(8, 32, device="cuda")
+    if strided:
+        source = source[:, ::2]
+    rows = list(source.unbind())
+    references = [weakref.ref(row) for row in rows]
+    main_stream = torch.cuda.current_stream()
+    copy_stream = torch.cuda.Stream()
+    with torch.cuda.stream(copy_stream):
+        copy_stream.wait_stream(main_stream)
+        torch.cuda._sleep(100_000_000)
+        outputs = ops.copy_tensors_to_cpu(rows)
+    del rows
+    assert all(reference() is None for reference in references)
+    copy_stream.synchronize()
+    torch.testing.assert_close(torch.stack(outputs), source.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [False, True])
+def test_copy_helpers_allow_graph_breaks_in_compiled_callers(rows):
+    def pipeline(tensor):
+        source = tensor + 1
+        output = (
+            ops.copy_rows_to_cpu(source, [0])[0]
+            if rows
+            else ops.copy_tensors_to_cpu([source])[0]
+        )
+        return output + 2
+
+    source = torch.randn(2, 3)
+    output = torch.compile(pipeline, backend="eager")(source)
+    torch.testing.assert_close(output, (source[0] if rows else source) + 3)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="requires CUDA/HIP")
+def test_copy_tensors_to_cpu_preserves_mixed_cpu_and_cuda_outputs():
+    cpu = torch.arange(2)
+    gpu = torch.arange(3, device="cuda")
+    outputs = ops.copy_tensors_to_cpu([gpu, cpu])
+    del gpu
+    torch.accelerator.synchronize()
+    ops.release_completed_host_copies()
+    assert outputs[1] is cpu
+    assert outputs[0].is_pinned()
+    torch.testing.assert_close(outputs[0], torch.arange(3), rtol=0, atol=0)

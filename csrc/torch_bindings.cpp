@@ -9,6 +9,7 @@
 // torch.ops._C.<op_name> for compatibility with existing code.
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // Asynchronous D2H copies into views of one pinned allocation.
+  ops.def("release_completed_host_copies() -> ()");
   ops.def("copy_tensors_to_cpu(Tensor[] tensors) -> Tensor[]");
   ops.def("copy_rows_to_cpu(Tensor tensor, int[] rows) -> Tensor[]");
 
@@ -957,6 +958,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cuda_utils, CompositeExplicitAutograd,
 // available for all backends. This is the stable ABI equivalent of calling
 // ops.impl("op_name", &func) without a dispatch key in the non-stable API.
 STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
+  ops.impl("release_completed_host_copies",
+           TORCH_BOX(&release_completed_host_copies));
 #ifndef USE_ROCM
   ops.impl("cutlass_scaled_mm_supports_fp8",
            TORCH_BOX(&cutlass_scaled_mm_supports_fp8));

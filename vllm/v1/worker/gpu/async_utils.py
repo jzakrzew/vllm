@@ -9,7 +9,11 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm._custom_ops import copy_rows_to_cpu, copy_tensors_to_cpu
+from vllm._custom_ops import (
+    copy_rows_to_cpu,
+    copy_tensors_to_cpu,
+    release_completed_host_copies,
+)
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -238,7 +242,7 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
                 raise ValueError("Pooler output and finished mask sizes must match")
             self.pooler_output_cpu: PoolerOutput
             if isinstance(pooler_output, torch.Tensor) and all(finished_mask):
-                self.pooler_output_cpu = pooler_output.to("cpu", non_blocking=True)
+                self.pooler_output_cpu = copy_tensors_to_cpu([pooler_output])[0]
             else:
                 if isinstance(pooler_output, torch.Tensor):
                     indices = [i for i, done in enumerate(finished_mask) if done]
@@ -259,11 +263,12 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
+        self.copy_event.synchronize()
+        release_completed_host_copies()
         if isinstance(self.pooler_output_cpu, torch.Tensor):
             pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
         else:
             pooler_output = self.pooler_output_cpu
-        self.copy_event.synchronize()
         self.model_runner_output.pooler_output = pooler_output
         return self.model_runner_output
 
