@@ -12,7 +12,6 @@ import vllm.envs as envs
 from vllm._custom_ops import (
     copy_rows_to_cpu,
     copy_tensors_to_cpu,
-    release_completed_host_copies,
 )
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.v1.outputs import (
@@ -264,7 +263,6 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
-        release_completed_host_copies()
         if isinstance(self.pooler_output_cpu, torch.Tensor):
             rows = self.pooler_output_cpu.unbind(dim=0)
             if self.output_indices is None:

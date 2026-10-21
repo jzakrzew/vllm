@@ -2978,13 +2978,6 @@ def concat_and_cache_mla_rope_fused(
 
 
 @torch.compiler.disable
-def release_completed_host_copies() -> None:
-    """Release completed transfers' GPU sources, without waiting for pending ones."""
-    if current_platform.is_cuda_alike():
-        torch.ops._C.release_completed_host_copies()
-
-
-@torch.compiler.disable
 def copy_tensors_to_cpu(tensors: list[torch.Tensor]) -> list[torch.Tensor]:
     """Copy tensors asynchronously into views of one pinned host allocation.
 
@@ -2993,8 +2986,7 @@ def copy_tensors_to_cpu(tensors: list[torch.Tensor]) -> list[torch.Tensor]:
     Shapes and dtypes are preserved;
     non-contiguous sources are staged on the current stream. Returned tensors
     own the transfer state; dropping the last output waits for unfinished copies.
-    Call `release_completed_host_copies` after synchronization to release GPU
-    sources while retaining the CPU outputs. The caller must
+    GPU sources remain alive until the last output is destroyed. The caller must
     synchronize the current stream (or a subsequent event) before reading the
     outputs, and must not modify the sources while the copies are in flight.
     """

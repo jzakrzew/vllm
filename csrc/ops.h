@@ -667,7 +667,6 @@ void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
                  int64_t block_size_in_bytes,
                  const torch::stable::Tensor& block_mapping);
 
-void release_completed_host_copies();
 std::vector<torch::stable::Tensor> copy_tensors_to_cpu(
     std::vector<torch::stable::Tensor> tensors);
 torch::stable::Tensor copy_rows_to_cpu(const torch::stable::Tensor& tensor,

@@ -133,18 +133,25 @@ def test_pending_host_copies_complete_when_last_output_is_dropped(as_rows):
 
 
 @pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="requires CUDA/HIP")
-def test_completed_host_copy_releases_source_without_another_submission():
-    """Release GPU sources at the existing output completion boundary."""
+@pytest.mark.parametrize("as_rows", [False, True])
+def test_host_output_owns_source_until_last_view_is_dropped(as_rows):
+    """Host storage retains its source without a separate cleanup mechanism."""
     torch.accelerator.synchronize()
     baseline = torch.accelerator.memory_allocated()
     source = torch.ones(1024, 1024, device="cuda")
-    outputs = ops.copy_tensors_to_cpu([source])
+    outputs = (
+        ops.copy_rows_to_cpu(source, [0])
+        if as_rows
+        else ops.copy_tensors_to_cpu([source])[0]
+    )
     del source
     torch.cuda.current_stream().synchronize()
-    ops.release_completed_host_copies()
+    view = outputs[0]
+    del outputs
+    assert torch.all(view == 1)
+    assert torch.accelerator.memory_allocated() > baseline
+    del view
     assert torch.accelerator.memory_allocated() <= baseline
-    assert outputs[0].shape == (1024, 1024)
-    assert torch.all(outputs[0] == 1)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
@@ -193,7 +200,6 @@ def test_copy_tensors_to_cpu_preserves_mixed_cpu_and_cuda_outputs():
     outputs = ops.copy_tensors_to_cpu([gpu, cpu])
     del gpu
     torch.accelerator.synchronize()
-    ops.release_completed_host_copies()
     assert outputs[1] is cpu
     assert outputs[0].is_pinned()
     torch.testing.assert_close(outputs[0], torch.arange(3), rtol=0, atol=0)

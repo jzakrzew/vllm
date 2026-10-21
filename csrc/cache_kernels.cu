@@ -22,7 +22,6 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <unistd.h>
 #include <vector>
 
@@ -317,15 +316,6 @@ struct PendingHostCopy {
     arena = HostTensor();
   }
 
-  bool release_if_completed() {
-    const torch::stable::accelerator::DeviceGuard guard(device);
-    const auto error = cudaEventQuery(event);
-    if (error == cudaErrorNotReady) return false;
-    check_copy_error(error);
-    sources.clear();
-    return true;
-  }
-
   void add(int64_t source, int64_t dest, int64_t bytes, int64_t storage) {
     if (bytes == 0) return;
     if (!sizes.empty() && last_storage == storage &&
@@ -340,41 +330,6 @@ struct PendingHostCopy {
     last_storage = storage;
   }
 };
-
-class PendingHostCopies {
- public:
-  void release_completed() {
-    STD_TORCH_CHECK(pid_ == getpid(),
-                    "host copies cannot be used after fork; use spawn instead");
-    std::vector<std::weak_ptr<PendingHostCopy>> pending;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      pending.swap(copies_);
-    }
-    for (auto& weak : pending) {
-      auto copy = weak.lock();
-      if (copy && !copy->release_if_completed()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        copies_.push_back(std::move(weak));
-      }
-    }
-  }
-
-  void track(const std::shared_ptr<PendingHostCopy>& copy) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    copies_.push_back(copy);
-  }
-
- private:
-  pid_t pid_ = getpid();
-  std::mutex mutex_;
-  std::vector<std::weak_ptr<PendingHostCopy>> copies_;
-};
-
-PendingHostCopies& pending_host_copies() {
-  static PendingHostCopies copies;
-  return copies;
-}
 
 HostTensor detached_source(const HostTensor& source) {
   std::array<StableIValue, 1> stack{torch::stable::detail::from(source)};
@@ -432,8 +387,6 @@ std::vector<HostTensor> copy_to_cpu(std::vector<HostTensor> tensors,
         shape, tensors.front().scalar_type(), std::nullopt,
         torch::stable::Device(torch::headeronly::DeviceType::CPU), true)};
   }
-  auto& pending = pending_host_copies();
-  pending.release_completed();
   const torch::stable::accelerator::DeviceGuard guard(device.index());
   const auto stream = get_current_cuda_stream(device.index());
   cudaStreamCaptureStatus capture;
@@ -529,7 +482,6 @@ std::vector<HostTensor> copy_to_cpu(std::vector<HostTensor> tensors,
                     copy->sizes.size(), false, stream, &copy->metadata, true);
   check_copy_error(cudaEventRecord(copy->event, stream));
   copy->recorded = true;
-  pending.track(copy);
   return outputs;
 }
 }  // namespace
@@ -542,10 +494,6 @@ std::vector<torch::stable::Tensor> copy_tensors_to_cpu(
 torch::stable::Tensor copy_rows_to_cpu(const torch::stable::Tensor& tensor,
                                        std::vector<int64_t> rows) {
   return copy_to_cpu({tensor}, &rows).front();
-}
-
-void release_completed_host_copies() {
-  pending_host_copies().release_completed();
 }
 
 namespace vllm {
