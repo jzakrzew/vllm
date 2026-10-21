@@ -423,9 +423,11 @@ def test_async_pooling_output_copies_only_finished_requests(as_list, finished):
         torch.cuda.current_stream(),
         torch.cuda.Stream(),
     )
-    if not as_list:
+    if not as_list and all(finished):
         assert isinstance(output.pooler_output_cpu, torch.Tensor)
-        assert output.pooler_output_cpu.shape[0] == sum(finished)
+        assert output.pooler_output_cpu.shape == source.shape
+    else:
+        assert isinstance(output.pooler_output_cpu, list)
     output = output.get_output()
     assert output is runner_output
     host_outputs = output.pooler_output

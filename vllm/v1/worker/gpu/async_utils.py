@@ -232,7 +232,6 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
     ):
         self.model_runner_output = model_runner_output
         self.pooler_output = pooler_output
-        self.output_indices: list[int] | None = None
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
 
@@ -241,21 +240,22 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
             if len(pooler_output) != len(finished_mask):
                 raise ValueError("Pooler output and finished mask sizes must match")
             self.pooler_output_cpu: PoolerOutput
-            if isinstance(pooler_output, torch.Tensor):
-                indices = [i for i, done in enumerate(finished_mask) if done]
-                self.pooler_output_cpu = copy_rows_to_cpu(pooler_output, indices)
-                if not all(finished_mask):
-                    self.output_indices = indices
+            if isinstance(pooler_output, torch.Tensor) and all(finished_mask):
+                self.pooler_output_cpu = copy_tensors_to_cpu([pooler_output])[0]
             else:
-                selected = [
-                    (i, output)
-                    for i, (output, done) in enumerate(
-                        zip(pooler_output, finished_mask, strict=True)
-                    )
-                    if done and output is not None
-                ]
-                indices = [i for i, _ in selected]
-                outputs = copy_tensors_to_cpu([output for _, output in selected])
+                if isinstance(pooler_output, torch.Tensor):
+                    indices = [i for i, done in enumerate(finished_mask) if done]
+                    outputs = copy_rows_to_cpu(pooler_output, indices).unbind(dim=0)
+                else:
+                    selected = [
+                        (i, output)
+                        for i, (output, done) in enumerate(
+                            zip(pooler_output, finished_mask, strict=True)
+                        )
+                        if done and output is not None
+                    ]
+                    indices = [i for i, _ in selected]
+                    outputs = copy_tensors_to_cpu([output for _, output in selected])
                 self.pooler_output_cpu = [None] * len(finished_mask)
                 for i, output in zip(indices, outputs, strict=True):
                     self.pooler_output_cpu[i] = output
@@ -264,13 +264,7 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
         if isinstance(self.pooler_output_cpu, torch.Tensor):
-            rows = self.pooler_output_cpu.unbind(dim=0)
-            if self.output_indices is None:
-                pooler_output = list(rows)
-            else:
-                pooler_output = [None] * len(self.pooler_output)
-                for i, output in zip(self.output_indices, rows, strict=True):
-                    pooler_output[i] = output
+            pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
         else:
             pooler_output = self.pooler_output_cpu
         self.model_runner_output.pooler_output = pooler_output
