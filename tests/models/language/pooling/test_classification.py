@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 from transformers import AutoModelForSequenceClassification
 
+from vllm.config import PoolerConfig
 from vllm.platforms import current_platform
 
 
@@ -106,3 +108,53 @@ def test_bert_model_runner_v2(hf_runner, vllm_runner, monkeypatch) -> None:
         rtol=1e-2,
         atol=1e-4,
     )
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize(
+    ("method", "tie_word_embeddings"),
+    [("from_2_way_softmax", True), ("no_post_processing", False)],
+)
+def test_classifier_from_quantized_token_embeddings(
+    vllm_runner, quantized_embedding_model, method, tie_word_embeddings
+):
+    """Derive classifier weights from the requested dequantized token rows."""
+    model_path, model, token_ids = quantized_embedding_model
+    classifier_weight = model.embed_tokens.weight
+    if not tie_word_embeddings:
+        model.config.tie_word_embeddings = False
+        model.config.save_pretrained(model_path)
+        checkpoint_path = model_path / "model.safetensors"
+        weights = load_file(checkpoint_path)
+        head_weight = model.embed_tokens.weight.detach().flip(0).float() + 1e-4
+        weights["lm_head.weight"] = head_weight
+        classifier_weight = head_weight.to(model.dtype)
+        save_file(weights, checkpoint_path)
+    classifier_ids = [7, 127] if method == "from_2_way_softmax" else [7, 63, 127]
+    with torch.no_grad():
+        rows = classifier_weight[classifier_ids].float()
+        if method == "from_2_way_softmax":
+            rows = rows[1:] - rows[:1]
+        hidden = model(token_ids).last_hidden_state[:, -1].float()
+        expected = torch.nn.functional.linear(hidden, rows)
+    with vllm_runner(
+        str(model_path),
+        runner="pooling",
+        convert="classify",
+        dtype="bfloat16",
+        enforce_eager=True,
+        max_model_len=32,
+        max_num_seqs=2,
+        gpu_memory_utilization=0.2,
+        pooler_config=PoolerConfig(pooling_type="LAST", use_activation=False),
+        hf_overrides={
+            "classifier_from_token": [f"token{i}" for i in classifier_ids],
+            "method": method,
+            "head_dtype": "float32",
+        },
+    ) as runner:
+        results = runner.llm.classify(
+            [{"prompt_token_ids": ids} for ids in token_ids.tolist()]
+        )
+    actual = torch.tensor([result.outputs.probs for result in results])
+    torch.testing.assert_close(actual, expected, rtol=2e-3, atol=1e-3)

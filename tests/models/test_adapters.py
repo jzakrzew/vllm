@@ -5,18 +5,38 @@
 import pytest
 import torch
 from transformers import Gemma3Config, PreTrainedConfig, Qwen2Config
+from transformers.models.gemma3.modeling_gemma3 import Gemma3TextScaledWordEmbedding
 
 from vllm.model_executor.models.adapters import (
     _create_pooling_model_cls,
+    _get_classifier_token_weights,
     _resolve_num_labels,
 )
+from vllm.model_executor.models.transformers.utils import replace_embedding_class
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     StageMissingLayer,
     WeightsMapper,
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.usefixtures("dist_init")
+def test_classifier_token_weights_exclude_embedding_scale():
+    embedding = Gemma3TextScaledWordEmbedding(8, 4, padding_idx=0, embed_scale=2.0)
+    source = replace_embedding_class(embedding)
+    source.weight_loader(source.weight, torch.arange(32).float().reshape(8, 4))
+    actual = _get_classifier_token_weights(source, [1, 3])
+    torch.testing.assert_close(actual, source.weight[[1, 3]], rtol=0, atol=0)
+
+
+def test_classifier_token_weights_reject_pipeline_placeholder():
+    with pytest.raises(
+        ValueError, match="Unsupported classifier token-row source: PPMissingLayer"
+    ):
+        _get_classifier_token_weights(PPMissingLayer(), [1, 3])
 
 
 class SimpleInnerModel(torch.nn.Module):

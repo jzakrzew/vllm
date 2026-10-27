@@ -513,147 +513,199 @@ def _disable_seq_cls_loading_on_inner_model(language_model, is_vlm: bool):
             inner_hf_config.classifier_from_token = original_hf_tokens
 
 
+def _get_classifier_token_weights(
+    source: nn.Module, token_ids: list[int]
+) -> torch.Tensor:
+    """Read unscaled token rows from formats usable before weight processing."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    if isinstance(source, VocabParallelEmbedding):
+        # For compatibility with the old behavior, assume lookup is ready before
+        # post-load processing. This can cause bugs for methods that require
+        # processing before lookup.
+        device = next(source.parameters()).device
+        ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+        return VocabParallelEmbedding.forward(source, ids)
+    if (
+        isinstance(source, nn.Embedding)
+        and getattr(source, "quant_method", None) is None
+    ):
+        ids = torch.tensor(token_ids, dtype=torch.long, device=source.weight.device)
+        return torch.nn.functional.embedding(ids, source.weight)
+    raise ValueError(
+        f"Unsupported classifier token-row source: {type(source).__name__}"
+    )
+
+
+def _get_classifier_token_ids(model, from_2_way_softmax: bool) -> list[int]:
+    from vllm.tokenizers import get_tokenizer
+
+    hf_config = model.config
+    tokens = getattr(
+        hf_config,
+        "classifier_from_token",
+        getattr(hf_config.get_text_config(), "classifier_from_token", []),
+    )
+    if from_2_way_softmax:
+        assert len(tokens) == 2
+    else:
+        assert len(tokens) > 0
+
+    config = model.vllm_config.model_config
+    tokenizer = get_tokenizer(
+        config.tokenizer,
+        revision=config.tokenizer_revision,
+        tokenizer_mode=config.tokenizer_mode,
+        trust_remote_code=config.trust_remote_code,
+    )
+    return [tokenizer.convert_tokens_to_ids(token) for token in tokens]
+
+
+def _select_dense_lm_head_rows(
+    weight: torch.Tensor,
+    token_ids: list[int],
+    expected_shape: tuple[int, int],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    dense_dtypes = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    if weight.dtype not in dense_dtypes or weight.shape != expected_shape:
+        raise ValueError(
+            "Untied classifier conversion requires a dense "
+            "floating-point LM head weight."
+        )
+    ids = torch.tensor(token_ids, dtype=torch.long, device=weight.device)
+    return weight.index_select(0, ids).to(dtype=dtype)
+
+
+def _load_backbone_for_classifier(model, language_model, weights) -> set[str]:
+    with _disable_seq_cls_loading_on_inner_model(
+        language_model, language_model is not model
+    ):
+        return model._load_pooling_model_weights(weights)
+
+
+def _load_tied_classifier_rows(
+    model, language_model, weights, token_ids: list[int]
+) -> tuple[set[str], torch.Tensor]:
+    backbone = language_model.model
+    embedding = (
+        backbone.embed_tokens
+        if hasattr(backbone, "embed_tokens")
+        else backbone.get_input_embeddings()
+    )
+    loaded_weights = _load_backbone_for_classifier(model, language_model, weights)
+    rows = _get_classifier_token_weights(embedding, token_ids)
+    return loaded_weights, rows
+
+
+def _load_untied_classifier_rows(
+    model, language_model, weights, token_ids: list[int]
+) -> tuple[set[str], torch.Tensor]:
+    """Load backbone weights and extract selected LM-head rows for classification."""
+    from .utils import maybe_prefix
+
+    prefix = next(
+        (name for name, module in model.named_modules() if module is language_model),
+        "",
+    )
+    head_prefix = maybe_prefix(prefix, "lm_head") + "."
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    text_config = model.config.get_text_config()
+    expected_shape = (text_config.vocab_size, text_config.hidden_size)
+    dtype = model.vllm_config.model_config.dtype
+    selected_rows = None
+
+    def backbone_weights():
+        """Stream backbone tensors and capture only the required LM-head rows.
+
+        Yielding avoids buffering the checkpoint or allocating a full LM head.
+        The enclosing loader reads selected_rows after consuming this iterator.
+        """
+        nonlocal selected_rows
+        for name, weight in weights:
+            mapped_name = mapper._map_name(name) if mapper is not None else name
+            if mapped_name is None or not mapped_name.startswith(head_prefix):
+                yield name, weight
+                continue
+            if mapped_name == head_prefix + "weight":
+                selected_rows = _select_dense_lm_head_rows(
+                    weight, token_ids, expected_shape, dtype
+                )
+            else:
+                raise ValueError(
+                    f"Unexpected LM-head parameter {mapped_name!r}: classifier "
+                    "conversion requires a dense, bias-free LM head."
+                )
+
+    loaded_weights = _load_backbone_for_classifier(
+        model, language_model, backbone_weights()
+    )
+    if selected_rows is None:
+        raise ValueError(f"Missing untied classifier weight: {head_prefix}weight")
+    return loaded_weights, selected_rows
+
+
+def _load_score_head_weights(
+    model, language_model, score_weight: torch.Tensor
+) -> set[str]:
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    loaded_weights: set[str] = set()
+    if language_model is not model and hasattr(language_model, "score"):
+        score_layer = language_model.score
+        loaded_weights.add("language_model.score.weight")
+    else:
+        score_layer = model.score
+        loaded_weights.add("score.weight")
+    param = score_layer.weight
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    weight_loader(param, score_weight)
+
+    return loaded_weights
+
+
+def _load_classifier_weights(
+    model,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    from_2_way_softmax: bool,
+) -> set[str]:
+    language_model = _get_language_model_for_seq_cls(model)
+    token_ids = _get_classifier_token_ids(model, from_2_way_softmax)
+
+    if language_model.config.get_text_config().tie_word_embeddings:
+        loaded_weights, rows = _load_tied_classifier_rows(
+            model, language_model, weights, token_ids
+        )
+    else:
+        loaded_weights, rows = _load_untied_classifier_rows(
+            model, language_model, weights, token_ids
+        )
+
+    score_weight = rows
+    if from_2_way_softmax:
+        score_weight = rows[1:].float() - rows[:1].float()
+    score_weights_loaded = _load_score_head_weights(model, language_model, score_weight)
+    loaded_weights |= score_weights_loaded
+
+    lm_head_name: str | None = "lm_head.weight"
+    if hf_to_vllm_mapper := getattr(model, "hf_to_vllm_mapper", None):
+        lm_head_name = hf_to_vllm_mapper._map_name(lm_head_name)
+    if lm_head_name is not None:
+        loaded_weights -= {lm_head_name}
+    return loaded_weights
+
+
 def load_weights_using_from_2_way_softmax(
     model, weights: Iterable[tuple[str, torch.Tensor]]
 ):
-    # refer to https://huggingface.co/Qwen/Qwen3-Reranker-0.6B/discussions/3
-    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
-    model_config = model.vllm_config.model_config
-    hf_config = model.config
-    text_config = hf_config.get_text_config()
-
-    tokens: list[str] = getattr(
-        hf_config,
-        "classifier_from_token",
-        getattr(text_config, "classifier_from_token", []),
-    )
-    assert len(tokens) == 2
-
-    language_model = _get_language_model_for_seq_cls(model)
-    is_vlm = language_model is not model
-    using_vlm_head = is_vlm and hasattr(language_model, "score")
-
-    language_model.lm_head = ParallelLMHead(
-        text_config.vocab_size,
-        text_config.hidden_size,
-    )
-    if language_model.config.get_text_config().tie_word_embeddings:
-        # embed_tokens is the assumed name for input embeddings. If the model does not
-        # have this attribute, we fall back to get_input_embeddings(), which is used by
-        # the Transformers modeling backend.
-        text_backbone = language_model.model
-        embed_tokens = (
-            text_backbone.embed_tokens
-            if hasattr(text_backbone, "embed_tokens")
-            else text_backbone.get_input_embeddings()
-        )
-        language_model.lm_head = language_model.lm_head.tie_weights(embed_tokens)
-
-    with _disable_seq_cls_loading_on_inner_model(language_model, is_vlm):
-        loaded_weights = model._load_pooling_model_weights(weights)
-
-    from vllm.tokenizers import get_tokenizer
-
-    tokenizer = get_tokenizer(
-        model_config.tokenizer,
-        revision=model_config.tokenizer_revision,
-        tokenizer_mode=model_config.tokenizer_mode,
-        trust_remote_code=model_config.trust_remote_code,
-    )
-
-    false_id = tokenizer.convert_tokens_to_ids(tokens[0])
-    true_id = tokenizer.convert_tokens_to_ids(tokens[1])
-    lm_head_weight = language_model.lm_head.weight
-    score_weight = lm_head_weight.data[[true_id]].to(
-        torch.float32
-    ) - lm_head_weight.data[[false_id]].to(torch.float32)
-
-    score_layer = language_model.score if using_vlm_head else model.score
-    param = score_layer.weight
-    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-    weight_loader(param, score_weight)
-
-    del language_model.lm_head
-
-    score_weight_name = (
-        "language_model.score.weight" if using_vlm_head else "score.weight"
-    )
-    loaded_weights.add(score_weight_name)
-
-    lm_head_name: str | None = "lm_head.weight"
-    if hf_to_vllm_mapper := getattr(model, "hf_to_vllm_mapper", None):
-        lm_head_name = hf_to_vllm_mapper._map_name(lm_head_name)
-    if lm_head_name is not None:
-        loaded_weights.discard(lm_head_name)
-    return loaded_weights
+    return _load_classifier_weights(model, weights, from_2_way_softmax=True)
 
 
 def load_weights_no_post_processing(model, weights: Iterable[tuple[str, torch.Tensor]]):
-    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
-    model_config = model.vllm_config.model_config
-    text_config = model.config.get_text_config()
-
-    tokens: list[str] = getattr(text_config, "classifier_from_token", [])
-    assert len(tokens) > 0
-
-    language_model = _get_language_model_for_seq_cls(model)
-    is_vlm = language_model is not model
-    using_vlm_head = is_vlm and hasattr(language_model, "score")
-
-    language_model.lm_head = ParallelLMHead(
-        text_config.vocab_size,
-        text_config.hidden_size,
-    )
-    if language_model.config.get_text_config().tie_word_embeddings:
-        # embed_tokens is the assumed name for input embeddings. If the model does not
-        # have this attribute, we fall back to get_input_embeddings(), which is used by
-        # the Transformers modeling backend.
-        text_backbone = language_model.model
-        embed_tokens = (
-            text_backbone.embed_tokens
-            if hasattr(text_backbone, "embed_tokens")
-            else text_backbone.get_input_embeddings()
-        )
-        language_model.lm_head = language_model.lm_head.tie_weights(embed_tokens)
-
-    with _disable_seq_cls_loading_on_inner_model(language_model, is_vlm):
-        # Bypass ModelForSequenceClassification to avoid infinite recursion
-        loaded_weights = model._load_pooling_model_weights(weights)
-
-    from vllm.tokenizers import get_tokenizer
-
-    tokenizer = get_tokenizer(
-        model_config.tokenizer,
-        revision=model_config.tokenizer_revision,
-        tokenizer_mode=model_config.tokenizer_mode,
-        trust_remote_code=model_config.trust_remote_code,
-    )
-
-    token_ids = [tokenizer.convert_tokens_to_ids(t) for t in tokens]
-    score_weight = language_model.lm_head.weight.data[token_ids]
-
-    score_layer = language_model.score if using_vlm_head else model.score
-    param = score_layer.weight
-    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-    weight_loader(param, score_weight)
-
-    del language_model.lm_head
-
-    score_weight_name = (
-        "language_model.score.weight" if using_vlm_head else "score.weight"
-    )
-    loaded_weights.add(score_weight_name)
-
-    lm_head_name: str | None = "lm_head.weight"
-    if hf_to_vllm_mapper := getattr(model, "hf_to_vllm_mapper", None):
-        lm_head_name = hf_to_vllm_mapper._map_name(lm_head_name)
-    if lm_head_name is not None:
-        loaded_weights.discard(lm_head_name)
-    return loaded_weights
+    return _load_classifier_weights(model, weights, from_2_way_softmax=False)
 
 
 SEQ_CLS_LOAD_METHODS = {
